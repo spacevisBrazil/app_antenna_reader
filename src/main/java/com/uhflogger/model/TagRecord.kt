@@ -1,15 +1,18 @@
 package com.uhflogger.model
 
 data class TagRecord(
-    val epc: String,
-    val rssi: Int,
-    val antenna: Int,
-    val androidTs: Long
+    val epc      : String,
+    val rssi     : Int,
+    val antenna  : Int,
+    val androidTs: Long,
+    val latitude : String = "",
+    val longitude: String = "",
+    val bearing  : String = ""
 ) {
     fun toCsvLine(): String =
-        "$epc,$rssi,$antenna,$androidTs"
+        "$epc,$rssi,$antenna,$androidTs,$latitude,$longitude,$bearing"
 
     companion object {
-        const val CSV_HEADER = "EPC,RSSI,Antenna,Timestamp"
+        const val CSV_HEADER = "EPC,RSSI,Antenna,Timestamp,Latitude,Longitude,Bearing"
     }
 }

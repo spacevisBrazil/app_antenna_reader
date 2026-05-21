@@ -39,6 +39,8 @@ class UHFReaderService : Service() {
     private var ioManager     : SerialInputOutputManager? = null
 
     var onStatusChanged: ((Boolean) -> Unit)? = null
+    var onCaptureError : (() -> Unit)?        = null
+    var mainActivity   : MainActivity?        = null
 
     override fun onCreate() {
         super.onCreate()
@@ -59,6 +61,7 @@ class UHFReaderService : Service() {
 
     override fun onDestroy() {
         stopCapture()
+        mainActivity = null
         super.onDestroy()
     }
 
@@ -78,7 +81,8 @@ class UHFReaderService : Service() {
         val port = driver.ports[0]
         try {
             port.open(connection)
-            port.setParameters(BAUD_RATE, UsbSerialPort.DATABITS_8, UsbSerialPort.STOPBITS_1, UsbSerialPort.PARITY_NONE)
+            port.setParameters(BAUD_RATE, UsbSerialPort.DATABITS_8,
+                UsbSerialPort.STOPBITS_1, UsbSerialPort.PARITY_NONE)
             port.dtr = true
             port.rts = true
         } catch (e: Exception) {
@@ -94,14 +98,27 @@ class UHFReaderService : Service() {
 
         ioManager = SerialInputOutputManager(port, object : SerialInputOutputManager.Listener {
             override fun onNewData(data: ByteArray) {
-                val tags = decoder.feed(data)
+                val lat = mainActivity?.getCurrentLatitude()  ?: ""
+                val lon = mainActivity?.getCurrentLongitude() ?: ""
+                val brg = mainActivity?.getCurrentBearing()   ?: ""
+                val tags = decoder.feed(data, lat, lon, brg)
                 if (tags.isNotEmpty()) {
                     synchronized(tagBuffer) { tagBuffer.addAll(tags) }
                 }
             }
+
             override fun onRunError(e: Exception) {
                 Log.e(TAG, "Serial read error", e)
-                stopCapture()
+                // Se isRunning já é false, o stop foi intencional — não dispara onCaptureError
+                if (!isRunning.compareAndSet(true, false)) return
+                ioManager?.stop()
+                ioManager = null
+                try { usbPort?.close() }       catch (_: Exception) {}
+                try { usbConnection?.close() } catch (_: Exception) {}
+                usbPort       = null
+                usbConnection = null
+                updateNotification("Sinal perdido — ${tagBuffer.size} tags aguardando salvamento")
+                onCaptureError?.invoke()
             }
         }).also {
             it.readTimeout  = 0
@@ -147,8 +164,7 @@ class UHFReaderService : Service() {
 
     private fun buildNotification(text: String): Notification {
         val pendingIntent = PendingIntent.getActivity(
-            this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
-        )
+            this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
         return Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("UHF Data Logger")
             .setContentText(text)
@@ -159,8 +175,7 @@ class UHFReaderService : Service() {
     }
 
     private fun updateNotification(text: String) {
-        val notif = buildNotification(text)
-        (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).notify(NOTIF_ID, notif)
+        (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).notify(NOTIF_ID, buildNotification(text))
     }
 
     companion object {

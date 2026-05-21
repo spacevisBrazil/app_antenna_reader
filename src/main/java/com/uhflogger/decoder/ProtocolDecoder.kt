@@ -6,11 +6,16 @@ class ProtocolDecoder {
 
     private val accumulator = ArrayDeque<Byte>(8192)
 
-    fun feed(data: ByteArray): List<TagRecord> {
+    fun feed(
+        data     : ByteArray,
+        latitude : String = "",
+        longitude: String = "",
+        bearing  : String = ""
+    ): List<TagRecord> {
         val results = mutableListOf<TagRecord>()
         for (b in data) accumulator.addLast(b)
 
-        while (accumulator.size >= 8) {
+        while (accumulator.size >= 8) {                          // igual ao working
             val startIdx = findStarter()
             if (startIdx < 0) {
                 val last = accumulator.last()
@@ -23,19 +28,23 @@ class ProtocolDecoder {
 
             val buf       = accumulator.toByteArray()
             val cmd       = buf[2].toInt() and 0xFF
-            val direction = buf[3].toInt() and 0xFF
+            val direction = buf[3].toInt() and 0xFF              // igual ao working
             val lenLow    = buf[4].toInt() and 0xFF
             val lenHigh   = buf[5].toInt() and 0xFF
             val dataLen   = lenLow + lenHigh * 256
-            val totalLen  = 7 + dataLen
+            val totalLen  = 7 + dataLen                          // igual ao working
 
             if (accumulator.size < totalLen) break
 
             val packet = ByteArray(totalLen) { accumulator.removeFirst() }
 
-            if (cmd != 0x02 || direction != 0x03) continue
+            if (cmd != 0x02 || direction != 0x03) continue       // igual ao working
+            // sem BCC — igual ao working
 
-            val tag = decodeTagBody(packet, offset = 8, available = dataLen - 2)
+            val tag = decodeTagBody(                             // offset=8, available=dataLen-2
+                packet, offset = 8, available = dataLen - 2,
+                latitude = latitude, longitude = longitude, bearing = bearing
+            )
             if (tag != null) results.add(tag)
         }
         return results
@@ -51,7 +60,14 @@ class ProtocolDecoder {
         return if (arr.last() == 0x43.toByte()) arr.size - 1 else -1
     }
 
-    private fun decodeTagBody(packet: ByteArray, offset: Int, available: Int): TagRecord? {
+    private fun decodeTagBody(
+        packet   : ByteArray,
+        offset   : Int,
+        available: Int,
+        latitude : String = "",
+        longitude: String = "",
+        bearing  : String = ""
+    ): TagRecord? {
         if (available < 3) return null
 
         val uhfClass = packet[offset].toInt() and 0xFF
@@ -69,38 +85,31 @@ class ProtocolDecoder {
         var antenna = 0
         var rssi    = 0
 
-        // Bit 7 → Antenna ID (1 byte)
         if (optCtrl and 0x80 != 0) {
             if (pos >= packet.size) return null
             antenna = packet[pos].toInt() and 0xFF
             pos += 1
         }
 
-        // Bit 6 → RSSI (1 byte, negative dBm)
         if (optCtrl and 0x40 != 0) {
             if (pos >= packet.size) return null
             rssi = -(packet[pos].toInt() and 0xFF)
             pos += 1
         }
 
-        // Bit 5 → PC value (2 bytes, skip)
         if (optCtrl and 0x20 != 0) pos += 2
-
-        // Bit 4 → Area (1 byte, skip)
         if (optCtrl and 0x10 != 0) pos += 1
-
-        // Bit 3 → Trigger (1 byte, skip)
         if (optCtrl and 0x08 != 0) pos += 1
-
-        // Bit 2 → Private Data (4 bytes, skip)
         if (optCtrl and 0x04 != 0) pos += 4
 
-        // Bit 1 → Reader Timestamp ignored, using Android time
         return TagRecord(
             epc       = epcHex,
             rssi      = rssi,
             antenna   = antenna,
-            androidTs = System.currentTimeMillis()
+            androidTs = System.currentTimeMillis(),
+            latitude  = latitude,
+            longitude = longitude,
+            bearing   = bearing
         )
     }
 }
