@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Filtro USB: aceita qualquer dispositivo USB serial.
+    Se quiser restringir a VID/PID específicos, adicione atributos:
+    <usb-device vendor-id="1234" product-id="5678" />
+-->
+<resources>
+    <usb-device />
+</resources>
