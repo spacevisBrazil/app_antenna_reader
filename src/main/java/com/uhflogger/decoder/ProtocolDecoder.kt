@@ -15,7 +15,7 @@ class ProtocolDecoder {
         val results = mutableListOf<TagRecord>()
         for (b in data) accumulator.addLast(b)
 
-        while (accumulator.size >= 8) {                          // igual ao working
+        while (accumulator.size >= 8) {
             val startIdx = findStarter()
             if (startIdx < 0) {
                 val last = accumulator.last()
@@ -28,18 +28,17 @@ class ProtocolDecoder {
 
             val buf       = accumulator.toByteArray()
             val cmd       = buf[2].toInt() and 0xFF
-            val direction = buf[3].toInt() and 0xFF              // igual ao working
+            val direction = buf[3].toInt() and 0xFF
             val lenLow    = buf[4].toInt() and 0xFF
             val lenHigh   = buf[5].toInt() and 0xFF
             val dataLen   = lenLow + lenHigh * 256
-            val totalLen  = 7 + dataLen                          // igual ao working
+            val totalLen  = 7 + dataLen
 
             if (accumulator.size < totalLen) break
 
             val packet = ByteArray(totalLen) { accumulator.removeFirst() }
 
-            if (cmd != 0x02 || direction != 0x03) continue       // igual ao working
-            // sem BCC — igual ao working
+            if (cmd != 0x02 || direction != 0x03) continue
 
             val tag = decodeTagBody(                             // offset=8, available=dataLen-2
                 packet, offset = 8, available = dataLen - 2,

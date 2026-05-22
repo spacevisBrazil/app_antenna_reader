@@ -15,35 +15,77 @@ import android.util.Log
 import com.hoho.android.usbserial.driver.UsbSerialPort
 import com.hoho.android.usbserial.driver.UsbSerialProber
 import com.hoho.android.usbserial.util.SerialInputOutputManager
+import com.uhflogger.CsvExporter
 import com.uhflogger.MainActivity
 import com.uhflogger.decoder.ProtocolDecoder
 import com.uhflogger.model.TagRecord
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 class UHFReaderService : Service() {
 
+    // =========================================================================
+    // Configurações de auto-save — ajuste aqui
+    // =========================================================================
+    companion object {
+        const val AUTO_SAVE_TAG_COUNT    = 10_000   // auto-save a cada N tags
+        const val AUTO_SAVE_INTERVAL_MIN = 10L      // auto-save a cada N minutos
+
+        private const val TAG        = "UHFReaderService"
+        private const val CHANNEL_ID = "uhf_logger_channel"
+        private const val NOTIF_ID   = 1001
+        private const val BAUD_RATE  = 115200
+
+        const val ACTION_START      = "com.uhflogger.START"
+        const val ACTION_STOP       = "com.uhflogger.STOP"
+        const val EXTRA_DEVICE_NAME = "device_name"
+    }
+
+    // =========================================================================
+    // Binder
+    // =========================================================================
     inner class LocalBinder : Binder() {
         fun getService(): UHFReaderService = this@UHFReaderService
     }
-
-    private val binder    = LocalBinder()
+    private val binder = LocalBinder()
     override fun onBind(intent: Intent): IBinder = binder
 
-    private val decoder   = ProtocolDecoder()
-    private val tagBuffer = mutableListOf<TagRecord>()
-    private val isRunning = AtomicBoolean(false)
+    // =========================================================================
+    // Estado interno
+    // =========================================================================
+    private val decoder    = ProtocolDecoder()
+    private val tagBuffer  = ConcurrentLinkedQueue<TagRecord>() // lock-free, thread-safe
+    private val totalCount = AtomicInteger(0)
+    private val isRunning  = AtomicBoolean(false)
 
     private var usbPort       : UsbSerialPort? = null
     private var usbConnection : UsbDeviceConnection? = null
     private var ioManager     : SerialInputOutputManager? = null
 
-    var onStatusChanged: ((Boolean) -> Unit)? = null
-    var onCaptureError : (() -> Unit)?        = null
-    var mainActivity   : MainActivity?        = null
+    // Auto-save scheduler
+    private var autoSaveExecutor: ScheduledExecutorService? = null
+    private var autoSaveTimerJob: ScheduledFuture<*>?       = null
 
+    // Contexto salvo para o CsvExporter (necessário fora da Activity)
+    private var appContext: Context? = null
+
+    // Callbacks para a Activity
+    var onStatusChanged : ((Boolean) -> Unit)? = null
+    var onCaptureError  : (() -> Unit)?        = null
+    var onAutoSaved     : ((Int) -> Unit)?     = null  // notifica a UI do auto-save
+    var mainActivity    : MainActivity?        = null
+
+    // =========================================================================
+    // Lifecycle
+    // =========================================================================
     override fun onCreate() {
         super.onCreate()
+        appContext = applicationContext
         createNotificationChannel()
         startForeground(NOTIF_ID, buildNotification("Aguardando conexão USB…"))
     }
@@ -65,18 +107,32 @@ class UHFReaderService : Service() {
         super.onDestroy()
     }
 
+    // =========================================================================
+    // API pública
+    // =========================================================================
+
     fun startCapture(deviceName: String) {
         if (isRunning.get()) return
         decoder.reset()
+        totalCount.set(0)
+
+        // Abre o arquivo CSV da sessão
+        val ctx = appContext ?: return
+        val fileName = CsvExporter.startSession(ctx)
+        if (fileName == null) {
+            Log.e(TAG, "Falha ao criar arquivo CSV da sessão")
+            return
+        }
+        Log.i(TAG, "Arquivo da sessão: $fileName")
 
         val usbManager = getSystemService(Context.USB_SERVICE) as UsbManager
         val availableDrivers = UsbSerialProber.getDefaultProber().findAllDrivers(usbManager)
 
         val driver = availableDrivers.firstOrNull { it.device.deviceName == deviceName }
-            ?: run { Log.e(TAG, "Device not found: $deviceName"); return }
+            ?: run { Log.e(TAG, "Device not found: $deviceName"); CsvExporter.cancelSession(); return }
 
         val connection = usbManager.openDevice(driver.device)
-            ?: run { Log.e(TAG, "USB permission denied"); return }
+            ?: run { Log.e(TAG, "USB permission denied"); CsvExporter.cancelSession(); return }
 
         val port = driver.ports[0]
         try {
@@ -87,14 +143,17 @@ class UHFReaderService : Service() {
             port.rts = true
         } catch (e: Exception) {
             Log.e(TAG, "Error opening serial port", e)
-            port.close()
-            connection.close()
+            port.close(); connection.close()
+            CsvExporter.cancelSession()
             return
         }
 
         usbPort       = port
         usbConnection = connection
         isRunning.set(true)
+
+        // Inicia auto-save por tempo
+        startAutoSaveTimer()
 
         ioManager = SerialInputOutputManager(port, object : SerialInputOutputManager.Listener {
             override fun onNewData(data: ByteArray) {
@@ -103,21 +162,24 @@ class UHFReaderService : Service() {
                 val brg = mainActivity?.getCurrentBearing()   ?: ""
                 val tags = decoder.feed(data, lat, lon, brg)
                 if (tags.isNotEmpty()) {
-                    synchronized(tagBuffer) { tagBuffer.addAll(tags) }
+                    tagBuffer.addAll(tags)
+                    val total = totalCount.addAndGet(tags.size)
+                    // Auto-save por contagem — sem lock, apenas drena a fila
+                    if (total % AUTO_SAVE_TAG_COUNT < tags.size) {
+                        autoSaveExecutor?.submit { flushBufferToDisk() }
+                    }
                 }
             }
 
             override fun onRunError(e: Exception) {
                 Log.e(TAG, "Serial read error", e)
-                // Se isRunning já é false, o stop foi intencional — não dispara onCaptureError
                 if (!isRunning.compareAndSet(true, false)) return
-                ioManager?.stop()
-                ioManager = null
+                stopAutoSaveTimer()
+                ioManager?.stop(); ioManager = null
                 try { usbPort?.close() }       catch (_: Exception) {}
                 try { usbConnection?.close() } catch (_: Exception) {}
-                usbPort       = null
-                usbConnection = null
-                updateNotification("Sinal perdido — ${tagBuffer.size} tags aguardando salvamento")
+                usbPort = null; usbConnection = null
+                updateNotification("Sinal perdido — ${totalCount.get()} tags aguardando salvamento")
                 onCaptureError?.invoke()
             }
         }).also {
@@ -126,36 +188,99 @@ class UHFReaderService : Service() {
             Executors.newSingleThreadExecutor().submit(it)
         }
 
-        updateNotification("Capturando… (${tagBuffer.size} tags)")
+        updateNotification("Capturando…")
         onStatusChanged?.invoke(true)
         Log.i(TAG, "Capture started on $deviceName @ $BAUD_RATE baud")
     }
 
-    fun stopCapture() {
-        if (!isRunning.compareAndSet(true, false)) return
+    fun stopCapture(): String? {
+        if (!isRunning.compareAndSet(true, false)) return null
 
-        ioManager?.stop()
-        ioManager = null
+        stopAutoSaveTimer()
+        ioManager?.stop(); ioManager = null
         try { usbPort?.close() }       catch (_: Exception) {}
         try { usbConnection?.close() } catch (_: Exception) {}
-        usbPort       = null
-        usbConnection = null
+        usbPort = null; usbConnection = null
 
-        updateNotification("Captura encerrada — ${tagBuffer.size} tags")
+        // Drena tudo que sobrou na fila e fecha o arquivo
+        val lastBatch = mutableListOf<TagRecord>()
+        while (tagBuffer.isNotEmpty()) {
+            tagBuffer.poll()?.let { lastBatch.add(it) }
+        }
+        val fileName = CsvExporter.finalizeSession(lastBatch)
+
+        updateNotification("Captura encerrada — ${totalCount.get()} tags salvas")
         onStatusChanged?.invoke(false)
-        Log.i(TAG, "Capture stopped. Total tags: ${tagBuffer.size}")
+        Log.i(TAG, "Capture stopped. Total tags: ${totalCount.get()}, file: $fileName")
+
+        totalCount.set(0)
+
+        return fileName
     }
 
     fun isCapturing(): Boolean = isRunning.get()
 
-    fun flushTags(): List<TagRecord> = synchronized(tagBuffer) {
-        val copy = tagBuffer.toList()
-        tagBuffer.clear()
-        copy
+    /** Total de tags na sessão atual (gravadas + ainda no buffer) */
+    fun tagCount(): Int = totalCount.get()
+
+    /**
+     * Mantido para compatibilidade com o onStopClicked da Activity.
+     * Como os dados já foram gravados incrementalmente, retorna lista vazia
+     * sinalizando que o arquivo já foi salvo.
+     */
+    fun flushTags(): List<TagRecord> = emptyList()
+
+    // =========================================================================
+    // Auto-save interno
+    // =========================================================================
+
+    private fun startAutoSaveTimer() {
+        autoSaveExecutor = Executors.newSingleThreadScheduledExecutor()
+        autoSaveTimerJob = autoSaveExecutor?.scheduleAtFixedRate(
+            { timerAutoSave() },
+            AUTO_SAVE_INTERVAL_MIN,
+            AUTO_SAVE_INTERVAL_MIN,
+            TimeUnit.MINUTES
+        )
     }
 
-    fun tagCount(): Int = synchronized(tagBuffer) { tagBuffer.size }
+    private fun stopAutoSaveTimer() {
+        autoSaveTimerJob?.cancel(false)
+        autoSaveTimerJob = null
+        autoSaveExecutor?.shutdown()
+        autoSaveExecutor = null
+    }
 
+    private fun timerAutoSave() {
+        if (!isRunning.get()) return
+        Log.i(TAG, "Auto-save por tempo (${AUTO_SAVE_INTERVAL_MIN}min)")
+        flushBufferToDisk()
+    }
+
+    /** Grava o buffer atual no disco e limpa. Deve ser chamado com lock em tagBuffer. */
+    private fun flushBufferToDisk() {
+        if (!isRunning.get()) return
+        // Drena a fila lock-free — thread de leitura continua sem bloqueio
+        val batch = mutableListOf<TagRecord>()
+        while (tagBuffer.isNotEmpty()) {
+            tagBuffer.poll()?.let { batch.add(it) }
+        }
+        if (batch.isEmpty()) return
+
+        val ok = CsvExporter.appendTags(batch)
+        if (ok) {
+            Log.i(TAG, "Auto-save: ${batch.size} tags gravadas, total: ${totalCount.get()}")
+            updateNotification("Capturando… (${totalCount.get()} tags)")
+            onAutoSaved?.invoke(totalCount.get())
+        } else {
+            Log.e(TAG, "Auto-save falhou — tags reinseridas na fila")
+            tagBuffer.addAll(batch)
+        }
+    }
+
+    // =========================================================================
+    // Notificação
+    // =========================================================================
     private fun createNotificationChannel() {
         val channel = NotificationChannel(CHANNEL_ID, "UHF Logger", NotificationManager.IMPORTANCE_LOW)
             .apply { description = "Serviço de captura RFID UHF" }
@@ -175,17 +300,7 @@ class UHFReaderService : Service() {
     }
 
     private fun updateNotification(text: String) {
-        (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).notify(NOTIF_ID, buildNotification(text))
-    }
-
-    companion object {
-        private const val TAG        = "UHFReaderService"
-        private const val CHANNEL_ID = "uhf_logger_channel"
-        private const val NOTIF_ID   = 1001
-        private const val BAUD_RATE  = 115200
-
-        const val ACTION_START      = "com.uhflogger.START"
-        const val ACTION_STOP       = "com.uhflogger.STOP"
-        const val EXTRA_DEVICE_NAME = "device_name"
+        (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
+            .notify(NOTIF_ID, buildNotification(text))
     }
 }

@@ -81,6 +81,12 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                     toast("Sinal da antena perdido — clique em STOP para salvar os dados")
                 }
             }
+
+            readerService?.onAutoSaved = { total ->
+                runOnUiThread {
+                    toast("Auto-save: $total tags gravadas")
+                }
+            }
             setCapturingState(readerService?.isCapturing() == true)
         }
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -130,6 +136,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     override fun onResume() {
         super.onResume()
         uiHandler.post(tagCountUpdater)
+        refreshDeviceList()
         startLocationUpdates()
         sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)?.let {
             sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
@@ -215,22 +222,32 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     }
 
     private fun onStopClicked() {
-        readerService?.stopCapture()
-        val tags = readerService?.flushTags() ?: emptyList()
-        if (tags.isEmpty()) { toast("Nenhuma tag para exportar"); return }
-        val fileName = CsvExporter.export(this, tags)
-        if (fileName != null) toast("CSV salvo em Downloads/$fileName\n(${tags.size} tags)")
-        else toast("Falha ao exportar CSV")
+        val fileName = readerService?.stopCapture()
+        val total    = readerService?.tagCount() ?: 0
+
+        if (fileName != null) {
+            toast("CSV salvo em Downloads/$fileName\n($total tags)")
+        } else {
+            toast("Nenhuma tag para exportar")
+        }
     }
 
     private fun bindToService() {
-        val intent = Intent(this, UHFReaderService::class.java)
-        startForegroundService(intent)
-        bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
+        try {
+            val intent = Intent(this, UHFReaderService::class.java)
+            startForegroundService(intent)
+            bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
+        } catch (e: Exception) {
+            toast("Erro ao iniciar serviço: ${e.message}")
+        }
     }
 
     private fun startReaderService(deviceName: String) {
-        readerService?.startCapture(deviceName)
+        try {
+            readerService?.startCapture(deviceName)
+        } catch (e: Exception) {
+            toast("Erro ao iniciar captura: ${e.message}")
+        }
     }
 
     private fun refreshDeviceList() {
@@ -258,7 +275,10 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
     private fun requestUsbPermission(usbManager: UsbManager, device: UsbDevice) {
         val permissionIntent = PendingIntent.getBroadcast(
-            this, 0, Intent(ACTION_USB_PERMISSION), PendingIntent.FLAG_MUTABLE)
+            this, 0,
+            Intent(ACTION_USB_PERMISSION).apply { setPackage(packageName) },
+            PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
         usbManager.requestPermission(device, permissionIntent)
     }
 
