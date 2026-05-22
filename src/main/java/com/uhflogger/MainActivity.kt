@@ -31,6 +31,8 @@ import androidx.core.content.ContextCompat
 import com.hoho.android.usbserial.driver.UsbSerialProber
 import com.uhflogger.databinding.ActivityMainBinding
 import com.uhflogger.service.UHFReaderService
+import com.uhflogger.SettingsManager
+import com.uhflogger.SettingsActivity
 
 class MainActivity : AppCompatActivity(), SensorEventListener {
 
@@ -38,6 +40,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private var readerService: UHFReaderService? = null
     private var serviceBound = false
     private var currentToast: Toast? = null
+    private var stoppedByError = false
 
     // GPS
     private lateinit var locationManager: LocationManager
@@ -60,7 +63,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private val tagCountUpdater = object : Runnable {
         override fun run() {
             val count = readerService?.tagCount() ?: 0
-            binding.tvTagCount.text = "Tags capturadas: $count"
+            binding.tvTagCount.text = "%,d".format(count)
             uiHandler.postDelayed(this, 1000L)
         }
     }
@@ -76,8 +79,11 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             }
             readerService?.onCaptureError = {
                 runOnUiThread {
+                    stoppedByError = true
                     setCapturingState(false)
-                    binding.btnStop.isEnabled = true
+                    binding.btnStart.isEnabled = false   // Start desabilitado até salvar
+                    binding.btnStop.isEnabled  = true    // Stop habilitado para salvar
+                    updateButtonColors()
                     toast("Sinal da antena perdido — clique em STOP para salvar os dados")
                 }
             }
@@ -108,7 +114,26 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                         toast("Permissão USB negada")
                     }
                 }
-                UsbManager.ACTION_USB_DEVICE_ATTACHED -> refreshDeviceList()
+                UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
+                    refreshDeviceList()
+                    // Se estava pausado (antena desconectou no meio da leitura),
+                    // retoma automaticamente quando a antena é reconectada
+                    val deviceName = binding.spinnerDevices.tag?.toString()
+                    if (readerService?.isPaused() == true && deviceName != null) {
+                        val usbManager = getSystemService(USB_SERVICE) as UsbManager
+                        val device = usbManager.deviceList.values
+                            .firstOrNull { it.deviceName == deviceName }
+                        if (device != null) {
+                            if (usbManager.hasPermission(device)) {
+                                stoppedByError = false
+                                readerService?.startCapture(deviceName)
+                                toast("Antena reconectada — retomando leitura")
+                            } else {
+                                requestUsbPermission(usbManager, device)
+                            }
+                        }
+                    }
+                }
                 UsbManager.ACTION_USB_DEVICE_DETACHED -> {
                     refreshDeviceList()
                     // onRunError já tratou a desconexão
@@ -190,9 +215,12 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             != PackageManager.PERMISSION_GRANTED) return
         try {
             locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 2000L, 1f, locationListener)
+            val gnssOnly = SettingsManager.getLocationMode(this) == SettingsManager.LOCATION_MODE_GNSS
             if (currentLocation == null) {
                 currentLocation = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)
-                    ?: locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
+                if (currentLocation == null && !gnssOnly) {
+                    currentLocation = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
+                }
             }
         } catch (_: Exception) {}
     }
@@ -207,8 +235,13 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     fun getCurrentBearing()   = if (!currentBearing.isNaN()) "%.1f".format(java.util.Locale.US, currentBearing) else ""
 
     private fun setupButtons() {
-        binding.btnStart.setOnClickListener { onStartClicked() }
-        binding.btnStop.setOnClickListener  { onStopClicked() }
+        binding.btnStart.setOnClickListener    { onStartClicked() }
+        binding.btnStop.setOnClickListener     { onStopClicked() }
+        binding.btnSettings.setOnClickListener { onSettingsClicked() }
+    }
+
+    private fun onSettingsClicked() {
+        startActivity(Intent(this, SettingsActivity::class.java))
     }
 
     private fun onStartClicked() {
@@ -222,14 +255,22 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     }
 
     private fun onStopClicked() {
-        val fileName = readerService?.stopCapture()
-        val total    = readerService?.tagCount() ?: 0
+        val fileName: String?
+        val total: Int
 
-        if (fileName != null) {
-            toast("CSV salvo em Downloads/$fileName\n($total tags)")
+        if (stoppedByError) {
+            stoppedByError = false
+            fileName = readerService?.saveAfterError()
+            total    = readerService?.tagCount() ?: 0
+            setCapturingState(false)  // saveAfterError não dispara callback, força aqui
         } else {
-            toast("Nenhuma tag para exportar")
+            fileName = readerService?.stopCapture()
+            total    = readerService?.tagCount() ?: 0
+            // stopCapture já chama onStatusChanged → setCapturingState via callback
         }
+
+        if (fileName != null) toast("CSV salvo em Downloads/$fileName\n($total tags)")
+        else toast("Nenhuma tag para exportar")
     }
 
     private fun bindToService() {
@@ -243,6 +284,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     }
 
     private fun startReaderService(deviceName: String) {
+        stoppedByError = false
         try {
             readerService?.startCapture(deviceName)
         } catch (e: Exception) {
@@ -253,24 +295,37 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private fun refreshDeviceList() {
         val usbManager = getSystemService(USB_SERVICE) as UsbManager
         val drivers    = UsbSerialProber.getDefaultProber().findAllDrivers(usbManager)
-        if (drivers.isEmpty()) {
-            val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, listOf("Nenhum dispositivo USB"))
-            adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
-            binding.spinnerDevices.adapter = adapter
-            binding.spinnerDevices.tag     = null
-            return
-        }
-        val labels = drivers.map { driver ->
+
+        val labels = if (drivers.isEmpty()) listOf("Nenhum dispositivo USB")
+        else drivers.map { driver ->
             val dev = driver.device
             val vid = dev.vendorId.toString(16).uppercase().padStart(4, '0')
             val pid = dev.productId.toString(16).uppercase().padStart(4, '0')
             val mfr = dev.manufacturerName ?: "Desconhecido"
             "VID:$vid / PID:$pid — $mfr"
         }
-        val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, labels)
+
+        // Adapter com texto preto forçado — independente do tema do celular
+        val adapter = object : ArrayAdapter<String>(this,
+            android.R.layout.simple_spinner_item, labels) {
+            override fun getView(pos: Int, v: android.view.View?, parent: android.view.ViewGroup): android.view.View {
+                val view = super.getView(pos, v, parent)
+                (view as? android.widget.TextView)?.setTextColor(android.graphics.Color.parseColor("#111111"))
+                return view
+            }
+            override fun getDropDownView(pos: Int, v: android.view.View?, parent: android.view.ViewGroup): android.view.View {
+                val view = super.getDropDownView(pos, v, parent)
+                (view as? android.widget.TextView)?.apply {
+                    setTextColor(android.graphics.Color.parseColor("#111111"))
+                    setBackgroundColor(android.graphics.Color.WHITE)
+                }
+                return view
+            }
+        }
         adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
         binding.spinnerDevices.adapter = adapter
-        binding.spinnerDevices.tag     = drivers[0].device.deviceName
+        binding.spinnerDevices.setBackgroundResource(R.drawable.bg_spinner_white)
+        binding.spinnerDevices.tag = if (drivers.isEmpty()) null else drivers[0].device.deviceName
     }
 
     private fun requestUsbPermission(usbManager: UsbManager, device: UsbDevice) {
@@ -294,9 +349,24 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private fun setCapturingState(capturing: Boolean) {
         binding.btnStart.isEnabled       = !capturing
         binding.btnStop.isEnabled        = capturing
+        binding.btnSettings.isEnabled    = !capturing
         binding.spinnerDevices.isEnabled = !capturing
-        binding.ledStatus.setImageResource(if (capturing) R.drawable.led_green else R.drawable.led_gray)
-        binding.tvStatus.text = if (capturing) "LENDO" else "PARADO"
+
+        binding.tvStatus.text = if (capturing) "Lendo" else "Parado"
+        binding.tvStatus.setBackgroundResource(
+            if (capturing) R.drawable.bg_badge_green else R.drawable.bg_badge_gray
+        )
+        updateButtonColors()
+    }
+
+    /** Cores sempre derivadas do isEnabled — fonte única de verdade */
+    private fun updateButtonColors() {
+        binding.btnStart.backgroundTintList = android.content.res.ColorStateList.valueOf(
+            if (binding.btnStart.isEnabled) 0xFF2E7D32.toInt() else 0xFFA5D6A7.toInt()
+        )
+        binding.btnStop.backgroundTintList = android.content.res.ColorStateList.valueOf(
+            if (binding.btnStop.isEnabled) 0xFFC62828.toInt() else 0xFFEF9A9A.toInt()
+        )
     }
 
     private fun requestNotificationPermission() {
@@ -310,7 +380,10 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
     private fun toast(msg: String) {
         currentToast?.cancel()
-        currentToast = Toast.makeText(this, msg, Toast.LENGTH_LONG).also { it.show() }
+        currentToast = Toast.makeText(this, msg, Toast.LENGTH_LONG).also {
+            it.setGravity(android.view.Gravity.TOP or android.view.Gravity.CENTER_HORIZONTAL, 0, 120)
+            it.show()
+        }
     }
 
     companion object {

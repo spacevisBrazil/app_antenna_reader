@@ -17,6 +17,7 @@ import com.hoho.android.usbserial.driver.UsbSerialProber
 import com.hoho.android.usbserial.util.SerialInputOutputManager
 import com.uhflogger.CsvExporter
 import com.uhflogger.MainActivity
+import com.uhflogger.SettingsManager
 import com.uhflogger.decoder.ProtocolDecoder
 import com.uhflogger.model.TagRecord
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -30,12 +31,9 @@ import java.util.concurrent.atomic.AtomicInteger
 class UHFReaderService : Service() {
 
     // =========================================================================
-    // Configurações de auto-save — ajuste aqui
+    // Configurações de auto-save — valores padrão, ajustáveis via SettingsActivity
     // =========================================================================
     companion object {
-        const val AUTO_SAVE_TAG_COUNT    = 10_000   // auto-save a cada N tags
-        const val AUTO_SAVE_INTERVAL_MIN = 10L      // auto-save a cada N minutos
-
         private const val TAG        = "UHFReaderService"
         private const val CHANNEL_ID = "uhf_logger_channel"
         private const val NOTIF_ID   = 1001
@@ -45,6 +43,10 @@ class UHFReaderService : Service() {
         const val ACTION_STOP       = "com.uhflogger.STOP"
         const val EXTRA_DEVICE_NAME = "device_name"
     }
+
+    // Lidos do SettingsManager no início de cada sessão
+    private var autoSaveTagCount   : Int  = SettingsManager.DEFAULT_AUTO_SAVE_TAGS
+    private var autoSaveIntervalMin: Long = SettingsManager.DEFAULT_AUTO_SAVE_MINUTES.toLong()
 
     // =========================================================================
     // Binder
@@ -62,6 +64,7 @@ class UHFReaderService : Service() {
     private val tagBuffer  = ConcurrentLinkedQueue<TagRecord>() // lock-free, thread-safe
     private val totalCount = AtomicInteger(0)
     private val isRunning  = AtomicBoolean(false)
+    private val isPaused   = AtomicBoolean(false)  // parado por erro, dados preservados
 
     private var usbPort       : UsbSerialPort? = null
     private var usbConnection : UsbDeviceConnection? = null
@@ -113,26 +116,35 @@ class UHFReaderService : Service() {
 
     fun startCapture(deviceName: String) {
         if (isRunning.get()) return
+        val resuming = isPaused.getAndSet(false)
         decoder.reset()
-        totalCount.set(0)
 
-        // Abre o arquivo CSV da sessão
         val ctx = appContext ?: return
-        val fileName = CsvExporter.startSession(ctx)
-        if (fileName == null) {
-            Log.e(TAG, "Falha ao criar arquivo CSV da sessão")
-            return
+
+        if (!resuming) {
+            // Nova sessão — zera contador e cria novo arquivo
+            totalCount.set(0)
+            autoSaveTagCount    = SettingsManager.getAutoSaveTags(ctx)
+            autoSaveIntervalMin = SettingsManager.getAutoSaveMinutes(ctx)
+            Log.i(TAG, "Nova sessão — auto-save a cada $autoSaveTagCount tags ou $autoSaveIntervalMin min")
+            val fileName = CsvExporter.startSession(ctx)
+            if (fileName == null) {
+                Log.e(TAG, "Falha ao criar arquivo CSV da sessão")
+                return
+            }
+            Log.i(TAG, "Arquivo da sessão: $fileName")
+        } else {
+            Log.i(TAG, "Retomando sessão — ${totalCount.get()} tags já capturadas")
         }
-        Log.i(TAG, "Arquivo da sessão: $fileName")
 
         val usbManager = getSystemService(Context.USB_SERVICE) as UsbManager
         val availableDrivers = UsbSerialProber.getDefaultProber().findAllDrivers(usbManager)
 
         val driver = availableDrivers.firstOrNull { it.device.deviceName == deviceName }
-            ?: run { Log.e(TAG, "Device not found: $deviceName"); CsvExporter.cancelSession(); return }
+            ?: run { Log.e(TAG, "Device not found: $deviceName"); if (!resuming) CsvExporter.cancelSession(); isPaused.set(resuming); return }
 
         val connection = usbManager.openDevice(driver.device)
-            ?: run { Log.e(TAG, "USB permission denied"); CsvExporter.cancelSession(); return }
+            ?: run { Log.e(TAG, "USB permission denied"); if (!resuming) CsvExporter.cancelSession(); isPaused.set(resuming); return }
 
         val port = driver.ports[0]
         try {
@@ -144,7 +156,8 @@ class UHFReaderService : Service() {
         } catch (e: Exception) {
             Log.e(TAG, "Error opening serial port", e)
             port.close(); connection.close()
-            CsvExporter.cancelSession()
+            if (!resuming) CsvExporter.cancelSession()
+            isPaused.set(resuming)
             return
         }
 
@@ -165,7 +178,7 @@ class UHFReaderService : Service() {
                     tagBuffer.addAll(tags)
                     val total = totalCount.addAndGet(tags.size)
                     // Auto-save por contagem — sem lock, apenas drena a fila
-                    if (total % AUTO_SAVE_TAG_COUNT < tags.size) {
+                    if (total % autoSaveTagCount < tags.size) {
                         autoSaveExecutor?.submit { flushBufferToDisk() }
                     }
                 }
@@ -174,6 +187,7 @@ class UHFReaderService : Service() {
             override fun onRunError(e: Exception) {
                 Log.e(TAG, "Serial read error", e)
                 if (!isRunning.compareAndSet(true, false)) return
+                isPaused.set(true)
                 stopAutoSaveTimer()
                 ioManager?.stop(); ioManager = null
                 try { usbPort?.close() }       catch (_: Exception) {}
@@ -195,6 +209,7 @@ class UHFReaderService : Service() {
 
     fun stopCapture(): String? {
         if (!isRunning.compareAndSet(true, false)) return null
+        isPaused.set(false)
 
         stopAutoSaveTimer()
         ioManager?.stop(); ioManager = null
@@ -202,23 +217,37 @@ class UHFReaderService : Service() {
         try { usbConnection?.close() } catch (_: Exception) {}
         usbPort = null; usbConnection = null
 
-        // Drena tudo que sobrou na fila e fecha o arquivo
+        val fileName = drainAndFinalize()
+        updateNotification("Captura encerrada — ${totalCount.get()} tags salvas")
+        onStatusChanged?.invoke(false)
+        Log.i(TAG, "Capture stopped. Total tags: ${totalCount.get()}, file: $fileName")
+        totalCount.set(0)
+        return fileName
+    }
+
+    /**
+     * Salva o que estiver na fila e fecha o arquivo.
+     * Usado quando a captura já foi parada por erro (onRunError)
+     * e o usuário clica em STOP para salvar os dados.
+     */
+    fun saveAfterError(): String? {
+        isPaused.set(false)
+        val fileName = drainAndFinalize()
+        totalCount.set(0)
+        Log.i(TAG, "saveAfterError: file=$fileName")
+        return fileName
+    }
+
+    private fun drainAndFinalize(): String? {
         val lastBatch = mutableListOf<TagRecord>()
         while (tagBuffer.isNotEmpty()) {
             tagBuffer.poll()?.let { lastBatch.add(it) }
         }
-        val fileName = CsvExporter.finalizeSession(lastBatch)
-
-        updateNotification("Captura encerrada — ${totalCount.get()} tags salvas")
-        onStatusChanged?.invoke(false)
-        Log.i(TAG, "Capture stopped. Total tags: ${totalCount.get()}, file: $fileName")
-
-        totalCount.set(0)
-
-        return fileName
+        return CsvExporter.finalizeSession(lastBatch)
     }
 
     fun isCapturing(): Boolean = isRunning.get()
+    fun isPaused(): Boolean    = isPaused.get()
 
     /** Total de tags na sessão atual (gravadas + ainda no buffer) */
     fun tagCount(): Int = totalCount.get()
@@ -238,8 +267,8 @@ class UHFReaderService : Service() {
         autoSaveExecutor = Executors.newSingleThreadScheduledExecutor()
         autoSaveTimerJob = autoSaveExecutor?.scheduleAtFixedRate(
             { timerAutoSave() },
-            AUTO_SAVE_INTERVAL_MIN,
-            AUTO_SAVE_INTERVAL_MIN,
+            autoSaveIntervalMin,
+            autoSaveIntervalMin,
             TimeUnit.MINUTES
         )
     }
@@ -253,7 +282,7 @@ class UHFReaderService : Service() {
 
     private fun timerAutoSave() {
         if (!isRunning.get()) return
-        Log.i(TAG, "Auto-save por tempo (${AUTO_SAVE_INTERVAL_MIN}min)")
+        Log.i(TAG, "Auto-save por tempo (${autoSaveIntervalMin}min)")
         flushBufferToDisk()
     }
 
