@@ -8,30 +8,37 @@ object SettingsManager {
     private const val PREFS_NAME = "uhf_logger_prefs"
 
     // Keys
-    const val KEY_AUTO_SAVE_TAGS     = "auto_save_tags"
-    const val KEY_AUTO_SAVE_MINUTES  = "auto_save_minutes"
-    const val KEY_LOCATION_MODE      = "location_mode"
-    const val KEY_ANTENNA_TYPE       = "antenna_type"
-    const val KEY_WINNIX_ANT_COUNT   = "winnix_ant_count"
-    const val KEY_WINNIX_POWER_DBM   = "winnix_power_dbm"
-    const val KEY_WINNIX_WORKING_MS  = "winnix_working_ms"
+    const val KEY_AUTO_SAVE_TAGS          = "auto_save_tags"
+    const val KEY_AUTO_SAVE_MINUTES       = "auto_save_minutes"
+    const val KEY_LOCATION_MODE           = "location_mode"
+    const val KEY_ANTENNA_TYPE            = "antenna_type"
+    const val KEY_WINNIX_ANT_COUNT        = "winnix_ant_count"
+    const val KEY_WINNIX_POWER_DBM        = "winnix_power_dbm"
+    const val KEY_WINNIX_WORKING_MS       = "winnix_working_ms"
+    const val KEY_WINNIX_INVENTORY_MODE   = "winnix_inventory_mode"
 
     // Location mode values
-    const val LOCATION_MODE_HYBRID   = "hybrid"
-    const val LOCATION_MODE_GNSS     = "gnss"
+    const val LOCATION_MODE_HYBRID        = "hybrid"
+    const val LOCATION_MODE_GNSS          = "gnss"
 
     // Antenna type values
-    const val ANTENNA_TYPE_JIETONG   = "jietong"
-    const val ANTENNA_TYPE_WINNIX    = "winnix"
+    const val ANTENNA_TYPE_JIETONG        = "jietong"
+    const val ANTENNA_TYPE_WINNIX         = "winnix"
+
+    // Winnix inventory mode values
+    const val WINNIX_INV_MODE_MULTITAG    = 1   // Multi-tag — S1, high accuracy
+    const val WINNIX_INV_MODE_FAST        = 2   // Fast read — S0, max read rate (moving tags)
+    const val WINNIX_INV_MODE_ADAPTIVE    = 5   // Adaptive  — S0+S1, recommended default
 
     // Defaults
-    const val DEFAULT_AUTO_SAVE_TAGS    = 10_000
-    const val DEFAULT_AUTO_SAVE_MINUTES = 10
-    const val DEFAULT_LOCATION_MODE     = LOCATION_MODE_HYBRID
-    const val DEFAULT_ANTENNA_TYPE      = ANTENNA_TYPE_JIETONG
-    const val DEFAULT_WINNIX_ANT_COUNT  = 1
-    const val DEFAULT_WINNIX_POWER_DBM  = 30
-    const val DEFAULT_WINNIX_WORKING_MS = 100
+    const val DEFAULT_AUTO_SAVE_TAGS         = 10_000
+    const val DEFAULT_AUTO_SAVE_MINUTES      = 10
+    const val DEFAULT_LOCATION_MODE          = LOCATION_MODE_HYBRID
+    const val DEFAULT_ANTENNA_TYPE           = ANTENNA_TYPE_JIETONG
+    const val DEFAULT_WINNIX_ANT_COUNT       = 1
+    const val DEFAULT_WINNIX_POWER_DBM       = 30
+    const val DEFAULT_WINNIX_WORKING_MS      = 100
+    const val DEFAULT_WINNIX_INVENTORY_MODE  = WINNIX_INV_MODE_FAST
 
     private fun prefs(context: Context): SharedPreferences =
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -77,4 +84,17 @@ object SettingsManager {
 
     fun setWinnixWorkingMs(context: Context, value: Int) =
         prefs(context).edit().putInt(KEY_WINNIX_WORKING_MS, value).apply()
+
+    fun getWinnixInventoryMode(context: Context): Int =
+        prefs(context).getInt(KEY_WINNIX_INVENTORY_MODE, DEFAULT_WINNIX_INVENTORY_MODE)
+
+    fun setWinnixInventoryMode(context: Context, value: Int) =
+        prefs(context).edit().putInt(KEY_WINNIX_INVENTORY_MODE, value).apply()
+
+    fun winnixInventoryModeLabel(mode: Int): String = when (mode) {
+        WINNIX_INV_MODE_MULTITAG -> "Multi-tag"
+        WINNIX_INV_MODE_FAST     -> "Fast read"
+        WINNIX_INV_MODE_ADAPTIVE -> "Adaptive"
+        else                     -> "Desconhecido"
+    }
 }

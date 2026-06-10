@@ -48,11 +48,14 @@ class UHFReaderService : Service() {
     private val tagBuffer      = ConcurrentLinkedQueue<TagRecord>()
     private val totalCount     = AtomicInteger(0)
     private val isRunning      = AtomicBoolean(false)
-    private val isPaused       = AtomicBoolean(false)
+    private val isPausedState  = AtomicBoolean(false)
 
     private var usbPort        : UsbSerialPort? = null
     private var usbConnection  : UsbDeviceConnection? = null
     private var ioManager      : SerialInputOutputManager? = null
+
+    private val stopExecutor   = Executors.newSingleThreadExecutor()
+    private val configExecutor = Executors.newSingleThreadExecutor()
 
     // Auto-save
     private var autoSaveTagCount   : Int  = SettingsManager.DEFAULT_AUTO_SAVE_TAGS
@@ -61,16 +64,20 @@ class UHFReaderService : Service() {
     private var autoSaveTimerJob   : ScheduledFuture<*>? = null
 
     private var appContext: Context? = null
-
-    // Active antenna type for current session
     private var activeAntennaType: String = SettingsManager.ANTENNA_TYPE_JIETONG
 
+    // Winnix temperature tracking
+    @Volatile private var winnixStartTemp     : String = ""
+    @Volatile private var winnixStopTempValue : String = ""
+    private var winnixTempLatch: java.util.concurrent.CountDownLatch? = null
+
     // Callbacks
-    var onStatusChanged  : ((Boolean) -> Unit)? = null
-    var onCaptureError   : (() -> Unit)?        = null
-    var onAutoSaved      : ((Int) -> Unit)?     = null
-    var onWrongAntennaType: ((String) -> Unit)? = null
-    var mainActivity     : MainActivity?        = null
+    var onStatusChanged    : ((Boolean) -> Unit)? = null
+    var onCaptureError     : (() -> Unit)?        = null
+    var onAutoSaved        : ((Int) -> Unit)?     = null
+    var onWrongAntennaType : ((String) -> Unit)?  = null
+    var onStopComplete     : ((String?, Int) -> Unit)? = null
+    var mainActivity       : MainActivity?        = null
 
     // =========================================================================
     // Lifecycle
@@ -96,16 +103,17 @@ class UHFReaderService : Service() {
     override fun onDestroy() {
         stopCapture()
         mainActivity = null
+        stopExecutor.shutdownNow()
+        configExecutor.shutdownNow()
         super.onDestroy()
     }
 
     // =========================================================================
     // Public API
     // =========================================================================
-
     fun startCapture(deviceName: String) {
         if (isRunning.get()) return
-        val resuming = isPaused.getAndSet(false)
+        val resuming = isPausedState.getAndSet(false)
 
         val ctx = appContext ?: return
         activeAntennaType = SettingsManager.getAntennaType(ctx)
@@ -126,48 +134,45 @@ class UHFReaderService : Service() {
             Log.i(TAG, "Resuming session — ${totalCount.get()} tags so far ($activeAntennaType)")
         }
 
-        // Reset decoders
         jietongDecoder.reset()
         winnixDecoder.reset()
 
         val usbManager = getSystemService(Context.USB_SERVICE) as UsbManager
         val drivers    = UsbSerialProber.getDefaultProber().findAllDrivers(usbManager)
         val driver     = drivers.firstOrNull { it.device.deviceName == deviceName }
-            ?: run { Log.e(TAG, "Device not found: $deviceName"); if (!resuming) CsvExporter.cancelSession(); isPaused.set(resuming); return }
+            ?: run { Log.e(TAG, "Device not found: $deviceName"); if (!resuming) CsvExporter.cancelSession(); isPausedState.set(resuming); return }
 
         val connection = usbManager.openDevice(driver.device)
-            ?: run { Log.e(TAG, "USB permission denied"); if (!resuming) CsvExporter.cancelSession(); isPaused.set(resuming); return }
+            ?: run { Log.e(TAG, "USB permission denied"); if (!resuming) CsvExporter.cancelSession(); isPausedState.set(resuming); return }
 
         val port = driver.ports[0]
         try {
             port.open(connection)
-            port.setParameters(BAUD_RATE, UsbSerialPort.DATABITS_8,
-                UsbSerialPort.STOPBITS_1, UsbSerialPort.PARITY_NONE)
+            port.setParameters(BAUD_RATE, UsbSerialPort.DATABITS_8, UsbSerialPort.STOPBITS_1, UsbSerialPort.PARITY_NONE)
             port.dtr = true
             port.rts = true
         } catch (e: Exception) {
             Log.e(TAG, "Error opening port", e)
-            port.close(); connection.close()
+            port.close()
+            connection.close()
             if (!resuming) CsvExporter.cancelSession()
-            isPaused.set(resuming)
+            isPausedState.set(resuming)
             return
         }
 
         usbPort       = port
         usbConnection = connection
 
-        // Probe: verify that the connected antenna matches the configured type
-        // This runs on every startCapture including resume — catches wrong antenna reconnection
         if (!probeAntennaType(port, activeAntennaType)) {
             val label = if (activeAntennaType == SettingsManager.ANTENNA_TYPE_WINNIX) "Winnix" else "Jietong"
             val msg   = "Antena $label não detectada. Verifique a conexão e o tipo configurado."
             Log.w(TAG, msg)
             isRunning.set(false)
-            // Restore paused state if was resuming — data is still safe
-            if (resuming) isPaused.set(true)
+            if (resuming) isPausedState.set(true)
             try { port.close() }       catch (_: Exception) {}
             try { connection.close() } catch (_: Exception) {}
-            usbPort = null; usbConnection = null
+            usbPort = null
+            usbConnection = null
             onWrongAntennaType?.invoke(msg)
             return
         }
@@ -185,46 +190,71 @@ class UHFReaderService : Service() {
         Log.i(TAG, "Capture started ($activeAntennaType) on $deviceName @ $BAUD_RATE baud")
     }
 
-    fun stopCapture(): String? {
-        if (!isRunning.compareAndSet(true, false)) return null
-        isPaused.set(false)
-
+    fun stopCapture() {
+        if (!isRunning.compareAndSet(true, false)) return
+        isPausedState.set(false)
         stopAutoSaveTimer()
 
-        if (activeAntennaType == SettingsManager.ANTENNA_TYPE_WINNIX) {
+        stopExecutor.submit {
+            // 1. Para o inventário de leitura
             sendWinnixStop()
+
+            // 2. Prepara o gatilho assíncrono antes de requisitar temperatura
+            winnixStopTempValue = ""
+            winnixTempLatch = java.util.concurrent.CountDownLatch(1)
+
+            // 3. Pede a temperatura de encerramento
+            try { usbPort?.write(winnixBuildGetTemperature(), 2000) } catch (_: Exception) {}
+
+            // 4. Aguarda até 2 segundos pela resposta vinda do onNewData
+            val received = winnixTempLatch!!.await(2000, java.util.concurrent.TimeUnit.MILLISECONDS)
+            winnixTempLatch = null
+
+            val winnixStopTemp = if (received && winnixStopTempValue.isNotEmpty()) {
+                Log.i(TAG, "Stop temperature: $winnixStopTempValue°C")
+                winnixStopTempValue
+            } else {
+                Log.w(TAG, "Stop temperature not received within timeout")
+                ""
+            }
+
+            // 5. Finaliza o IOManager e fecha as portas de comunicação com segurança
+            ioManager?.stop()
+            ioManager = null
+            Thread.sleep(200)
+
+            closePort()
+
+            val tagCount = totalCount.get()
+            val fileName = drainAndFinalize(winnixStopTemp)
+            updateNotification("Captura encerrada — $tagCount tags")
+            totalCount.set(0)
+
+            Log.i(TAG, "Capture stopped. Total: $tagCount, file: $fileName")
+            onStatusChanged?.invoke(false)
+            onStopComplete?.invoke(fileName, tagCount)
         }
-
-        ioManager?.stop(); ioManager = null
-        try { usbPort?.close() }       catch (_: Exception) {}
-        try { usbConnection?.close() } catch (_: Exception) {}
-        usbPort = null; usbConnection = null
-
-        val fileName = drainAndFinalize()
-        updateNotification("Captura encerrada — ${totalCount.get()} tags")
-        onStatusChanged?.invoke(false)
-        Log.i(TAG, "Capture stopped. Total: ${totalCount.get()}, file: $fileName")
-        totalCount.set(0)
-        return fileName
     }
 
-    fun saveAfterError(): String? {
-        isPaused.set(false)
-        val fileName = drainAndFinalize()
-        totalCount.set(0)
-        return fileName
+    fun saveAfterError() {
+        isPausedState.set(false)
+        stopExecutor.submit {
+            val tagCount = totalCount.get()
+            val fileName = drainAndFinalize("")
+            totalCount.set(0)
+            Log.i(TAG, "Saved after error. Total: $tagCount, file: $fileName")
+            onStopComplete?.invoke(fileName, tagCount)
+        }
     }
 
     fun isCapturing(): Boolean = isRunning.get()
-    fun isPaused()   : Boolean = isPaused.get()
+    fun isPaused()   : Boolean = isPausedState.get()
     fun tagCount()   : Int     = totalCount.get()
-
-    fun flushTags(): List<TagRecord> = emptyList() // data saved incrementally
+    fun flushTags(): List<TagRecord> = emptyList()
 
     // =========================================================================
-    // Jietong capture (existing logic)
+    // Jietong capture
     // =========================================================================
-
     private fun startJietongCapture(port: UsbSerialPort) {
         ioManager = SerialInputOutputManager(port, object : SerialInputOutputManager.Listener {
             override fun onNewData(data: ByteArray) {
@@ -251,54 +281,71 @@ class UHFReaderService : Service() {
     // =========================================================================
     // Winnix capture
     // =========================================================================
-
     private fun startWinnixCapture(port: UsbSerialPort, ctx: Context) {
-        val antCount   = SettingsManager.getWinnixAntCount(ctx)
-        val powerDbm   = SettingsManager.getWinnixPowerDbm(ctx)
-        val workingMs  = SettingsManager.getWinnixWorkingMs(ctx)
-        val antennas   = (1..antCount).toList()
+        val antCount    = SettingsManager.getWinnixAntCount(ctx)
+        val powerDbm    = SettingsManager.getWinnixPowerDbm(ctx)
+        val workingMs   = SettingsManager.getWinnixWorkingMs(ctx)
+        val invMode     = SettingsManager.getWinnixInventoryMode(ctx)
+        val antennas    = (1..antCount).toList()
+        val inactiveMs  = 300
 
-        // Send config commands synchronously on a background thread before starting IOManager
-        Executors.newSingleThreadExecutor().submit {
+        winnixStartTemp = ""
+
+        configExecutor.submit {
             try {
-                // set_antennas
                 port.write(winnixBuildSetAntennas(antennas), 2000)
                 Thread.sleep(500)
-                port.purgeHwBuffers(false, true)  // discard response
+                port.purgeHwBuffers(false, true)
 
-                // set_power for each antenna
                 antennas.forEach { ant ->
                     port.write(winnixBuildSetPower(ant, powerDbm), 2000)
                     Thread.sleep(500)
                     port.purgeHwBuffers(false, true)
                 }
 
-                // set_working_time for each antenna
-                antennas.forEach { ant ->
-                    port.write(winnixBuildSetWorkingTime(ant, workingMs), 2000)
+                for (ant in 1..4) {
+                    val ms = if (ant <= antCount) workingMs else inactiveMs
+                    port.write(winnixBuildSetWorkingTime(ant, ms), 2000)
                     Thread.sleep(500)
                     port.purgeHwBuffers(false, true)
                 }
 
-                // Flush any remaining config responses
+                port.write(winnixBuildSetInventoryMode(invMode), 2000)
+                Thread.sleep(500)
+                port.purgeHwBuffers(false, true)
+
+                port.write(winnixBuildSetStatusLed(enabled = true), 2000)
+                Thread.sleep(500)
+                port.purgeHwBuffers(false, true)
+
+                val startTemp = winnixReadTemperature(port)
+                winnixStartTemp = if (startTemp != null) "%.1f".format(java.util.Locale.US, startTemp) else ""
+                Log.i(TAG, "Winnix start temperature: $winnixStartTemp°C")
+
                 Thread.sleep(200)
                 port.purgeHwBuffers(false, true)
 
-                // Send start_inventory
                 port.write(winnixBuildStartInventory(), 2000)
-                Log.i(TAG, "Winnix inventory started (ants=$antennas power=${powerDbm}dBm working=${workingMs}ms)")
+                Log.i(TAG, "Winnix inventory started (ants=$antennas power=${powerDbm}dBm working=${workingMs}ms invMode=$invMode)")
 
-                // Now start the IOManager to read tags
                 ioManager = SerialInputOutputManager(port, object : SerialInputOutputManager.Listener {
                     override fun onNewData(data: ByteArray) {
+                        checkWinnixTempResponse(data)
+
                         val lat  = mainActivity?.getCurrentLatitude()  ?: ""
                         val lon  = mainActivity?.getCurrentLongitude() ?: ""
                         val brg  = mainActivity?.getCurrentBearing()   ?: ""
                         val tags = winnixDecoder.feed(data, lat, lon, brg)
                         if (tags.isNotEmpty()) {
-                            tagBuffer.addAll(tags)
-                            val total = totalCount.addAndGet(tags.size)
-                            if (total % autoSaveTagCount < tags.size) {
+                            val processedTags = tags.toMutableList()
+                            val temp = winnixStartTemp
+                            if (temp.isNotEmpty()) {
+                                winnixStartTemp = ""
+                                processedTags[0] = processedTags[0].copy(temperature = temp)
+                            }
+                            tagBuffer.addAll(processedTags)
+                            val total = totalCount.addAndGet(processedTags.size)
+                            if (total % autoSaveTagCount < processedTags.size) {
                                 autoSaveExecutor?.submit { flushBufferToDisk() }
                             }
                         }
@@ -316,6 +363,15 @@ class UHFReaderService : Service() {
         }
     }
 
+    private fun closePort() {
+        synchronized(this) {
+            try { usbPort?.close() }       catch (_: Exception) {}
+            try { usbConnection?.close() } catch (_: Exception) {}
+            usbPort       = null
+            usbConnection = null
+        }
+    }
+
     private fun sendWinnixStop() {
         try {
             usbPort?.write(winnixBuildStopInventory(), 2000)
@@ -323,32 +379,35 @@ class UHFReaderService : Service() {
         } catch (_: Exception) {}
     }
 
-    /**
-     * Sends a version/status query to the port and checks if the response
-     * matches the expected antenna protocol header.
-     *
-     * Jietong: cmd 0x01 (get version) → response starts with [0x43, 0x4D, 0x01, 0x03]
-     * Winnix:  cmd 0x02 (get version) → response starts with [0xA5, 0x5A]
-     *
-     * Runs synchronously — called before IOManager is started.
-     * Timeout: 1000ms.
-     */
+    private fun checkWinnixTempResponse(data: ByteArray) {
+        val latch = winnixTempLatch ?: return
+        if (latch.count == 0L) return
+
+        for (i in 0 until data.size - 8) {
+            if (data[i] == 0xA5.toByte() && data[i+1] == 0x5A.toByte() && data[i+4] == 0x35.toByte()) {
+                if (data[i+5] == 0x01.toByte()) {
+                    val raw    = ((data[i+6].toInt() and 0xFF) shl 8) or (data[i+7].toInt() and 0xFF)
+                    val signed = if (raw > 32767) raw - 65536 else raw
+                    val temp   = signed / 100.0f
+                    winnixStopTempValue = "%.1f".format(java.util.Locale.US, temp)
+                    Log.i(TAG, "Winnix stop temperature captured via onNewData: $winnixStopTempValue°C")
+                    latch.countDown()
+                }
+                break
+            }
+        }
+    }
+
     private fun probeAntennaType(port: UsbSerialPort, antennaType: String): Boolean {
         return try {
             val (probeCmd, expectedHeader) = if (antennaType == SettingsManager.ANTENNA_TYPE_WINNIX) {
-                // Winnix: get version — A5 5A 00 08 02 0A 0D 0A
-                // BCC = XOR(0x00, 0x08, 0x02) = 0x0A  ✓ (verified against real capture)
-                byteArrayOf(0xA5.toByte(), 0x5A.toByte(), 0x00, 0x08, 0x02, 0x0A, 0x0D, 0x0A) to
-                        byteArrayOf(0xA5.toByte(), 0x5A.toByte())
+                byteArrayOf(0xA5.toByte(), 0x5A.toByte(), 0x00, 0x08, 0x02, 0x0A, 0x0D, 0x0A) to byteArrayOf(0xA5.toByte(), 0x5A.toByte())
             } else {
-                // Jietong: get version (0x01), eigenvalue=0x02 (host), length=0x0002, devnum=0x0000, BCC=0x00
-                byteArrayOf(0x43, 0x4D, 0x01, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00) to
-                        byteArrayOf(0x43, 0x4D, 0x01, 0x03)
+                byteArrayOf(0x43, 0x4D, 0x01, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00) to byteArrayOf(0x43, 0x4D, 0x01, 0x03)
             }
 
             port.write(probeCmd, 2000)
 
-            // Wait for response — 1000ms timeout
             val deadline   = System.currentTimeMillis() + PROBE_TIMEOUT_MS
             val readBuf    = ByteArray(64)
             val response   = mutableListOf<Byte>()
@@ -364,13 +423,10 @@ class UHFReaderService : Service() {
                 return false
             }
 
-            // Check if response starts with expected header
             val bytes = response.toByteArray()
             for (i in expectedHeader.indices) {
                 if (bytes[i] != expectedHeader[i]) {
-                    Log.w(TAG, "Probe header mismatch at byte $i: " +
-                            "expected 0x${String.format("%02X", expectedHeader[i].toInt() and 0xFF)} " +
-                            "got 0x${String.format("%02X", bytes[i].toInt() and 0xFF)}")
+                    Log.w(TAG, "Probe header mismatch at byte $i")
                     return false
                 }
             }
@@ -385,7 +441,6 @@ class UHFReaderService : Service() {
     // =========================================================================
     // Winnix frame builders
     // =========================================================================
-
     private fun winnixCalcCheck(payload: ByteArray): Byte {
         var result = 0
         for (b in payload) result = result xor (b.toInt() and 0xFF)
@@ -399,11 +454,53 @@ class UHFReaderService : Service() {
         return byteArrayOf(0xA5.toByte(), 0x5A.toByte()) + payload + byteArrayOf(check, 0x0D, 0x0A)
     }
 
-    private fun winnixBuildStartInventory(): ByteArray =
-        winnixBuildFrame(0x82, byteArrayOf(0x00, 0x00))
+    private fun winnixBuildStartInventory(): ByteArray = winnixBuildFrame(0x82, byteArrayOf(0x00, 0x00))
+    private fun winnixBuildStopInventory(): ByteArray = winnixBuildFrame(0x8C)
+    private fun winnixBuildGetTemperature(): ByteArray = winnixBuildFrame(0x34)
 
-    private fun winnixBuildStopInventory(): ByteArray =
-        winnixBuildFrame(0x8C)
+    private fun winnixBuildSetStatusLed(enabled: Boolean): ByteArray {
+        val led = if (enabled) 0x01.toByte() else 0x00.toByte()
+        return winnixBuildFrame(0x7A, byteArrayOf(0x00, 0x00, 0x00, led, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00))
+    }
+
+    private fun winnixBuildSetInventoryMode(mode: Int): ByteArray {
+        return winnixBuildFrame(0x76, byteArrayOf(0x00, (mode and 0xFF).toByte()))
+    }
+
+    private fun winnixReadTemperature(port: UsbSerialPort): Float? {
+        return try {
+            try { port.purgeHwBuffers(false, true) } catch (_: Exception) {}
+            Thread.sleep(100)
+
+            port.write(winnixBuildGetTemperature(), 2000)
+
+            val collected = mutableListOf<Byte>()
+            val deadline  = System.currentTimeMillis() + 1500L
+            val buf       = ByteArray(32)
+            while (System.currentTimeMillis() < deadline && collected.size < 11) {
+                val n = try { port.read(buf, 200) } catch (_: Exception) { 0 }
+                for (i in 0 until n) collected.add(buf[i])
+            }
+
+            if (collected.size < 9) return null
+
+            val data = collected.toByteArray()
+            val idx  = data.indexOfFirst { it == 0xA5.toByte() }
+            if (idx < 0 || idx + 8 >= data.size)          return null
+            if (data[idx + 1] != 0x5A.toByte())           return null
+            if (data[idx + 4] != 0x35.toByte())           return null
+            if (data[idx + 5] != 0x01.toByte())           return null
+
+            val raw    = ((data[idx + 6].toInt() and 0xFF) shl 8) or (data[idx + 7].toInt() and 0xFF)
+            val signed = if (raw > 32767) raw - 65536 else raw
+            val temp   = signed / 100.0f
+            Log.i(TAG, "Temperature read: $temp°C")
+            temp
+        } catch (e: Exception) {
+            Log.w(TAG, "Temperature read failed: ${e.message}")
+            null
+        }
+    }
 
     private fun winnixBuildSetAntennas(antennas: List<Int>): ByteArray {
         var mask = 0L
@@ -424,11 +521,7 @@ class UHFReaderService : Service() {
 
     private fun winnixBuildSetWorkingTime(antenna: Int, timeMs: Int): ByteArray {
         val dbyte2 = (antenna and 0x0F).toByte()
-        return winnixBuildFrame(0x4A, byteArrayOf(
-            dbyte2,
-            ((timeMs shr 8) and 0xFF).toByte(),
-            (timeMs and 0xFF).toByte()
-        ))
+        return winnixBuildFrame(0x4A, byteArrayOf(dbyte2, ((timeMs shr 8) and 0xFF).toByte(), (timeMs and 0xFF).toByte()))
     }
 
     private fun Long.toBytesLE8(): ByteArray {
@@ -440,16 +533,14 @@ class UHFReaderService : Service() {
     // =========================================================================
     // Shared error handler
     // =========================================================================
-
     private fun handleRunError(e: Exception) {
         Log.e(TAG, "Serial read error — device likely disconnected", e)
         if (!isRunning.compareAndSet(true, false)) return
-        isPaused.set(true)
+        isPausedState.set(true)
         stopAutoSaveTimer()
-        ioManager?.stop(); ioManager = null
-        try { usbPort?.close() }       catch (_: Exception) {}
-        try { usbConnection?.close() } catch (_: Exception) {}
-        usbPort = null; usbConnection = null
+        ioManager?.stop()
+        ioManager = null
+        closePort()
         updateNotification("Sinal perdido — ${totalCount.get()} tags aguardando salvamento")
         onCaptureError?.invoke()
     }
@@ -457,7 +548,6 @@ class UHFReaderService : Service() {
     // =========================================================================
     // Auto-save
     // =========================================================================
-
     private fun startAutoSaveTimer() {
         autoSaveExecutor = Executors.newSingleThreadScheduledExecutor()
         autoSaveTimerJob = autoSaveExecutor?.scheduleAtFixedRate(
@@ -490,16 +580,15 @@ class UHFReaderService : Service() {
         }
     }
 
-    private fun drainAndFinalize(): String? {
+    private fun drainAndFinalize(winnixStopTemp: String = ""): String? {
         val lastBatch = mutableListOf<TagRecord>()
         while (tagBuffer.isNotEmpty()) tagBuffer.poll()?.let { lastBatch.add(it) }
-        return CsvExporter.finalizeSession(lastBatch)
+        return CsvExporter.finalizeSession(lastBatch, winnixStopTemp)
     }
 
     // =========================================================================
     // Notification
     // =========================================================================
-
     private fun createNotificationChannel() {
         val channel = NotificationChannel(CHANNEL_ID, "UHF Logger", NotificationManager.IMPORTANCE_LOW)
             .apply { description = "Serviço de captura RFID UHF" }
@@ -507,8 +596,7 @@ class UHFReaderService : Service() {
     }
 
     private fun buildNotification(text: String): Notification {
-        val pi = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE)
+        val pi = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
         return Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("UHF Data Logger")
             .setContentText(text)
@@ -519,8 +607,7 @@ class UHFReaderService : Service() {
     }
 
     private fun updateNotification(text: String) {
-        (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
-            .notify(NOTIF_ID, buildNotification(text))
+        (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).notify(NOTIF_ID, buildNotification(text))
     }
 
     companion object {
@@ -528,7 +615,7 @@ class UHFReaderService : Service() {
         private const val CHANNEL_ID = "uhf_logger_channel"
         private const val NOTIF_ID   = 1001
         private const val BAUD_RATE         = 115200
-        private const val PROBE_TIMEOUT_MS  = 250L    // timeout for antenna type detection probe
+        private const val PROBE_TIMEOUT_MS  = 250L
 
         const val ACTION_START      = "com.uhflogger.START"
         const val ACTION_STOP       = "com.uhflogger.STOP"

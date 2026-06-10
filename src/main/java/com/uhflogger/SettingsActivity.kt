@@ -153,6 +153,14 @@ class SettingsActivity : AppCompatActivity() {
             }
         }
 
+        // Inventory mode
+        val invMode = SettingsManager.getWinnixInventoryMode(this)
+        buildRow(section, "Modo de inventário",
+            SettingsManager.winnixInventoryModeLabel(invMode),
+            ROW_WINNIX_INV_MODE) {
+            showWinnixInventoryModeDialog(section)
+        }
+
         return section
     }
 
@@ -202,6 +210,53 @@ class SettingsActivity : AppCompatActivity() {
                 winnixSection.visibility = if (type == SettingsManager.ANTENNA_TYPE_WINNIX)
                     View.VISIBLE else View.GONE
                 toast("Salvo: $label")
+            }
+            .setNegativeButton("Cancelar", null)
+            .show()
+    }
+
+    private fun showWinnixInventoryModeDialog(parent: LinearLayout) {
+        val current = SettingsManager.getWinnixInventoryMode(this)
+
+        val wrapper = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.WHITE)
+            val p = dp(20)
+            setPadding(p, dp(8), p, dp(8))
+        }
+
+        data class ModeOption(val id: Int, val mode: Int, val label: String, val desc: String)
+        val options = listOf(
+            ModeOption(40, SettingsManager.WINNIX_INV_MODE_MULTITAG,
+                "Multi-tag", "Alta precisão para grande quantidade de tags"),
+            ModeOption(41, SettingsManager.WINNIX_INV_MODE_FAST,
+                "Fast read", "Máxima velocidade de leitura — ideal para tags em movimento"),
+            ModeOption(42, SettingsManager.WINNIX_INV_MODE_ADAPTIVE,
+                "Adaptive", "Modo adaptativo — recomendado para a maioria dos cenários")
+        )
+
+        val radioGroup = RadioGroup(this)
+        for (opt in options) {
+            val rb = RadioButton(this).apply {
+                id        = opt.id
+                text      = "${opt.label} — ${opt.desc}"
+                setTextColor(TEXT)
+                textSize  = 13f
+                isChecked = current == opt.mode
+            }
+            radioGroup.addView(rb)
+        }
+        wrapper.addView(radioGroup)
+
+        AlertDialog.Builder(this, android.R.style.Theme_Material_Light_Dialog_Alert)
+            .setTitle("Modo de inventário (Winnix)")
+            .setView(wrapper)
+            .setPositiveButton("Salvar") { _, _ ->
+                val selected = options.firstOrNull { it.id == radioGroup.checkedRadioButtonId }
+                    ?: options[1] // default Fast read
+                SettingsManager.setWinnixInventoryMode(this, selected.mode)
+                updateRowValue(parent, ROW_WINNIX_INV_MODE, selected.label)
+                toast("Salvo: ${selected.label}")
             }
             .setNegativeButton("Cancelar", null)
             .show()
@@ -366,6 +421,8 @@ class SettingsActivity : AppCompatActivity() {
                             SettingsManager.DEFAULT_WINNIX_POWER_DBM)
                         SettingsManager.setWinnixWorkingMs(this@SettingsActivity,
                             SettingsManager.DEFAULT_WINNIX_WORKING_MS)
+                        SettingsManager.setWinnixInventoryMode(this@SettingsActivity,
+                            SettingsManager.DEFAULT_WINNIX_INVENTORY_MODE)
 
                         updateRowValue(parent, ROW_TAGS,
                             "A cada ${SettingsManager.DEFAULT_AUTO_SAVE_TAGS} tags")
@@ -492,5 +549,6 @@ class SettingsActivity : AppCompatActivity() {
         private const val ROW_WINNIX_ANT_COUNT= 2005
         private const val ROW_WINNIX_POWER    = 2006
         private const val ROW_WINNIX_WORKING  = 2007
+        private const val ROW_WINNIX_INV_MODE = 2008
     }
 }

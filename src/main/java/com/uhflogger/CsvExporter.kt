@@ -14,9 +14,11 @@ object CsvExporter {
 
     private const val TAG = "CsvExporter"
 
-    private var sessionUri    : Uri?           = null
-    private var sessionWriter : BufferedWriter? = null
-    private var sessionFile   : String?        = null
+    private var sessionUri        : Uri?           = null
+    private var sessionWriter     : BufferedWriter? = null
+    private var sessionFile       : String?        = null
+    // Last tag line held in memory — flushed with temperature when session finalizes
+    private var pendingLastLine   : String?        = null
 
     // -------------------------------------------------------------------------
     // Session API
@@ -46,9 +48,10 @@ object CsvExporter {
             writer.newLine()
             writer.flush()
 
-            sessionUri    = uri
-            sessionWriter = writer
-            sessionFile   = fileName
+            sessionUri       = uri
+            sessionWriter    = writer
+            sessionFile      = fileName
+            pendingLastLine  = null
             Log.i(TAG, "Session started: $fileName")
             fileName
         } catch (e: Exception) {
@@ -62,7 +65,17 @@ object CsvExporter {
         if (tags.isEmpty()) return true
         val writer = sessionWriter ?: return false.also { Log.e(TAG, "No active session") }
         return try {
-            tags.forEach { tag -> writer.write(tag.toCsvLine()); writer.newLine() }
+            // Flush any previously held last line before writing new tags
+            pendingLastLine?.let { writer.write(it); writer.newLine() }
+            pendingLastLine = null
+
+            // Write all but the last tag immediately
+            // Hold the last tag as pendingLastLine so temperature can be applied later
+            for (i in 0 until tags.size - 1) {
+                writer.write(tags[i].toCsvLine())
+                writer.newLine()
+            }
+            pendingLastLine = tags.last().toCsvLine()
             writer.flush()
             true
         } catch (e: Exception) {
@@ -71,8 +84,46 @@ object CsvExporter {
         }
     }
 
-    fun finalizeSession(tags: List<TagRecord>): String? {
-        appendTags(tags)
+    /**
+     * Finalize session.
+     * If stopTemperature is provided (Winnix only), it is applied to the last tag line.
+     */
+    fun finalizeSession(tags: List<TagRecord>, stopTemperature: String = ""): String? {
+        val writer = sessionWriter
+        if (writer != null) {
+            try {
+                if (tags.isEmpty()) {
+                    // Final batch is empty — apply temperature to the pendingLastLine if available
+                    val line = if (stopTemperature.isNotEmpty() && pendingLastLine != null)
+                        pendingLastLine!! + ",$stopTemperature"
+                    else
+                        pendingLastLine
+                    line?.let { writer.write(it); writer.newLine() }
+                    pendingLastLine = null
+                } else {
+                    // Flush pending line without temperature (not the last tag overall)
+                    pendingLastLine?.let { writer.write(it); writer.newLine() }
+                    pendingLastLine = null
+
+                    // Write all but last of the final batch
+                    for (i in 0 until tags.size - 1) {
+                        writer.write(tags[i].toCsvLine())
+                        writer.newLine()
+                    }
+
+                    // Last tag — apply stop temperature if provided
+                    val lastTag = if (stopTemperature.isNotEmpty())
+                        tags.last().copy(temperature = stopTemperature)
+                    else
+                        tags.last()
+                    writer.write(lastTag.toCsvLine())
+                    writer.newLine()
+                }
+                writer.flush()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error writing final batch", e)
+            }
+        }
         val fileName = sessionFile
         closeWriter()
         Log.i(TAG, "Session finalized: $fileName")
@@ -108,8 +159,9 @@ object CsvExporter {
 
     private fun closeWriter() {
         try { sessionWriter?.close() } catch (_: Exception) {}
-        sessionWriter = null
-        sessionUri    = null
-        sessionFile   = null
+        sessionWriter  = null
+        sessionUri     = null
+        sessionFile    = null
+        pendingLastLine = null
     }
 }
