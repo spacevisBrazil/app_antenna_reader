@@ -463,8 +463,14 @@ class UHFReaderService : Service() {
         return winnixBuildFrame(0x7A, byteArrayOf(0x00, 0x00, 0x00, led, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00))
     }
 
+    /**
+     * mode: table mode 1-5 (as defined in SettingsManager WINNIX_INV_MODE_*).
+     * Protocol DByte0 values are 0-4, with a -1 offset from the table numbering.
+     * Verified against doc example: Fast read (table Mode 2) = DByte0 0x01.
+     */
     private fun winnixBuildSetInventoryMode(mode: Int): ByteArray {
-        return winnixBuildFrame(0x76, byteArrayOf(0x00, (mode and 0xFF).toByte()))
+        val dbyte0 = (mode - 1) and 0xFF
+        return winnixBuildFrame(0x76, byteArrayOf(0x00, dbyte0.toByte()))
     }
 
     private fun winnixReadTemperature(port: UsbSerialPort): Float? {
