@@ -101,6 +101,16 @@ class UHFReaderService : Service() {
     }
 
     override fun onDestroy() {
+        // If Winnix was active and app is closing without a proper stop,
+        // send stop command directly. The module keeps inventorying indefinitely
+        // without an explicit 0x8C — this covers the case where the user closes
+        // the app without pressing Stop.
+        if (activeAntennaType == SettingsManager.ANTENNA_TYPE_WINNIX && usbPort != null) {
+            try {
+                usbPort?.write(winnixBuildStopInventory(), 1000)
+                Thread.sleep(200)
+            } catch (_: Exception) {}
+        }
         stopCapture()
         mainActivity = null
         stopExecutor.shutdownNow()
@@ -400,17 +410,31 @@ class UHFReaderService : Service() {
 
     private fun probeAntennaType(port: UsbSerialPort, antennaType: String): Boolean {
         return try {
+            // For Winnix: send stop inventory before probing.
+            // If the module was left running (e.g. app closed without Stop),
+            // it will be inventorying continuously. The stop is silently ignored
+            // if the module is already idle.
+            if (antennaType == SettingsManager.ANTENNA_TYPE_WINNIX) {
+                port.write(winnixBuildStopInventory(), 1000)
+                Thread.sleep(300)
+                // Flush any inventory data that was in-flight before the stop
+                try { port.purgeHwBuffers(false, true) } catch (_: Exception) {}
+                Thread.sleep(100)
+            }
+
             val (probeCmd, expectedHeader) = if (antennaType == SettingsManager.ANTENNA_TYPE_WINNIX) {
-                byteArrayOf(0xA5.toByte(), 0x5A.toByte(), 0x00, 0x08, 0x02, 0x0A, 0x0D, 0x0A) to byteArrayOf(0xA5.toByte(), 0x5A.toByte())
+                byteArrayOf(0xA5.toByte(), 0x5A.toByte(), 0x00, 0x08, 0x02, 0x0A, 0x0D, 0x0A) to
+                        byteArrayOf(0xA5.toByte(), 0x5A.toByte())
             } else {
-                byteArrayOf(0x43, 0x4D, 0x01, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00) to byteArrayOf(0x43, 0x4D, 0x01, 0x03)
+                byteArrayOf(0x43, 0x4D, 0x01, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00) to
+                        byteArrayOf(0x43, 0x4D, 0x01, 0x03)
             }
 
             port.write(probeCmd, 2000)
 
-            val deadline   = System.currentTimeMillis() + PROBE_TIMEOUT_MS
-            val readBuf    = ByteArray(64)
-            val response   = mutableListOf<Byte>()
+            val deadline = System.currentTimeMillis() + PROBE_TIMEOUT_MS
+            val readBuf  = ByteArray(64)
+            val response = mutableListOf<Byte>()
 
             while (System.currentTimeMillis() < deadline && response.size < 16) {
                 val n = try { port.read(readBuf, 100) } catch (_: Exception) { 0 }
