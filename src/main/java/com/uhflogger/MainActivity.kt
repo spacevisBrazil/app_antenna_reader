@@ -33,6 +33,8 @@ import com.uhflogger.databinding.ActivityMainBinding
 import com.uhflogger.service.UHFReaderService
 import com.uhflogger.SettingsManager
 import com.uhflogger.SettingsActivity
+import com.uhflogger.drive.DriveHelper
+import com.uhflogger.drive.DriveMonitorService
 
 class MainActivity : AppCompatActivity(), SensorEventListener {
 
@@ -170,6 +172,10 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
         sensorManager   = getSystemService(SENSOR_SERVICE)  as SensorManager
         locationManager = getSystemService(LOCATION_SERVICE) as LocationManager
+
+        if (DriveHelper.isSignedIn(this)) {
+            DriveMonitorService.start(this)
+        }
 
         requestNotificationPermission()
         requestLocationPermission()

@@ -1,62 +1,52 @@
 package com.uhflogger
 
-import android.content.ContentValues
 import android.content.Context
-import android.net.Uri
-import android.os.Environment
-import android.provider.MediaStore
 import android.util.Log
 import com.uhflogger.model.TagRecord
 import java.io.BufferedWriter
-import java.io.OutputStreamWriter
+import java.io.File
+import java.io.FileWriter
 
 object CsvExporter {
 
     private const val TAG = "CsvExporter"
 
-    private var sessionUri        : Uri?           = null
-    private var sessionWriter     : BufferedWriter? = null
-    private var sessionFile       : String?        = null
+    private var sessionWriter   : BufferedWriter? = null
+    private var sessionFile     : String?         = null
+    private var sessionFilePath : String?         = null
     // Last tag line held in memory — flushed with temperature when session finalizes
-    private var pendingLastLine   : String?        = null
+    private var pendingLastLine : String?         = null
 
     // -------------------------------------------------------------------------
     // Session API
     // -------------------------------------------------------------------------
 
-    /** prefix: "jietong" or "winnix" — used in filename */
+    /**
+     * prefix: "jietong" or "winnix" — used in filename.
+     * Files saved to: /sdcard/Android/data/com.uhflogger/files/csv/
+     * No storage permission needed (scoped storage, Android 10+).
+     * FileObserver watches this folder and triggers Drive upload automatically.
+     */
     fun startSession(context: Context, prefix: String = "rfid"): String? {
         closeWriter()
         val fileName = "${prefix}_${System.currentTimeMillis()}.csv"
-
-        val contentValues = ContentValues().apply {
-            put(MediaStore.Downloads.DISPLAY_NAME, fileName)
-            put(MediaStore.Downloads.MIME_TYPE, "text/csv")
-            put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
-        }
-
-        val resolver = context.contentResolver
-        val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, contentValues)
-            ?: return null.also { Log.e(TAG, "Failed to create MediaStore entry") }
+        val folder   = getCsvFolder(context)
+        val file     = File(folder, fileName)
 
         return try {
-            val outputStream = resolver.openOutputStream(uri, "wa")
-                ?: return null.also { Log.e(TAG, "Failed to open output stream") }
-
-            val writer = BufferedWriter(OutputStreamWriter(outputStream))
+            val writer = BufferedWriter(FileWriter(file, false))
             writer.write(TagRecord.CSV_HEADER)
             writer.newLine()
             writer.flush()
 
-            sessionUri       = uri
-            sessionWriter    = writer
-            sessionFile      = fileName
-            pendingLastLine  = null
-            Log.i(TAG, "Session started: $fileName")
+            sessionWriter   = writer
+            sessionFile     = fileName
+            sessionFilePath = file.absolutePath
+            pendingLastLine = null
+            Log.i(TAG, "Session started: ${file.absolutePath}")
             fileName
         } catch (e: Exception) {
             Log.e(TAG, "Error starting session", e)
-            resolver.delete(uri, null, null)
             null
         }
     }
@@ -85,7 +75,7 @@ object CsvExporter {
     }
 
     /**
-     * Finalize session.
+     * Finalize session and signal file is ready for Drive upload.
      * If stopTemperature is provided (Winnix only), it is applied to the last tag line.
      */
     fun finalizeSession(tags: List<TagRecord>, stopTemperature: String = ""): String? {
@@ -124,44 +114,31 @@ object CsvExporter {
                 Log.e(TAG, "Error writing final batch", e)
             }
         }
+
         val fileName = sessionFile
+        Log.i(TAG, "Session finalized: $fileName — FileObserver will trigger upload")
         closeWriter()
-        Log.i(TAG, "Session finalized: $fileName")
         return fileName
     }
 
     fun cancelSession() = closeWriter()
 
     // -------------------------------------------------------------------------
-    // Legacy
+    // Helpers
     // -------------------------------------------------------------------------
-    fun export(context: Context, tags: List<TagRecord>): String? {
-        if (tags.isEmpty()) return null
-        val fileName = "rfid_${System.currentTimeMillis()}.csv"
-        val contentValues = ContentValues().apply {
-            put(MediaStore.Downloads.DISPLAY_NAME, fileName)
-            put(MediaStore.Downloads.MIME_TYPE, "text/csv")
-            put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
-        }
-        val resolver = context.contentResolver
-        val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, contentValues)
-            ?: return null
-        return try {
-            resolver.openOutputStream(uri)?.bufferedWriter()?.use { writer ->
-                writer.write(TagRecord.CSV_HEADER); writer.newLine()
-                tags.forEach { writer.write(it.toCsvLine()); writer.newLine() }
-            }
-            fileName
-        } catch (e: Exception) {
-            resolver.delete(uri, null, null); null
-        }
+
+    /** Returns (and creates if needed) the folder where CSV files are stored */
+    fun getCsvFolder(context: Context): File {
+        val dir = File(context.getExternalFilesDir(null), "csv")
+        if (!dir.exists()) dir.mkdirs()
+        return dir
     }
 
     private fun closeWriter() {
         try { sessionWriter?.close() } catch (_: Exception) {}
-        sessionWriter  = null
-        sessionUri     = null
-        sessionFile    = null
+        sessionWriter   = null
+        sessionFile     = null
+        sessionFilePath = null
         pendingLastLine = null
     }
 }
