@@ -59,13 +59,19 @@ class SettingsActivity : AppCompatActivity() {
             "A cada ${SettingsManager.getAutoSaveMinutes(this)} min",
             ROW_MINUTES) {
             showNumberDialog("Auto-save por tempo",
-                "Entre 1 e 60 minutos",
+                "Entre 1 e 1440 minutos (1440 = 24h)",
                 SettingsManager.getAutoSaveMinutes(this).toString(),
-                1, 60) { v ->
+                1, 1440) { v ->
                 SettingsManager.setAutoSaveMinutes(this, v)
                 updateRowValue(root, ROW_MINUTES, "A cada $v min")
                 toast("Salvo")
             }
+        }
+
+        val modeLabel = if (SettingsManager.getAutoSaveMode(this) == SettingsManager.AUTO_SAVE_MODE_NEW_FILE)
+            "Novo arquivo a cada auto-save" else "Atualizar arquivo atual"
+        buildRow(root, "Modo de auto-save", modeLabel, ROW_AUTO_SAVE_MODE) {
+            showAutoSaveModeDialog(root)
         }
 
         // --- LOCALIZAÇÃO ------------------------------------------------
@@ -364,6 +370,41 @@ class SettingsActivity : AppCompatActivity() {
             .show()
     }
 
+    private fun showAutoSaveModeDialog(parent: LinearLayout) {
+        val current = SettingsManager.getAutoSaveMode(this)
+        val wrapper = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.WHITE)
+            val p = dp(20); setPadding(p, dp(8), p, dp(8))
+        }
+        val radioGroup = RadioGroup(this)
+        val rbAppend = RadioButton(this).apply {
+            id = 50; text = "Atualizar arquivo atual — um único CSV por sessão"
+            setTextColor(TEXT); textSize = 13f
+            isChecked = current == SettingsManager.AUTO_SAVE_MODE_APPEND
+        }
+        val rbNew = RadioButton(this).apply {
+            id = 51; text = "Novo arquivo a cada auto-save — múltiplos CSVs por sessão"
+            setTextColor(TEXT); textSize = 13f
+            isChecked = current == SettingsManager.AUTO_SAVE_MODE_NEW_FILE
+        }
+        radioGroup.addView(rbAppend); radioGroup.addView(rbNew)
+        wrapper.addView(radioGroup)
+        AlertDialog.Builder(this, android.R.style.Theme_Material_Light_Dialog_Alert)
+            .setTitle("Modo de auto-save")
+            .setView(wrapper)
+            .setPositiveButton("Salvar") { _, _ ->
+                val mode = if (radioGroup.checkedRadioButtonId == 51)
+                    SettingsManager.AUTO_SAVE_MODE_NEW_FILE else SettingsManager.AUTO_SAVE_MODE_APPEND
+                SettingsManager.setAutoSaveMode(this, mode)
+                val label = if (mode == SettingsManager.AUTO_SAVE_MODE_NEW_FILE)
+                    "Novo arquivo a cada auto-save" else "Atualizar arquivo atual"
+                updateRowValue(parent, ROW_AUTO_SAVE_MODE, label)
+                toast("Salvo")
+            }
+            .setNegativeButton("Cancelar", null).show()
+    }
+
     private fun showLocationDialog(parent: LinearLayout) {
         val current = SettingsManager.getLocationMode(this)
 
@@ -430,6 +471,8 @@ class SettingsActivity : AppCompatActivity() {
                             SettingsManager.DEFAULT_AUTO_SAVE_TAGS)
                         SettingsManager.setAutoSaveMinutes(this@SettingsActivity,
                             SettingsManager.DEFAULT_AUTO_SAVE_MINUTES)
+                        SettingsManager.setAutoSaveMode(this@SettingsActivity,
+                            SettingsManager.DEFAULT_AUTO_SAVE_MODE)
                         SettingsManager.setLocationMode(this@SettingsActivity,
                             SettingsManager.DEFAULT_LOCATION_MODE)
                         SettingsManager.setAntennaType(this@SettingsActivity,
@@ -447,6 +490,7 @@ class SettingsActivity : AppCompatActivity() {
                             "A cada ${SettingsManager.DEFAULT_AUTO_SAVE_TAGS} tags")
                         updateRowValue(parent, ROW_MINUTES,
                             "A cada ${SettingsManager.DEFAULT_AUTO_SAVE_MINUTES} min")
+                        updateRowValue(parent, ROW_AUTO_SAVE_MODE, "Atualizar arquivo atual")
                         updateRowValue(parent, ROW_LOCATION, "GNSS + Rede")
                         updateRowValue(parent, ROW_ANTENNA_TYPE, "Jietong")
 
@@ -563,6 +607,7 @@ class SettingsActivity : AppCompatActivity() {
     companion object {
         private const val ROW_TAGS            = 2001
         private const val ROW_MINUTES         = 2002
+        private const val ROW_AUTO_SAVE_MODE  = 2010
         private const val ROW_LOCATION        = 2003
         private const val ROW_ANTENNA_TYPE    = 2004
         private const val ROW_WINNIX_ANT_COUNT= 2005

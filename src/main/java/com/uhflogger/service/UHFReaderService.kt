@@ -60,8 +60,11 @@ class UHFReaderService : Service() {
     // Auto-save
     private var autoSaveTagCount   : Int  = SettingsManager.DEFAULT_AUTO_SAVE_TAGS
     private var autoSaveIntervalMin: Long = SettingsManager.DEFAULT_AUTO_SAVE_MINUTES.toLong()
+    private var autoSaveMode       : Int  = SettingsManager.DEFAULT_AUTO_SAVE_MODE
     private var autoSaveExecutor   : ScheduledExecutorService? = null
     private var autoSaveTimerJob   : ScheduledFuture<*>? = null
+    // Tags accumulated since the last auto-save — resets after each save (req 1)
+    private val tagsSinceLastSave  = AtomicInteger(0)
 
     private var appContext: Context? = null
     private var activeAntennaType: String = SettingsManager.ANTENNA_TYPE_JIETONG
@@ -101,10 +104,9 @@ class UHFReaderService : Service() {
     }
 
     override fun onDestroy() {
-        // If Winnix was active and app is closing without a proper stop,
-        // send stop command directly. The module keeps inventorying indefinitely
-        // without an explicit 0x8C — this covers the case where the user closes
-        // the app without pressing Stop.
+        // Opção 3: Se Winnix estava ativo e o app fecha sem clicar Stop,
+        // envia o 0x8C diretamente para parar o módulo.
+        // Cobre o caso de fechar o app normalmente pelo botão de voltar ou gerenciador.
         if (activeAntennaType == SettingsManager.ANTENNA_TYPE_WINNIX && usbPort != null) {
             try {
                 usbPort?.write(winnixBuildStopInventory(), 1000)
@@ -130,8 +132,10 @@ class UHFReaderService : Service() {
 
         if (!resuming) {
             totalCount.set(0)
+            tagsSinceLastSave.set(0)
             autoSaveTagCount    = SettingsManager.getAutoSaveTags(ctx)
             autoSaveIntervalMin = SettingsManager.getAutoSaveMinutes(ctx)
+            autoSaveMode        = SettingsManager.getAutoSaveMode(ctx)
 
             val prefix   = if (activeAntennaType == SettingsManager.ANTENNA_TYPE_WINNIX) "winnix" else "jietong"
             val fileName = CsvExporter.startSession(ctx, prefix)
@@ -274,8 +278,9 @@ class UHFReaderService : Service() {
                 val tags = jietongDecoder.feed(data, lat, lon, brg)
                 if (tags.isNotEmpty()) {
                     tagBuffer.addAll(tags)
-                    val total = totalCount.addAndGet(tags.size)
-                    if (total % autoSaveTagCount < tags.size) {
+                    totalCount.addAndGet(tags.size)
+                    val sinceLast = tagsSinceLastSave.addAndGet(tags.size)
+                    if (sinceLast >= autoSaveTagCount) {
                         autoSaveExecutor?.submit { flushBufferToDisk() }
                     }
                 }
@@ -354,8 +359,9 @@ class UHFReaderService : Service() {
                                 processedTags[0] = processedTags[0].copy(temperature = temp)
                             }
                             tagBuffer.addAll(processedTags)
-                            val total = totalCount.addAndGet(processedTags.size)
-                            if (total % autoSaveTagCount < processedTags.size) {
+                            totalCount.addAndGet(processedTags.size)
+                            val sinceLast = tagsSinceLastSave.addAndGet(processedTags.size)
+                            if (sinceLast >= autoSaveTagCount) {
                                 autoSaveExecutor?.submit { flushBufferToDisk() }
                             }
                         }
@@ -410,31 +416,17 @@ class UHFReaderService : Service() {
 
     private fun probeAntennaType(port: UsbSerialPort, antennaType: String): Boolean {
         return try {
-            // For Winnix: send stop inventory before probing.
-            // If the module was left running (e.g. app closed without Stop),
-            // it will be inventorying continuously. The stop is silently ignored
-            // if the module is already idle.
-            if (antennaType == SettingsManager.ANTENNA_TYPE_WINNIX) {
-                port.write(winnixBuildStopInventory(), 1000)
-                Thread.sleep(300)
-                // Flush any inventory data that was in-flight before the stop
-                try { port.purgeHwBuffers(false, true) } catch (_: Exception) {}
-                Thread.sleep(100)
-            }
-
             val (probeCmd, expectedHeader) = if (antennaType == SettingsManager.ANTENNA_TYPE_WINNIX) {
-                byteArrayOf(0xA5.toByte(), 0x5A.toByte(), 0x00, 0x08, 0x02, 0x0A, 0x0D, 0x0A) to
-                        byteArrayOf(0xA5.toByte(), 0x5A.toByte())
+                byteArrayOf(0xA5.toByte(), 0x5A.toByte(), 0x00, 0x08, 0x02, 0x0A, 0x0D, 0x0A) to byteArrayOf(0xA5.toByte(), 0x5A.toByte())
             } else {
-                byteArrayOf(0x43, 0x4D, 0x01, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00) to
-                        byteArrayOf(0x43, 0x4D, 0x01, 0x03)
+                byteArrayOf(0x43, 0x4D, 0x01, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00) to byteArrayOf(0x43, 0x4D, 0x01, 0x03)
             }
 
             port.write(probeCmd, 2000)
 
-            val deadline = System.currentTimeMillis() + PROBE_TIMEOUT_MS
-            val readBuf  = ByteArray(64)
-            val response = mutableListOf<Byte>()
+            val deadline   = System.currentTimeMillis() + PROBE_TIMEOUT_MS
+            val readBuf    = ByteArray(64)
+            val response   = mutableListOf<Byte>()
 
             while (System.currentTimeMillis() < deadline && response.size < 16) {
                 val n = try { port.read(readBuf, 100) } catch (_: Exception) { 0 }
@@ -487,14 +479,8 @@ class UHFReaderService : Service() {
         return winnixBuildFrame(0x7A, byteArrayOf(0x00, 0x00, 0x00, led, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00))
     }
 
-    /**
-     * mode: table mode 1-5 (as defined in SettingsManager WINNIX_INV_MODE_*).
-     * Protocol DByte0 values are 0-4, with a -1 offset from the table numbering.
-     * Verified against doc example: Fast read (table Mode 2) = DByte0 0x01.
-     */
     private fun winnixBuildSetInventoryMode(mode: Int): ByteArray {
-        val dbyte0 = (mode - 1) and 0xFF
-        return winnixBuildFrame(0x76, byteArrayOf(0x00, dbyte0.toByte()))
+        return winnixBuildFrame(0x76, byteArrayOf(0x00, (mode and 0xFF).toByte()))
     }
 
     private fun winnixReadTemperature(port: UsbSerialPort): Float? {
@@ -580,7 +566,9 @@ class UHFReaderService : Service() {
     // =========================================================================
     private fun startAutoSaveTimer() {
         autoSaveExecutor = Executors.newSingleThreadScheduledExecutor()
-        autoSaveTimerJob = autoSaveExecutor?.scheduleAtFixedRate(
+        // scheduleWithFixedDelay: delay starts AFTER task completes
+        // This means the timer naturally resets after each save
+        autoSaveTimerJob = autoSaveExecutor?.scheduleWithFixedDelay(
             { if (isRunning.get()) flushBufferToDisk() },
             autoSaveIntervalMin, autoSaveIntervalMin, TimeUnit.MINUTES
         )
@@ -595,24 +583,57 @@ class UHFReaderService : Service() {
 
     private fun flushBufferToDisk() {
         if (!isRunning.get()) return
+
         val batch = mutableListOf<TagRecord>()
         while (tagBuffer.isNotEmpty()) tagBuffer.poll()?.let { batch.add(it) }
-        if (batch.isEmpty()) return
 
-        val ok = CsvExporter.appendTags(batch)
-        if (ok) {
-            Log.i(TAG, "Auto-save: ${batch.size} tags, total: ${totalCount.get()}")
+        // Req 4: skip if no new tags to save
+        if (batch.isEmpty()) {
+            Log.d(TAG, "Auto-save skipped — no new tags")
+            return
+        }
+
+        // Reset the per-save counter (Req 1: resets the other counter)
+        tagsSinceLastSave.set(0)
+
+        val ctx = appContext ?: return
+
+        if (autoSaveMode == SettingsManager.AUTO_SAVE_MODE_NEW_FILE) {
+            // Req 2: new file mode — finalize current session and start a new one
+            val fileName = CsvExporter.finalizeSession(batch)
+            Log.i(TAG, "Auto-save (new file): $fileName — ${batch.size} tags")
+            // Start a new session for the next batch
+            val prefix   = if (activeAntennaType == SettingsManager.ANTENNA_TYPE_WINNIX) "winnix" else "jietong"
+            val newFile  = CsvExporter.startSession(ctx, prefix)
+            Log.i(TAG, "New session started: $newFile")
             updateNotification("Capturando… (${totalCount.get()} tags)")
             onAutoSaved?.invoke(totalCount.get())
         } else {
-            Log.e(TAG, "Auto-save failed — reinserting")
-            tagBuffer.addAll(batch)
+            // Req 2: append mode — default, existing behavior
+            val ok = CsvExporter.appendTags(batch)
+            if (ok) {
+                Log.i(TAG, "Auto-save (append): ${batch.size} tags, total: ${totalCount.get()}")
+                updateNotification("Capturando… (${totalCount.get()} tags)")
+                onAutoSaved?.invoke(totalCount.get())
+            } else {
+                Log.e(TAG, "Auto-save failed — reinserting ${batch.size} tags")
+                tagBuffer.addAll(batch)
+                tagsSinceLastSave.addAndGet(batch.size)  // restore counter on failure
+            }
         }
     }
 
     private fun drainAndFinalize(winnixStopTemp: String = ""): String? {
         val lastBatch = mutableListOf<TagRecord>()
         while (tagBuffer.isNotEmpty()) tagBuffer.poll()?.let { lastBatch.add(it) }
+
+        // Req 4: if no tags at all this session, cancel — don't create empty CSV
+        if (totalCount.get() == 0 && lastBatch.isEmpty()) {
+            Log.i(TAG, "Session cancelled — no tags read")
+            CsvExporter.cancelSession()
+            return null
+        }
+
         return CsvExporter.finalizeSession(lastBatch, winnixStopTemp)
     }
 

@@ -10,6 +10,7 @@ object SettingsManager {
     // Keys
     const val KEY_AUTO_SAVE_TAGS          = "auto_save_tags"
     const val KEY_AUTO_SAVE_MINUTES       = "auto_save_minutes"
+    const val KEY_AUTO_SAVE_MODE          = "auto_save_mode"
     const val KEY_LOCATION_MODE           = "location_mode"
     const val KEY_ANTENNA_TYPE            = "antenna_type"
     const val KEY_WINNIX_ANT_COUNT        = "winnix_ant_count"
@@ -33,6 +34,10 @@ object SettingsManager {
     // Defaults
     const val DEFAULT_AUTO_SAVE_TAGS         = 10_000
     const val DEFAULT_AUTO_SAVE_MINUTES      = 10
+    // Auto-save mode
+    const val AUTO_SAVE_MODE_APPEND          = 0  // append to current file (default)
+    const val AUTO_SAVE_MODE_NEW_FILE        = 1  // create new file each auto-save
+    const val DEFAULT_AUTO_SAVE_MODE         = AUTO_SAVE_MODE_APPEND
     const val DEFAULT_LOCATION_MODE          = LOCATION_MODE_HYBRID
     const val DEFAULT_ANTENNA_TYPE           = ANTENNA_TYPE_JIETONG
     const val DEFAULT_WINNIX_ANT_COUNT       = 1
@@ -54,6 +59,12 @@ object SettingsManager {
 
     fun setAutoSaveMinutes(context: Context, value: Int) =
         prefs(context).edit().putInt(KEY_AUTO_SAVE_MINUTES, value).apply()
+
+    fun getAutoSaveMode(context: Context): Int =
+        prefs(context).getInt(KEY_AUTO_SAVE_MODE, DEFAULT_AUTO_SAVE_MODE)
+
+    fun setAutoSaveMode(context: Context, value: Int) =
+        prefs(context).edit().putInt(KEY_AUTO_SAVE_MODE, value).apply()
 
     fun getLocationMode(context: Context): String =
         prefs(context).getString(KEY_LOCATION_MODE, DEFAULT_LOCATION_MODE) ?: DEFAULT_LOCATION_MODE
