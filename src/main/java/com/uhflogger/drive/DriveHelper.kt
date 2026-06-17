@@ -26,9 +26,16 @@ object DriveHelper {
     private const val KEY_ROOT_ID      = "root_folder_id"
     private const val KEY_DEVICE_ID    = "device_folder_id"
 
-    // Device name sanitized for use as Drive folder name
-    val deviceName: String
-        get() = Build.MODEL.replace(Regex("[^a-zA-Z0-9 _\\-]"), "_")
+    // Device name: uses the user-configured name from Settings → About phone → Device name
+    // Falls back to Build.MODEL if not set
+    // No extra permissions required
+    fun getDeviceName(context: Context): String {
+        val userSetName = android.provider.Settings.Global.getString(
+            context.contentResolver, "device_name"
+        )
+        val name = if (!userSetName.isNullOrBlank()) userSetName else Build.MODEL
+        return name.replace(Regex("[^a-zA-Z0-9 _\\-]"), "_").trim()
+    }
 
     // ─── Auth ─────────────────────────────────────────────────────────────────
 
@@ -79,8 +86,8 @@ object DriveHelper {
                 p.edit().putString(KEY_ROOT_ID, it).apply()
             }
 
-        // Get or create device subfolder
-        val deviceId = findOrCreateFolder(drive, deviceName, rootId).also {
+        // Get or create device subfolder using user-configured device name
+        val deviceId = findOrCreateFolder(drive, getDeviceName(context), rootId).also {
             p.edit().putString(KEY_DEVICE_ID, it).apply()
         }
         return deviceId
@@ -89,7 +96,7 @@ object DriveHelper {
     private fun findOrCreateFolder(drive: Drive, name: String, parentId: String): String {
         // Search for existing folder
         val query = "name='$name' and mimeType='application/vnd.google-apps.folder' " +
-            "and '$parentId' in parents and trashed=false"
+                "and '$parentId' in parents and trashed=false"
         val result = drive.files().list()
             .setQ(query)
             .setFields("files(id)")

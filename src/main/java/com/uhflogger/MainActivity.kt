@@ -112,7 +112,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             }
             readerService?.onStopComplete = { fileName, tagCount ->
                 runOnUiThread {
-                    if (fileName != null) toast("CSV salvo em Downloads/$fileName\n($tagCount tags)")
+                    if (fileName != null) toast("CSV salvo: $fileName\n($tagCount tags)")
                     else toast("Nenhuma tag para exportar")
                 }
             }
@@ -172,10 +172,6 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
         sensorManager   = getSystemService(SENSOR_SERVICE)  as SensorManager
         locationManager = getSystemService(LOCATION_SERVICE) as LocationManager
-
-        if (DriveHelper.isSignedIn(this)) {
-            DriveMonitorService.start(this)
-        }
 
         requestNotificationPermission()
         requestLocationPermission()

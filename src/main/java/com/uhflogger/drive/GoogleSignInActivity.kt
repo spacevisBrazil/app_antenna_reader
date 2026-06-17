@@ -61,8 +61,8 @@ class GoogleSignInActivity : AppCompatActivity() {
 
         val tvInfo = TextView(this).apply {
             text     = "Os arquivos CSV serão enviados automaticamente para:\n\n" +
-                       "My Drive → UHF Logger → ${DriveHelper.deviceName}\n\n" +
-                       "O login é feito uma única vez."
+                    "My Drive → UHF Logger → ${DriveHelper.getDeviceName(this@GoogleSignInActivity)}\n\n" +
+                    "O login é feito uma única vez."
             textSize = 13f
             setTextColor(0xFF666666.toInt())
             gravity  = Gravity.CENTER

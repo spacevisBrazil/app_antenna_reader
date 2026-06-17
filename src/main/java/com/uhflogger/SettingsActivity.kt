@@ -95,12 +95,31 @@ class SettingsActivity : AppCompatActivity() {
 
         // --- RESTAURAR --------------------------------------------------
         root.addView(spacer(24))
+        // --- GOOGLE DRIVE SYNC -----------------------------------------
+        root.addView(spacer(16))
+        buildSectionLabel(root, "GOOGLE DRIVE SYNC")
+
+        val driveAccount = com.uhflogger.drive.DriveHelper.getSignedInAccount(this)
+        val driveStatus  = if (driveAccount != null) driveAccount.email ?: "Conectado" else "Não conectado"
+        buildRow(root, "Conta Google", driveStatus, ROW_DRIVE_ACCOUNT) {
+            startActivity(android.content.Intent(this,
+                com.uhflogger.drive.GoogleSignInActivity::class.java))
+        }
+
         buildRestoreButton(root)
     }
 
     override fun onOptionsItemSelected(item: MenuItem): Boolean {
         if (item.itemId == android.R.id.home) { finish(); return true }
         return super.onOptionsItemSelected(item)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Refresh Drive account status when returning from GoogleSignInActivity
+        val account = com.uhflogger.drive.DriveHelper.getSignedInAccount(this)
+        val status  = if (account != null) account.email ?: "Conectado" else "Não conectado"
+        root.findViewById<android.widget.TextView>(ROW_DRIVE_ACCOUNT)?.text = status
     }
 
     // -------------------------------------------------------------------------
@@ -550,5 +569,6 @@ class SettingsActivity : AppCompatActivity() {
         private const val ROW_WINNIX_POWER    = 2006
         private const val ROW_WINNIX_WORKING  = 2007
         private const val ROW_WINNIX_INV_MODE = 2008
+        private const val ROW_DRIVE_ACCOUNT   = 2009
     }
 }
