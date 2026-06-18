@@ -76,12 +76,19 @@ object DriveHelper {
     fun getOrCreateDeviceFolder(context: Context, drive: Drive): String {
         val p = prefs(context)
 
-        // Check cache first
+        // Check cache — but verify the folder still exists in Drive
         val cachedId = p.getString(KEY_DEVICE_ID, null)
-        if (cachedId != null) return cachedId
+        if (cachedId != null && folderExists(drive, cachedId)) return cachedId
+
+        // Cache miss or folder was deleted — clear and rebuild
+        if (cachedId != null) {
+            Log.w(TAG, "Cached device folder no longer exists — rebuilding")
+            p.edit().remove(KEY_DEVICE_ID).remove(KEY_ROOT_ID).apply()
+        }
 
         // Get or create root "UHF Logger" folder
         val rootId = p.getString(KEY_ROOT_ID, null)
+            ?.takeIf { folderExists(drive, it) }
             ?: findOrCreateFolder(drive, ROOT_FOLDER_NAME, "root").also {
                 p.edit().putString(KEY_ROOT_ID, it).apply()
             }
@@ -90,7 +97,24 @@ object DriveHelper {
         val deviceId = findOrCreateFolder(drive, getDeviceName(context), rootId).also {
             p.edit().putString(KEY_DEVICE_ID, it).apply()
         }
+        Log.i(TAG, "Device folder ready: $deviceId")
         return deviceId
+    }
+
+    /**
+     * Checks if a Drive folder still exists (not deleted/trashed).
+     * Used to validate cached folder IDs.
+     */
+    private fun folderExists(drive: Drive, folderId: String): Boolean {
+        return try {
+            val file = drive.files().get(folderId)
+                .setFields("id,trashed")
+                .execute()
+            file.trashed != true
+        } catch (e: Exception) {
+            Log.w(TAG, "Folder $folderId not found: ${e.message}")
+            false
+        }
     }
 
     private fun findOrCreateFolder(drive: Drive, name: String, parentId: String): String {
@@ -126,14 +150,37 @@ object DriveHelper {
      * Uploads a CSV file to the device folder on Google Drive.
      * Returns the Drive file ID on success, throws on failure.
      */
-    fun uploadCsv(context: Context, drive: Drive, localFile: File): String {
+    /**
+     * Checks if a file with the given name already exists in the device folder.
+     * Returns the existing file ID, or null if not found.
+     * Used to prevent duplicate uploads on retry.
+     */
+    fun findExistingFile(drive: Drive, context: Context, fileName: String): String? {
         val folderId = getOrCreateDeviceFolder(context, drive)
+        val query = "name='$fileName' and '$folderId' in parents and trashed=false"
+        val result = drive.files().list()
+            .setQ(query)
+            .setFields("files(id,name,size)")
+            .execute()
+        return result.files.firstOrNull()?.id?.also {
+            Log.i(TAG, "File already exists in Drive: $fileName → $it")
+        }
+    }
 
+    fun uploadCsv(context: Context, drive: Drive, localFile: File): String {
+        // Check if file already exists in Drive (handles retry duplicates)
+        val existing = findExistingFile(drive, context, localFile.name)
+        if (existing != null) {
+            Log.i(TAG, "Skipping upload — file already in Drive: ${localFile.name}")
+            return existing
+        }
+
+        val folderId = getOrCreateDeviceFolder(context, drive)
         val metadata = DriveFile().apply {
             name    = localFile.name
             parents = listOf(folderId)
         }
-        val content = FileContent("text/csv", localFile)
+        val content  = FileContent("text/csv", localFile)
         val uploaded = drive.files().create(metadata, content)
             .setFields("id,name,size")
             .execute()

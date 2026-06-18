@@ -35,17 +35,36 @@ class DriveUploadWorker(
             val file = File(entry.filePath)
             if (!file.exists()) {
                 Log.w(TAG, "File not found, removing from queue: ${entry.filePath}")
-                UploadQueueManager.markDone(context, entry.id)
+                UploadQueueDatabase.get(context).dao().delete(entry.id)  // sync
                 continue
             }
             try {
-                DriveHelper.uploadCsv(context, drive, file)
+                val driveFileId = DriveHelper.uploadCsv(context, drive, file)
+
+                // Save driveFileId SYNCHRONOUSLY before deleting local file
+                // This ensures we can recover even if app dies after this line
+                UploadQueueDatabase.get(context).dao().setDriveFileId(entry.id, driveFileId)
+
                 file.delete()
                 Log.i(TAG, "Upload OK + local deleted: ${file.name}")
-                UploadQueueManager.markDone(context, entry.id)
+
+                // Mark done SYNCHRONOUSLY
+                UploadQueueDatabase.get(context).dao().delete(entry.id)
+
+            } catch (e: com.google.api.client.googleapis.json.GoogleJsonResponseException) {
+                // 404 = folder was deleted from Drive — clear cache so it gets recreated
+                if (e.statusCode == 404) {
+                    Log.w(TAG, "Drive folder not found (404) — clearing cache for rebuild")
+                    DriveHelper.clearFolderCache(context)
+                }
+                Log.e(TAG, "Upload failed for ${file.name}: ${e.message}")
+                UploadQueueDatabase.get(context).dao()
+                    .updateStatus(entry.id, UploadStatus.FAILED)
+                allOk = false
             } catch (e: Exception) {
                 Log.e(TAG, "Upload failed for ${file.name}: ${e.message}")
-                UploadQueueManager.markFailed(context, entry.id)
+                UploadQueueDatabase.get(context).dao()
+                    .updateStatus(entry.id, UploadStatus.FAILED)
                 allOk = false
             }
         }
@@ -74,7 +93,7 @@ class DriveUploadWorker(
 
             WorkManager.getInstance(context).enqueueUniqueWork(
                 WORK_NAME_UPLOAD,
-                ExistingWorkPolicy.KEEP,   // don't cancel if already pending
+                ExistingWorkPolicy.REPLACE,  // replace if pending/blocked by backoff
                 request
             )
             Log.d(TAG, "Upload work scheduled")

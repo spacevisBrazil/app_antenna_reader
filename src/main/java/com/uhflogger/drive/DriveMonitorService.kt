@@ -20,11 +20,29 @@ class DriveMonitorService : Service() {
         fileObserver = CsvFileObserver(this, folder).also { it.startWatching() }
         Log.i(TAG, "Monitoring: ${folder.absolutePath}")
 
-        // Schedule periodic background check on service start
-        DriveUploadWorker.schedulePeriodic(this)
+        // Scan folder for any CSV files that exist but were never enqueued.
+        // This handles: DB migration wipe, FileObserver miss, crash after write.
+        // Uses IGNORE conflict strategy so already-queued files are not duplicated.
+        scanAndEnqueueExistingFiles(folder)
 
-        // Also try to upload any files that were pending before restart
+        // Schedule periodic background check
+        DriveUploadWorker.schedulePeriodic(this)
+        // Try to upload anything pending immediately
         DriveUploadWorker.scheduleNow(this)
+    }
+
+    /**
+     * Scans the CSV folder and enqueues any file not already in the upload queue.
+     * Safe to call on every startup — insert uses IGNORE on conflict.
+     */
+    private fun scanAndEnqueueExistingFiles(folder: java.io.File) {
+        val files = folder.listFiles { f -> f.isFile && f.name.endsWith(".csv", ignoreCase = true) }
+        if (files.isNullOrEmpty()) return
+        Log.i(TAG, "Startup scan: found ${files.size} CSV file(s) in folder")
+        for (file in files) {
+            UploadQueueManager.enqueue(this, file.absolutePath)
+            Log.i(TAG, "  Enqueued (startup scan): ${file.name}")
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {

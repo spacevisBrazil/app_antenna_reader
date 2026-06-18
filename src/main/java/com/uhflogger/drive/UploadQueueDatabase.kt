@@ -9,9 +9,10 @@ enum class UploadStatus { PENDING, IN_PROGRESS, DONE, FAILED }
 
 @Entity(tableName = "upload_queue")
 data class UploadEntry(
-    @PrimaryKey(autoGenerate = true) val id       : Long   = 0,
+    @PrimaryKey(autoGenerate = true) val id          : Long   = 0,
     val filePath   : String,
     val status     : UploadStatus = UploadStatus.PENDING,
+    val driveFileId: String       = "",   // set after successful upload, used to detect duplicates
     val retryCount : Int          = 0,
     val createdAt  : Long         = System.currentTimeMillis()
 )
@@ -29,6 +30,9 @@ interface UploadQueueDao {
     @Query("UPDATE upload_queue SET status = :status, retryCount = retryCount + 1 WHERE id = :id")
     fun updateStatus(id: Long, status: UploadStatus)
 
+    @Query("UPDATE upload_queue SET driveFileId = :driveFileId WHERE id = :id")
+    fun setDriveFileId(id: Long, driveFileId: String)
+
     @Query("DELETE FROM upload_queue WHERE id = :id")
     fun delete(id: Long)
 
@@ -45,7 +49,7 @@ class Converters {
 
 // ─── Database ─────────────────────────────────────────────────────────────────
 
-@Database(entities = [UploadEntry::class], version = 1, exportSchema = false)
+@Database(entities = [UploadEntry::class], version = 2, exportSchema = false)
 @TypeConverters(Converters::class)
 abstract class UploadQueueDatabase : RoomDatabase() {
     abstract fun dao(): UploadQueueDao
@@ -59,8 +63,20 @@ abstract class UploadQueueDatabase : RoomDatabase() {
                     context.applicationContext,
                     UploadQueueDatabase::class.java,
                     "upload_queue.db"
-                ).fallbackToDestructiveMigration().build().also { INSTANCE = it }
+                )
+                    .addMigrations(MIGRATION_1_2)
+                    // NOTE: fallbackToDestructiveMigration removed intentionally.
+                    // If migration fails we prefer a crash over silently losing the queue.
+                    // The startup folder scan in DriveMonitorService recovers orphaned files.
+                    .build().also { INSTANCE = it }
             }
+
+        // Migration: add driveFileId column
+        val MIGRATION_1_2 = object : androidx.room.migration.Migration(1, 2) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE upload_queue ADD COLUMN driveFileId TEXT NOT NULL DEFAULT ''")
+            }
+        }
     }
 }
 
@@ -79,6 +95,10 @@ object UploadQueueManager {
 
     fun markDone(context: Context, id: Long) {
         Thread { UploadQueueDatabase.get(context).dao().delete(id) }.start()
+    }
+
+    fun setDriveFileId(context: Context, id: Long, driveFileId: String) {
+        Thread { UploadQueueDatabase.get(context).dao().setDriveFileId(id, driveFileId) }.start()
     }
 
     fun markFailed(context: Context, id: Long) {
