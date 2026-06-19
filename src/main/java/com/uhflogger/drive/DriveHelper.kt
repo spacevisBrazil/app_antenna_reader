@@ -73,12 +73,17 @@ object DriveHelper {
      * Hierarchy: My Drive → "UHF Logger" → "[Device Model]"
      * Caches IDs in SharedPreferences to avoid repeated API calls.
      */
-    fun getOrCreateDeviceFolder(context: Context, drive: Drive): String {
+    // Process-wide lock for folder creation — prevents the classic
+    // "list() then create()" race condition that creates duplicate folders
+    // when called from multiple threads/workers simultaneously.
+    private val folderLock = Any()
+
+    fun getOrCreateDeviceFolder(context: Context, drive: Drive): String = synchronized(folderLock) {
         val p = prefs(context)
 
         // Check cache — but verify the folder still exists in Drive
         val cachedId = p.getString(KEY_DEVICE_ID, null)
-        if (cachedId != null && folderExists(drive, cachedId)) return cachedId
+        if (cachedId != null && folderExists(drive, cachedId)) return@synchronized cachedId
 
         // Cache miss or folder was deleted — clear and rebuild
         if (cachedId != null) {
@@ -98,7 +103,7 @@ object DriveHelper {
             p.edit().putString(KEY_DEVICE_ID, it).apply()
         }
         Log.i(TAG, "Device folder ready: $deviceId")
-        return deviceId
+        deviceId
     }
 
     /**
@@ -167,12 +172,17 @@ object DriveHelper {
         }
     }
 
-    fun uploadCsv(context: Context, drive: Drive, localFile: File): String {
+    // Process-wide lock for the entire check-then-upload sequence.
+    // Prevents two threads from both passing findExistingFile() (neither sees
+    // the other's in-flight upload) and both creating the file in Drive.
+    private val uploadLock = Any()
+
+    fun uploadCsv(context: Context, drive: Drive, localFile: File): String = synchronized(uploadLock) {
         // Check if file already exists in Drive (handles retry duplicates)
         val existing = findExistingFile(drive, context, localFile.name)
         if (existing != null) {
             Log.i(TAG, "Skipping upload — file already in Drive: ${localFile.name}")
-            return existing
+            return@synchronized existing
         }
 
         val folderId = getOrCreateDeviceFolder(context, drive)
@@ -186,6 +196,6 @@ object DriveHelper {
             .execute()
 
         Log.i(TAG, "Uploaded ${localFile.name} → Drive ID: ${uploaded.id} (${uploaded.getSize()} bytes)")
-        return uploaded.id
+        uploaded.id
     }
 }

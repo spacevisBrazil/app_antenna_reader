@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <uses-feature android:name="android.hardware.usb.host" />
     <uses-permission android:name="android.permission.USB_PERMISSION" />
@@ -20,12 +21,27 @@
 
 
     <application
+        android:name=".UHFLoggerApplication"
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
         android:label="UHF Logger"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.UHFLogger">
+
+        <!-- WorkManager: disable default auto-init so our custom
+             single-thread Configuration (UHFLoggerApplication) takes effect.
+             Required whenever Application implements Configuration.Provider. -->
+        <provider
+            android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup"
+            android:exported="false"
+            tools:node="merge">
+            <meta-data
+                android:name="androidx.work.WorkManagerInitializer"
+                android:value="androidx.startup"
+                tools:node="remove" />
+        </provider>
 
         <!-- Drive Sync -->
         <activity

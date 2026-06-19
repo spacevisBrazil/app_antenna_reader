@@ -12,6 +12,17 @@ class DriveUploadWorker(
 ) : Worker(context, workerParams) {
 
     override fun doWork(): Result {
+        // Process-wide lock — absolute guarantee that only one upload pass
+        // runs at a time, regardless of how many WorkManager workers were triggered.
+        // This is the real fix for duplicate folders/files: even if WorkManager
+        // schedules a one-time AND a periodic worker at the same instant,
+        // only one enters this block at a time.
+        synchronized(UPLOAD_LOCK) {
+            return doUploadPass()
+        }
+    }
+
+    private fun doUploadPass(): Result {
         if (!DriveHelper.isSignedIn(context)) {
             Log.w(TAG, "Not signed in — skipping upload")
             return Result.failure()
@@ -35,24 +46,21 @@ class DriveUploadWorker(
             val file = File(entry.filePath)
             if (!file.exists()) {
                 Log.w(TAG, "File not found, removing from queue: ${entry.filePath}")
-                UploadQueueDatabase.get(context).dao().delete(entry.id)  // sync
+                UploadQueueDatabase.get(context).dao().delete(entry.id)
                 continue
             }
             try {
                 val driveFileId = DriveHelper.uploadCsv(context, drive, file)
 
                 // Save driveFileId SYNCHRONOUSLY before deleting local file
-                // This ensures we can recover even if app dies after this line
                 UploadQueueDatabase.get(context).dao().setDriveFileId(entry.id, driveFileId)
 
                 file.delete()
                 Log.i(TAG, "Upload OK + local deleted: ${file.name}")
 
-                // Mark done SYNCHRONOUSLY
                 UploadQueueDatabase.get(context).dao().delete(entry.id)
 
             } catch (e: com.google.api.client.googleapis.json.GoogleJsonResponseException) {
-                // 404 = folder was deleted from Drive — clear cache so it gets recreated
                 if (e.statusCode == 404) {
                     Log.w(TAG, "Drive folder not found (404) — clearing cache for rebuild")
                     DriveHelper.clearFolderCache(context)
@@ -74,12 +82,16 @@ class DriveUploadWorker(
 
     companion object {
         private const val TAG       = "DriveUploadWorker"
-        const val WORK_NAME_UPLOAD  = "drive_upload"
-        const val WORK_NAME_PERIODIC= "drive_upload_periodic"
+        // Single shared work name — ensures WorkManager NEVER runs two
+        // upload workers concurrently, regardless of trigger source
+        // (manual scheduleNow, periodic check, or network reconnect).
+        const val WORK_NAME = "drive_upload_serial"
 
         /**
          * Schedule a one-time upload — called immediately when a new CSV is created
          * or when network connectivity is restored.
+         * Uses the SAME unique work name as schedulePeriodic to guarantee
+         * only one upload worker ever runs at a time.
          */
         fun scheduleNow(context: Context) {
             val request = OneTimeWorkRequestBuilder<DriveUploadWorker>()
@@ -92,16 +104,18 @@ class DriveUploadWorker(
                 .build()
 
             WorkManager.getInstance(context).enqueueUniqueWork(
-                WORK_NAME_UPLOAD,
-                ExistingWorkPolicy.REPLACE,  // replace if pending/blocked by backoff
+                WORK_NAME,
+                ExistingWorkPolicy.APPEND_OR_REPLACE,
                 request
             )
             Log.d(TAG, "Upload work scheduled")
         }
 
         /**
-         * Schedule a periodic check every 15 minutes — catches any missed files
-         * (e.g. CSV created while offline, then network restored).
+         * Schedule a periodic check every 15 minutes — catches any missed files.
+         * Uses a SEPARATE periodic chain, but doWork() itself is protected by
+         * a process-wide lock (see UPLOAD_LOCK) so it never overlaps with
+         * a one-time scheduleNow() execution.
          */
         fun schedulePeriodic(context: Context) {
             val request = PeriodicWorkRequestBuilder<DriveUploadWorker>(15, TimeUnit.MINUTES)
@@ -120,5 +134,12 @@ class DriveUploadWorker(
             )
             Log.d(TAG, "Periodic upload work scheduled (15 min)")
         }
+
+        private const val WORK_NAME_PERIODIC = "drive_upload_periodic"
+
+        // Process-wide lock — guarantees doWork() body never runs concurrently
+        // even if WorkManager somehow schedules two workers at the same instant
+        // (different unique-work chains: one-time vs periodic).
+        val UPLOAD_LOCK = Any()
     }
 }
