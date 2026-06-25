@@ -281,6 +281,7 @@ class UHFReaderService : Service() {
                     totalCount.addAndGet(tags.size)
                     val sinceLast = tagsSinceLastSave.addAndGet(tags.size)
                     if (sinceLast >= autoSaveTagCount) {
+                        rescheduleTimerJob()   // reset time-based counter (req: count-save resets time-save)
                         autoSaveExecutor?.submit { flushBufferToDisk() }
                     }
                 }
@@ -362,6 +363,7 @@ class UHFReaderService : Service() {
                             totalCount.addAndGet(processedTags.size)
                             val sinceLast = tagsSinceLastSave.addAndGet(processedTags.size)
                             if (sinceLast >= autoSaveTagCount) {
+                                rescheduleTimerJob()   // reset time-based counter (req: count-save resets time-save)
                                 autoSaveExecutor?.submit { flushBufferToDisk() }
                             }
                         }
@@ -576,8 +578,17 @@ class UHFReaderService : Service() {
     // =========================================================================
     private fun startAutoSaveTimer() {
         autoSaveExecutor = Executors.newSingleThreadScheduledExecutor()
-        // scheduleWithFixedDelay: delay starts AFTER task completes
-        // This means the timer naturally resets after each save
+        rescheduleTimerJob()
+    }
+
+    /**
+     * (Re)schedules the time-based auto-save job starting from now.
+     * Called on initial start AND whenever a tag-count-triggered save happens,
+     * so the time counter resets — preventing a near-immediate duplicate
+     * save right after a count-triggered one.
+     */
+    private fun rescheduleTimerJob() {
+        autoSaveTimerJob?.cancel(false)
         autoSaveTimerJob = autoSaveExecutor?.scheduleWithFixedDelay(
             { if (isRunning.get()) flushBufferToDisk() },
             autoSaveIntervalMin, autoSaveIntervalMin, TimeUnit.MINUTES
