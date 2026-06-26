@@ -111,18 +111,28 @@ class BluetoothSerialPort(private val device: BluetoothDevice) : ISerialPort {
         return if (timeout == 0) {
             // Blocking read — used by BluetoothInputOutputManager for continuous data.
             // Blocks until data arrives OR throws IOException on disconnect.
-            // This is intentional: IOException triggers onRunError → reconnect loop.
             stream.read(buf, 0, buf.size)
         } else {
-            // Non-blocking read with timeout — used by winnixReadTemperature and probe.
-            // Uses available() polling so it returns when timeout expires instead of blocking forever.
-            val deadline = System.currentTimeMillis() + timeout
-            while (stream.available() == 0 && System.currentTimeMillis() < deadline) {
-                Thread.sleep(20)
+            // Timed read: spawn a thread that does blocking read, interrupt after timeout.
+            // More reliable than available() polling on BT sockets.
+            var result = 0
+            var exception: Exception? = null
+            val readerThread = Thread {
+                try {
+                    result = stream.read(buf, 0, buf.size)
+                } catch (e: Exception) {
+                    exception = e
+                }
             }
-            if (stream.available() == 0) return 0
-            val toRead = minOf(stream.available(), buf.size)
-            stream.read(buf, 0, toRead)
+            readerThread.isDaemon = true
+            readerThread.start()
+            readerThread.join(timeout.toLong())
+            if (readerThread.isAlive) {
+                readerThread.interrupt()
+                return 0  // timeout — no data
+            }
+            exception?.let { throw it }
+            result
         }
     }
 

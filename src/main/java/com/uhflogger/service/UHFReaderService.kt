@@ -164,6 +164,7 @@ class UHFReaderService : Service() {
         winnixDecoder.reset()
 
         activeIsBluetooth = (deviceName == BT_DEVICE_NAME)
+        winnixResponseBuffer.clear()  // clear stale bytes from previous session
 
         if (deviceName == BT_DEVICE_NAME) {
             startBtConnection(deviceName, resuming)
@@ -342,19 +343,14 @@ class UHFReaderService : Service() {
             ioManager   = null
 
             // 3. Lê temperatura de encerramento
-            // Ordem: módulo parou (0x8C confirmado) → agora aceita 0x34 → lemos temperatura
-            // BT: usa latch via onNewData (btIoManager ainda ativo para receber 0x35)
-            // USB: lê diretamente na porta
+            // Usa latch via onNewData para AMBOS USB e BT:
+            // SerialInputOutputManager (USB) e btIoManager (BT) ambos chamam onNewData
+            // que preenche o latch quando 0x35 é detectado no winnixResponseBuffer.
+            // Leitura direta (winnixReadTemperature) não funciona pois o IOManager
+            // consome os bytes antes — mesmo problema no USB e no BT.
             val winnixStopTemp = if (activeAntennaType == SettingsManager.ANTENNA_TYPE_WINNIX) {
-                if (activeIsBluetooth && localBtIo != null) {
-                    val port = activePort
-                    if (port != null) winnixReadTemperatureBt(port)
-                    else ""
-                } else {
-                    val port = activePort
-                    val temp = if (port != null) winnixReadTemperature(port) else null
-                    if (temp != null) "%.1f".format(java.util.Locale.US, temp) else ""
-                }
+                val port = activePort
+                if (port != null) winnixReadTemperatureBt(port) else ""
             } else ""
 
             // 4. Para IOManagers e fecha porta
@@ -538,28 +534,43 @@ class UHFReaderService : Service() {
             override fun onRunError(e: Exception)   = handleRunError(e)
         }
 
+    // Accumulation buffer for detecting fragmented 0x8D/0x35 frames from BT
+    private val winnixResponseBuffer = java.util.concurrent.CopyOnWriteArrayList<Byte>()
+
     private fun winnixOnNewData(data: ByteArray) {
+        // Accumulate bytes — BT can fragment frames across multiple onNewData calls
+        data.forEach { winnixResponseBuffer.add(it) }
+        // Keep buffer bounded — max 256 bytes (response frames are small)
+        while (winnixResponseBuffer.size > 256) winnixResponseBuffer.removeAt(0)
+
+        val buf = winnixResponseBuffer.toByteArray()
+
         // Check for stop confirmation (0x8D)
-        for (i in 0 until data.size - 4) {
-            if (data[i] == 0xA5.toByte() && data[i+1] == 0x5A.toByte()
-                && data[i+4] == 0x8D.toByte()) {
-                Log.i(TAG, "Winnix stop confirmed (0x8D) via onNewData")
-                winnixStopConfirmed.set(true)
+        if (!winnixStopConfirmed.get()) {
+            for (i in 0 until buf.size - 4) {
+                if (buf[i] == 0xA5.toByte() && buf[i+1] == 0x5A.toByte()
+                    && buf[i+4] == 0x8D.toByte()) {
+                    Log.i(TAG, "Winnix stop confirmed (0x8D) via onNewData")
+                    winnixStopConfirmed.set(true)
+                    winnixResponseBuffer.clear()
+                    break
+                }
             }
         }
 
         // Check for temperature response (0x35) — fills latch for winnixReadTemperatureBt()
         val tempLatch = winnixTempLatch.get()
         if (tempLatch != null && tempLatch.count > 0) {
-            for (i in 0 until data.size - 7) {
-                if (data[i] == 0xA5.toByte() && data[i+1] == 0x5A.toByte()
-                    && data[i+4] == 0x35.toByte() && data[i+5] == 0x01.toByte()) {
-                    val raw    = ((data[i+6].toInt() and 0xFF) shl 8) or (data[i+7].toInt() and 0xFF)
+            for (i in 0 until buf.size - 7) {
+                if (buf[i] == 0xA5.toByte() && buf[i+1] == 0x5A.toByte()
+                    && buf[i+4] == 0x35.toByte() && buf[i+5] == 0x01.toByte()) {
+                    val raw    = ((buf[i+6].toInt() and 0xFF) shl 8) or (buf[i+7].toInt() and 0xFF)
                     val signed = if (raw > 32767) raw - 65536 else raw
                     val temp   = signed / 100.0f
                     winnixTempResult = "%.1f".format(java.util.Locale.US, temp)
                     Log.i(TAG, "Temperature 0x35 captured via onNewData: $winnixTempResult°C")
                     tempLatch.countDown()
+                    winnixResponseBuffer.clear()
                     break
                 }
             }
@@ -604,26 +615,23 @@ class UHFReaderService : Service() {
     private fun sendWinnixStop() {
         val port = activePort ?: return
         winnixStopConfirmed.set(false)
-        repeat(3) { attempt ->
-            try {
-                Log.i(TAG, "Sending stop inventory (0x8C) attempt ${attempt + 1}")
-                port.write(winnixBuildStopInventory(), 2000)
-                // Wait up to 1s for winnixOnNewData to detect 0x8D and set the flag
-                val deadline = System.currentTimeMillis() + 1000L
-                while (!winnixStopConfirmed.get() && System.currentTimeMillis() < deadline) {
-                    Thread.sleep(50)
-                }
-                if (winnixStopConfirmed.get()) {
-                    Log.i(TAG, "Winnix stop confirmed (0x8D) on attempt ${attempt + 1}")
-                    return
-                }
-                Log.w(TAG, "Stop confirmation not received on attempt ${attempt + 1}, retrying...")
-            } catch (e: Exception) {
-                Log.e(TAG, "sendWinnixStop error: ${e.message}")
-                return
+        try {
+            Log.i(TAG, "Sending stop inventory (0x8C)")
+            port.write(winnixBuildStopInventory(), 2000)
+            // Wait up to 3s for 0x8D confirmation via onNewData
+            // Send only ONCE — sending multiple 0x8C confuses the module
+            val deadline = System.currentTimeMillis() + 3000L
+            while (!winnixStopConfirmed.get() && System.currentTimeMillis() < deadline) {
+                Thread.sleep(50)
             }
+            if (winnixStopConfirmed.get()) {
+                Log.i(TAG, "Winnix stop confirmed (0x8D)")
+            } else {
+                Log.w(TAG, "Winnix stop: no 0x8D within 3s — proceeding anyway")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "sendWinnixStop error: ${e.message}")
         }
-        Log.w(TAG, "Winnix stop: no 0x8D after 3 attempts — proceeding anyway")
     }
 
     private fun probeAntennaType(port: ISerialPort, antennaType: String): Boolean {
