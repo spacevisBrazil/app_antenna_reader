@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.content.Intent
 import android.hardware.usb.UsbDeviceConnection
@@ -21,6 +22,10 @@ import com.uhflogger.SettingsManager
 import com.uhflogger.decoder.ProtocolDecoder
 import com.uhflogger.decoder.WinnixProtocolDecoder
 import com.uhflogger.model.TagRecord
+import com.uhflogger.serial.BluetoothInputOutputManager
+import com.uhflogger.serial.BluetoothSerialPort
+import com.uhflogger.serial.ISerialPort
+import com.uhflogger.serial.UsbSerialPortWrapper
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
@@ -52,10 +57,14 @@ class UHFReaderService : Service() {
 
     private var usbPort        : UsbSerialPort? = null
     private var usbConnection  : UsbDeviceConnection? = null
+    private var activePort     : ISerialPort? = null   // USB or Bluetooth — single active port
     private var ioManager      : SerialInputOutputManager? = null
+    private var btIoManager    : BluetoothInputOutputManager? = null  // BT equivalent of ioManager
 
     private val stopExecutor   = Executors.newSingleThreadExecutor()
     private val configExecutor = Executors.newSingleThreadExecutor()
+    // Dedicated executor for BT reconnect loop — separate so it never blocks stop/config ops
+    @Volatile private var btReconnectExecutor: java.util.concurrent.ExecutorService? = null
 
     // Auto-save
     private var autoSaveTagCount   : Int  = SettingsManager.DEFAULT_AUTO_SAVE_TAGS
@@ -67,12 +76,16 @@ class UHFReaderService : Service() {
     private val tagsSinceLastSave  = AtomicInteger(0)
 
     private var appContext: Context? = null
-    private var activeAntennaType: String = SettingsManager.ANTENNA_TYPE_JIETONG
+    private var activeAntennaType : String  = SettingsManager.ANTENNA_TYPE_JIETONG
+    private var activeIsBluetooth : Boolean = false  // true=BT session, false=USB session
 
     // Winnix temperature tracking
     @Volatile private var winnixStartTemp     : String = ""
-    @Volatile private var winnixStopTempValue : String = ""
-    private var winnixTempLatch: java.util.concurrent.CountDownLatch? = null
+    // Generic temperature read via onNewData — used for both start and stop temp on BT
+    @Volatile private var winnixTempResult    : String = ""
+    private val winnixTempLatch     = java.util.concurrent.atomic.AtomicReference<java.util.concurrent.CountDownLatch?>(null)
+    // Flag set by onNewData when 0x8D (stop confirmation) is received
+    private val winnixStopConfirmed = java.util.concurrent.atomic.AtomicBoolean(false)
 
     // Callbacks
     var onStatusChanged    : ((Boolean) -> Unit)? = null
@@ -104,17 +117,16 @@ class UHFReaderService : Service() {
     }
 
     override fun onDestroy() {
-        // Opção 3: Se Winnix estava ativo e o app fecha sem clicar Stop,
-        // envia o 0x8C diretamente para parar o módulo.
-        // Cobre o caso de fechar o app normalmente pelo botão de voltar ou gerenciador.
-        if (activeAntennaType == SettingsManager.ANTENNA_TYPE_WINNIX && usbPort != null) {
+        // Se Winnix estava ativo e app fecha sem Stop, envia 0x8C para parar o módulo
+        if (activeAntennaType == SettingsManager.ANTENNA_TYPE_WINNIX && activePort != null) {
             try {
-                usbPort?.write(winnixBuildStopInventory(), 1000)
+                activePort?.write(winnixBuildStopInventory(), 1000)
                 Thread.sleep(200)
             } catch (_: Exception) {}
         }
         stopCapture()
         mainActivity = null
+        btReconnectExecutor?.shutdownNow(); btReconnectExecutor = null
         stopExecutor.shutdownNow()
         configExecutor.shutdownNow()
         super.onDestroy()
@@ -151,6 +163,18 @@ class UHFReaderService : Service() {
         jietongDecoder.reset()
         winnixDecoder.reset()
 
+        activeIsBluetooth = (deviceName == BT_DEVICE_NAME)
+
+        if (deviceName == BT_DEVICE_NAME) {
+            startBtConnection(deviceName, resuming)
+        } else {
+            startUsbConnection(deviceName, resuming)
+        }
+    }
+
+    // ── USB connection ─────────────────────────────────────────────────────
+    private fun startUsbConnection(deviceName: String, resuming: Boolean) {
+        val ctx = appContext ?: return
         val usbManager = getSystemService(Context.USB_SERVICE) as UsbManager
         val drivers    = UsbSerialProber.getDefaultProber().findAllDrivers(usbManager)
         val driver     = drivers.firstOrNull { it.device.deviceName == deviceName }
@@ -166,9 +190,8 @@ class UHFReaderService : Service() {
             port.dtr = true
             port.rts = true
         } catch (e: Exception) {
-            Log.e(TAG, "Error opening port", e)
-            port.close()
-            connection.close()
+            Log.e(TAG, "Error opening USB port", e)
+            port.close(); connection.close()
             if (!resuming) CsvExporter.cancelSession()
             isPausedState.set(resuming)
             return
@@ -176,68 +199,173 @@ class UHFReaderService : Service() {
 
         usbPort       = port
         usbConnection = connection
+        val wrapper   = UsbSerialPortWrapper(port, connection)
+        activePort    = wrapper
 
-        if (!probeAntennaType(port, activeAntennaType)) {
+        if (!probeAntennaType(wrapper, activeAntennaType)) {
             val label = if (activeAntennaType == SettingsManager.ANTENNA_TYPE_WINNIX) "Winnix" else "Jietong"
             val msg   = "Antena $label não detectada. Verifique a conexão e o tipo configurado."
             Log.w(TAG, msg)
             isRunning.set(false)
             if (resuming) isPausedState.set(true)
-            try { port.close() }       catch (_: Exception) {}
-            try { connection.close() } catch (_: Exception) {}
-            usbPort = null
-            usbConnection = null
+            closePort()
             onWrongAntennaType?.invoke(msg)
             return
         }
 
         isRunning.set(true)
-
         if (activeAntennaType == SettingsManager.ANTENNA_TYPE_WINNIX) {
-            startWinnixCapture(port, ctx)
+            startWinnixCapture(wrapper, ctx)
         } else {
-            startJietongCapture(port)
+            startJietongCapture(wrapper)
         }
         startAutoSaveTimer()
         updateNotification("Capturando…")
         onStatusChanged?.invoke(true)
-        Log.i(TAG, "Capture started ($activeAntennaType) on $deviceName @ $BAUD_RATE baud")
+        Log.i(TAG, "USB capture started ($activeAntennaType) on $deviceName @ $BAUD_RATE baud")
+    }
+
+    // ── Bluetooth connection ────────────────────────────────────────────────
+    private fun startBtConnection(deviceName: String, resuming: Boolean, retryCount: Int = 0) {
+        val ctx = appContext ?: return
+        Log.i(TAG, "BT_CONNECT: startBtConnection called resuming=$resuming retryCount=$retryCount")
+        configExecutor.submit {
+            try {
+                // Check BLUETOOTH_CONNECT permission (required on Android 12+)
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+                    if (ctx.checkSelfPermission(android.Manifest.permission.BLUETOOTH_CONNECT)
+                        != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                        Log.e(TAG, "BT_CONNECT: BLUETOOTH_CONNECT permission not granted")
+                        if (!resuming) CsvExporter.cancelSession()
+                        isPausedState.set(resuming)
+                        onWrongAntennaType?.invoke("Permissão Bluetooth não concedida.")
+                        return@submit
+                    }
+                }
+
+                val btManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+                val adapter   = btManager.adapter
+                    ?: run { Log.e(TAG, "BT_CONNECT: Bluetooth not available"); if (!resuming) CsvExporter.cancelSession(); isPausedState.set(resuming); return@submit }
+
+                Log.i(TAG, "BT_CONNECT: searching for paired device '$BT_DEVICE_NAME'")
+                @Suppress("DEPRECATION")
+                val btDevice = try {
+                    adapter.bondedDevices?.firstOrNull { it.name == BT_DEVICE_NAME }
+                } catch (se: SecurityException) {
+                    Log.e(TAG, "BT_CONNECT: SecurityException on bondedDevices: ${se.message}")
+                    if (!resuming) CsvExporter.cancelSession()
+                    isPausedState.set(resuming)
+                    return@submit
+                } ?: run {
+                    Log.e(TAG, "BT_CONNECT: device '$BT_DEVICE_NAME' not found in paired devices")
+                    if (!resuming) CsvExporter.cancelSession()
+                    isPausedState.set(resuming)
+                    return@submit
+                }
+
+                Log.i(TAG, "BT_CONNECT: found device ${btDevice.address}, attempting socket connect")
+                val btPort = BluetoothSerialPort(btDevice)
+                try {
+                    try { adapter.cancelDiscovery() } catch (_: SecurityException) {}
+                    btPort.connect()
+                    Log.i(TAG, "BT_CONNECT: socket connected successfully")
+                } catch (e: Exception) {
+                    Log.e(TAG, "BT_CONNECT: socket connect FAILED (attempt ${retryCount+1}): ${e.message}")
+                    btPort.close()
+                    if (retryCount < BT_MAX_RETRIES) {
+                        Log.i(TAG, "BT_CONNECT: retrying in ${BT_RETRY_DELAY_MS}ms (${retryCount+1}/$BT_MAX_RETRIES)")
+                        Thread.sleep(BT_RETRY_DELAY_MS)
+                        startBtConnection(deviceName, resuming, retryCount + 1)
+                    } else {
+                        Log.e(TAG, "BT_CONNECT: all $BT_MAX_RETRIES retries exhausted")
+                        if (!resuming) CsvExporter.cancelSession()
+                        isPausedState.set(resuming)
+                        onWrongAntennaType?.invoke("Winnix_BT: falha ao conectar após $BT_MAX_RETRIES tentativas")
+                    }
+                    return@submit
+                }
+
+                activePort = btPort
+                Log.i(TAG, "BT_CONNECT: running probe...")
+                if (!probeAntennaType(btPort, SettingsManager.ANTENNA_TYPE_WINNIX)) {
+                    Log.w(TAG, "BT_CONNECT: probe FAILED (attempt ${retryCount+1})")
+                    btPort.close()
+                    activePort = null
+                    if (retryCount < BT_MAX_RETRIES) {
+                        Log.i(TAG, "BT_CONNECT: retrying probe in ${BT_RETRY_DELAY_MS}ms")
+                        Thread.sleep(BT_RETRY_DELAY_MS)
+                        startBtConnection(deviceName, resuming, retryCount + 1)
+                    } else {
+                        isRunning.set(false)
+                        if (resuming) isPausedState.set(true)
+                        onWrongAntennaType?.invoke("Winnix_BT: módulo não respondeu após $BT_MAX_RETRIES tentativas.")
+                    }
+                    return@submit
+                }
+
+                Log.i(TAG, "BT_CONNECT: probe OK — starting Winnix capture")
+                isRunning.set(true)
+                startWinnixCaptureBt(btPort, ctx)
+                startAutoSaveTimer()
+                updateNotification("Capturando via BT…")
+                onStatusChanged?.invoke(true)
+                Log.i(TAG, "BT_CONNECT: capture started successfully on $BT_DEVICE_NAME")
+
+            } catch (e: Exception) {
+                Log.e(TAG, "BT_CONNECT: unexpected error: ${e.message}", e)
+                if (!resuming) CsvExporter.cancelSession()
+                isPausedState.set(resuming)
+            }
+        }
     }
 
     fun stopCapture() {
-        if (!isRunning.compareAndSet(true, false)) return
-        isPausedState.set(false)
+        // Handle two cases:
+        // 1. Actively capturing (isRunning=true) — normal stop
+        // 2. Paused with BT reconnect loop running (isRunning=false, isPaused=true) — stop loop + finalize
+        val wasRunning = isRunning.compareAndSet(true, false)
+        val wasPaused  = isPausedState.get()
+        if (!wasRunning && !wasPaused) return
+
+        isPausedState.set(false)  // stops the reconnect loop if running
+        btReconnectExecutor?.shutdownNow(); btReconnectExecutor = null
         stopAutoSaveTimer()
 
         stopExecutor.submit {
-            // 1. Para o inventário de leitura
+            // 1. Para o inventário
             sendWinnixStop()
 
-            // 2. Prepara o gatilho assíncrono antes de requisitar temperatura
-            winnixStopTempValue = ""
-            winnixTempLatch = java.util.concurrent.CountDownLatch(1)
+            // 2. Para o btIoManager via flag, lê temperatura, depois fecha porta
+            val localBtIo = btIoManager
+            val localIo   = ioManager
+            btIoManager = null
+            ioManager   = null
 
-            // 3. Pede a temperatura de encerramento
-            try { usbPort?.write(winnixBuildGetTemperature(), 2000) } catch (_: Exception) {}
+            // 3. Lê temperatura de encerramento
+            // Ordem: módulo parou (0x8C confirmado) → agora aceita 0x34 → lemos temperatura
+            // BT: usa latch via onNewData (btIoManager ainda ativo para receber 0x35)
+            // USB: lê diretamente na porta
+            val winnixStopTemp = if (activeAntennaType == SettingsManager.ANTENNA_TYPE_WINNIX) {
+                if (activeIsBluetooth && localBtIo != null) {
+                    val port = activePort
+                    if (port != null) winnixReadTemperatureBt(port)
+                    else ""
+                } else {
+                    val port = activePort
+                    val temp = if (port != null) winnixReadTemperature(port) else null
+                    if (temp != null) "%.1f".format(java.util.Locale.US, temp) else ""
+                }
+            } else ""
 
-            // 4. Aguarda até 2 segundos pela resposta vinda do onNewData
-            val received = winnixTempLatch!!.await(2000, java.util.concurrent.TimeUnit.MILLISECONDS)
-            winnixTempLatch = null
-
-            val winnixStopTemp = if (received && winnixStopTempValue.isNotEmpty()) {
-                Log.i(TAG, "Stop temperature: $winnixStopTempValue°C")
-                winnixStopTempValue
+            // 4. Para IOManagers e fecha porta
+            if (localBtIo != null) {
+                closePort()        // interrompe stream.read() bloqueante → btIoManager sai via IOException
+                localBtIo.stop()   // garante flag running=false
             } else {
-                Log.w(TAG, "Stop temperature not received within timeout")
-                ""
+                localIo?.stop()
+                Thread.sleep(200)
+                closePort()
             }
-
-            // 5. Finaliza o IOManager e fecha as portas de comunicação com segurança
-            ioManager?.stop()
-            ioManager = null
-            Thread.sleep(200)
-
-            closePort()
 
             val tagCount = totalCount.get()
             val fileName = drainAndFinalize(winnixStopTemp)
@@ -251,7 +379,8 @@ class UHFReaderService : Service() {
     }
 
     fun saveAfterError() {
-        isPausedState.set(false)
+        isPausedState.set(false)  // stops reconnect loop if running
+        btReconnectExecutor?.shutdownNow(); btReconnectExecutor = null
         stopExecutor.submit {
             val tagCount = totalCount.get()
             val fileName = drainAndFinalize("")
@@ -267,10 +396,10 @@ class UHFReaderService : Service() {
     fun flushTags(): List<TagRecord> = emptyList()
 
     // =========================================================================
-    // Jietong capture
+    // Jietong capture (USB only)
     // =========================================================================
-    private fun startJietongCapture(port: UsbSerialPort) {
-        ioManager = SerialInputOutputManager(port, object : SerialInputOutputManager.Listener {
+    private fun startJietongCapture(wrapper: UsbSerialPortWrapper) {
+        ioManager = SerialInputOutputManager(wrapper.rawPort(), object : SerialInputOutputManager.Listener {
             override fun onNewData(data: ByteArray) {
                 val lat  = mainActivity?.getCurrentLatitude()  ?: ""
                 val lon  = mainActivity?.getCurrentLongitude() ?: ""
@@ -281,7 +410,7 @@ class UHFReaderService : Service() {
                     totalCount.addAndGet(tags.size)
                     val sinceLast = tagsSinceLastSave.addAndGet(tags.size)
                     if (sinceLast >= autoSaveTagCount) {
-                        rescheduleTimerJob()   // reset time-based counter (req: count-save resets time-save)
+                        rescheduleTimerJob()
                         autoSaveExecutor?.submit { flushBufferToDisk() }
                     }
                 }
@@ -295,140 +424,230 @@ class UHFReaderService : Service() {
     }
 
     // =========================================================================
-    // Winnix capture
+    // Winnix capture — USB (uses SerialInputOutputManager)
     // =========================================================================
-    private fun startWinnixCapture(port: UsbSerialPort, ctx: Context) {
-        val antCount    = SettingsManager.getWinnixAntCount(ctx)
-        val powerDbm    = SettingsManager.getWinnixPowerDbm(ctx)
-        val workingMs   = SettingsManager.getWinnixWorkingMs(ctx)
-        val invMode     = SettingsManager.getWinnixInventoryMode(ctx)
-        val antennas    = (1..antCount).toList()
-        val inactiveMs  = 300
+    private fun startWinnixCapture(wrapper: UsbSerialPortWrapper, ctx: Context) {
+        val antCount   = SettingsManager.getWinnixAntCount(ctx)
+        val powerDbm   = SettingsManager.getWinnixPowerDbm(ctx)
+        val workingMs  = SettingsManager.getWinnixWorkingMs(ctx)
+        val invMode    = SettingsManager.getWinnixInventoryMode(ctx)
+        val antennas   = (1..antCount).toList()
+        val inactiveMs = 300
 
         winnixStartTemp = ""
 
         configExecutor.submit {
             try {
-                port.write(winnixBuildSetAntennas(antennas), 2000)
-                Thread.sleep(500)
-                port.purgeHwBuffers(false, true)
+                winnixConfigSequence(wrapper, antennas, powerDbm, workingMs, invMode, inactiveMs)
 
-                antennas.forEach { ant ->
-                    port.write(winnixBuildSetPower(ant, powerDbm), 2000)
-                    Thread.sleep(500)
-                    port.purgeHwBuffers(false, true)
-                }
-
-                for (ant in 1..4) {
-                    val ms = if (ant <= antCount) workingMs else inactiveMs
-                    port.write(winnixBuildSetWorkingTime(ant, ms), 2000)
-                    Thread.sleep(500)
-                    port.purgeHwBuffers(false, true)
-                }
-
-                port.write(winnixBuildSetInventoryMode(invMode), 2000)
-                Thread.sleep(500)
-                port.purgeHwBuffers(false, true)
-
-                port.write(winnixBuildSetStatusLed(enabled = true), 2000)
-                Thread.sleep(500)
-                port.purgeHwBuffers(false, true)
-
-                val startTemp = winnixReadTemperature(port)
+                val startTemp = winnixReadTemperature(wrapper)
                 winnixStartTemp = if (startTemp != null) "%.1f".format(java.util.Locale.US, startTemp) else ""
                 Log.i(TAG, "Winnix start temperature: $winnixStartTemp°C")
 
                 Thread.sleep(200)
-                port.purgeHwBuffers(false, true)
+                wrapper.purgeHwBuffers(false, true)
+                wrapper.write(winnixBuildStartInventory(), 2000)
+                Log.i(TAG, "Winnix USB inventory started")
 
-                port.write(winnixBuildStartInventory(), 2000)
-                Log.i(TAG, "Winnix inventory started (ants=$antennas power=${powerDbm}dBm working=${workingMs}ms invMode=$invMode)")
-
-                ioManager = SerialInputOutputManager(port, object : SerialInputOutputManager.Listener {
-                    override fun onNewData(data: ByteArray) {
-                        checkWinnixTempResponse(data)
-
-                        val lat  = mainActivity?.getCurrentLatitude()  ?: ""
-                        val lon  = mainActivity?.getCurrentLongitude() ?: ""
-                        val brg  = mainActivity?.getCurrentBearing()   ?: ""
-                        val tags = winnixDecoder.feed(data, lat, lon, brg)
-                        if (tags.isNotEmpty()) {
-                            val processedTags = tags.toMutableList()
-                            val temp = winnixStartTemp
-                            if (temp.isNotEmpty()) {
-                                winnixStartTemp = ""
-                                processedTags[0] = processedTags[0].copy(temperature = temp)
-                            }
-                            tagBuffer.addAll(processedTags)
-                            totalCount.addAndGet(processedTags.size)
-                            val sinceLast = tagsSinceLastSave.addAndGet(processedTags.size)
-                            if (sinceLast >= autoSaveTagCount) {
-                                rescheduleTimerJob()   // reset time-based counter (req: count-save resets time-save)
-                                autoSaveExecutor?.submit { flushBufferToDisk() }
-                            }
-                        }
-                    }
-                    override fun onRunError(e: Exception) = handleRunError(e)
-                }).also {
+                ioManager = SerialInputOutputManager(wrapper.rawPort(), makeWinnixListener()).also {
                     it.readTimeout  = 0
                     it.writeTimeout = 2000
                     Executors.newSingleThreadExecutor().submit(it)
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Winnix startup error", e)
+                Log.e(TAG, "Winnix USB startup error", e)
                 handleRunError(e)
+            }
+        }
+    }
+
+    // =========================================================================
+    // Winnix capture — Bluetooth (uses BluetoothInputOutputManager)
+    // =========================================================================
+    private fun startWinnixCaptureBt(btPort: BluetoothSerialPort, ctx: Context) {
+        val antCount   = SettingsManager.getWinnixAntCount(ctx)
+        val powerDbm   = SettingsManager.getWinnixPowerDbm(ctx)
+        val workingMs  = SettingsManager.getWinnixWorkingMs(ctx)
+        val invMode    = SettingsManager.getWinnixInventoryMode(ctx)
+        val antennas   = (1..antCount).toList()
+        val inactiveMs = 300
+
+        winnixStartTemp = ""
+
+        // Config runs on configExecutor — btPort is already connected at this point
+        configExecutor.submit {
+            try {
+                winnixConfigSequence(btPort, antennas, powerDbm, workingMs, invMode, inactiveMs)
+
+                // Start temperature — read BEFORE starting btIoManager (no competition)
+                val startTemp = winnixReadTemperature(btPort)
+                winnixStartTemp = if (startTemp != null) "%.1f".format(java.util.Locale.US, startTemp) else ""
+                Log.i(TAG, "Winnix BT start temperature: $winnixStartTemp°C")
+
+                Thread.sleep(200)
+                btPort.purgeHwBuffers(false, true)
+                btPort.write(winnixBuildStartInventory(), 2000)
+                Log.i(TAG, "Winnix BT inventory started")
+
+                // Guard: only assign btIoManager if still running
+                // Prevents race where stopCapture() ran while configExecutor was still starting
+                if (!isRunning.get()) {
+                    Log.w(TAG, "BT capture aborted — stop was called during startup")
+                    btPort.close()
+                    return@submit
+                }
+
+                btIoManager = BluetoothInputOutputManager(btPort, object : BluetoothInputOutputManager.Listener {
+                    override fun onNewData(data: ByteArray) = winnixOnNewData(data)
+                    override fun onRunError(e: Exception)   = handleRunError(e)
+                })
+                Executors.newSingleThreadExecutor().submit(btIoManager)
+
+            } catch (e: Exception) {
+                Log.e(TAG, "Winnix BT startup error", e)
+                handleRunError(e)
+            }
+        }
+    }
+
+    // =========================================================================
+    // Shared Winnix helpers
+    // =========================================================================
+
+    /** Sends the full configuration sequence to the Winnix module via any port. */
+    private fun winnixConfigSequence(
+        port: ISerialPort, antennas: List<Int>,
+        powerDbm: Int, workingMs: Int, invMode: Int, inactiveMs: Int
+    ) {
+        port.write(winnixBuildSetAntennas(antennas), 2000); Thread.sleep(500); port.purgeHwBuffers(false, true)
+        antennas.forEach { ant ->
+            port.write(winnixBuildSetPower(ant, powerDbm), 2000); Thread.sleep(500); port.purgeHwBuffers(false, true)
+        }
+        for (ant in 1..4) {
+            val ms = if (ant <= antennas.size) workingMs else inactiveMs
+            port.write(winnixBuildSetWorkingTime(ant, ms), 2000); Thread.sleep(500); port.purgeHwBuffers(false, true)
+        }
+        port.write(winnixBuildSetInventoryMode(invMode), 2000); Thread.sleep(500); port.purgeHwBuffers(false, true)
+        port.write(winnixBuildSetStatusLed(), 2000); Thread.sleep(500); port.purgeHwBuffers(false, true)
+    }
+
+    /** Returns the shared onNewData handler for Winnix (USB and BT use the same logic). */
+    private fun makeWinnixListener(): SerialInputOutputManager.Listener =
+        object : SerialInputOutputManager.Listener {
+            override fun onNewData(data: ByteArray) = winnixOnNewData(data)
+            override fun onRunError(e: Exception)   = handleRunError(e)
+        }
+
+    private fun winnixOnNewData(data: ByteArray) {
+        // Check for stop confirmation (0x8D)
+        for (i in 0 until data.size - 4) {
+            if (data[i] == 0xA5.toByte() && data[i+1] == 0x5A.toByte()
+                && data[i+4] == 0x8D.toByte()) {
+                Log.i(TAG, "Winnix stop confirmed (0x8D) via onNewData")
+                winnixStopConfirmed.set(true)
+            }
+        }
+
+        // Check for temperature response (0x35) — fills latch for winnixReadTemperatureBt()
+        val tempLatch = winnixTempLatch.get()
+        if (tempLatch != null && tempLatch.count > 0) {
+            for (i in 0 until data.size - 7) {
+                if (data[i] == 0xA5.toByte() && data[i+1] == 0x5A.toByte()
+                    && data[i+4] == 0x35.toByte() && data[i+5] == 0x01.toByte()) {
+                    val raw    = ((data[i+6].toInt() and 0xFF) shl 8) or (data[i+7].toInt() and 0xFF)
+                    val signed = if (raw > 32767) raw - 65536 else raw
+                    val temp   = signed / 100.0f
+                    winnixTempResult = "%.1f".format(java.util.Locale.US, temp)
+                    Log.i(TAG, "Temperature 0x35 captured via onNewData: $winnixTempResult°C")
+                    tempLatch.countDown()
+                    break
+                }
+            }
+        }
+
+        val lat  = mainActivity?.getCurrentLatitude()  ?: ""
+        val lon  = mainActivity?.getCurrentLongitude() ?: ""
+        val brg  = mainActivity?.getCurrentBearing()   ?: ""
+        val tags = winnixDecoder.feed(data, lat, lon, brg)
+        if (tags.isNotEmpty()) {
+            val processedTags = tags.toMutableList()
+            val temp = winnixStartTemp
+            if (temp.isNotEmpty()) {
+                winnixStartTemp = ""
+                processedTags[0] = processedTags[0].copy(temperature = temp)
+            }
+            tagBuffer.addAll(processedTags)
+            totalCount.addAndGet(processedTags.size)
+            val sinceLast = tagsSinceLastSave.addAndGet(processedTags.size)
+            if (sinceLast >= autoSaveTagCount) {
+                rescheduleTimerJob()
+                autoSaveExecutor?.submit { flushBufferToDisk() }
             }
         }
     }
 
     private fun closePort() {
         synchronized(this) {
-            try { usbPort?.close() }       catch (_: Exception) {}
-            try { usbConnection?.close() } catch (_: Exception) {}
+            try { activePort?.close() } catch (_: Exception) {}
+            activePort    = null
             usbPort       = null
             usbConnection = null
         }
     }
 
+    /**
+     * Sends stop inventory (0x8C) and waits for module confirmation (0x8D).
+     * The 0x8D response is detected by winnixOnNewData which sets winnixStopConfirmed.
+     * Works for both USB and BT — IOManager/btIoManager deliver the response via onNewData.
+     * Retries up to 3 times if no confirmation received within 1s per attempt.
+     */
     private fun sendWinnixStop() {
-        try {
-            usbPort?.write(winnixBuildStopInventory(), 2000)
-            Thread.sleep(300)
-        } catch (_: Exception) {}
-    }
-
-    private fun checkWinnixTempResponse(data: ByteArray) {
-        val latch = winnixTempLatch ?: return
-        if (latch.count == 0L) return
-
-        for (i in 0 until data.size - 8) {
-            if (data[i] == 0xA5.toByte() && data[i+1] == 0x5A.toByte() && data[i+4] == 0x35.toByte()) {
-                if (data[i+5] == 0x01.toByte()) {
-                    val raw    = ((data[i+6].toInt() and 0xFF) shl 8) or (data[i+7].toInt() and 0xFF)
-                    val signed = if (raw > 32767) raw - 65536 else raw
-                    val temp   = signed / 100.0f
-                    winnixStopTempValue = "%.1f".format(java.util.Locale.US, temp)
-                    Log.i(TAG, "Winnix stop temperature captured via onNewData: $winnixStopTempValue°C")
-                    latch.countDown()
+        val port = activePort ?: return
+        winnixStopConfirmed.set(false)
+        repeat(3) { attempt ->
+            try {
+                Log.i(TAG, "Sending stop inventory (0x8C) attempt ${attempt + 1}")
+                port.write(winnixBuildStopInventory(), 2000)
+                // Wait up to 1s for winnixOnNewData to detect 0x8D and set the flag
+                val deadline = System.currentTimeMillis() + 1000L
+                while (!winnixStopConfirmed.get() && System.currentTimeMillis() < deadline) {
+                    Thread.sleep(50)
                 }
-                break
+                if (winnixStopConfirmed.get()) {
+                    Log.i(TAG, "Winnix stop confirmed (0x8D) on attempt ${attempt + 1}")
+                    return
+                }
+                Log.w(TAG, "Stop confirmation not received on attempt ${attempt + 1}, retrying...")
+            } catch (e: Exception) {
+                Log.e(TAG, "sendWinnixStop error: ${e.message}")
+                return
             }
         }
+        Log.w(TAG, "Winnix stop: no 0x8D after 3 attempts — proceeding anyway")
     }
 
-    private fun probeAntennaType(port: UsbSerialPort, antennaType: String): Boolean {
+    private fun probeAntennaType(port: ISerialPort, antennaType: String): Boolean {
         return try {
+            if (antennaType == SettingsManager.ANTENNA_TYPE_WINNIX) {
+                port.write(winnixBuildStopInventory(), 1000)
+                Thread.sleep(300)
+                port.purgeHwBuffers(false, true)
+                Thread.sleep(100)
+            }
+
             val (probeCmd, expectedHeader) = if (antennaType == SettingsManager.ANTENNA_TYPE_WINNIX) {
-                byteArrayOf(0xA5.toByte(), 0x5A.toByte(), 0x00, 0x08, 0x02, 0x0A, 0x0D, 0x0A) to byteArrayOf(0xA5.toByte(), 0x5A.toByte())
+                byteArrayOf(0xA5.toByte(), 0x5A.toByte(), 0x00, 0x08, 0x02, 0x0A, 0x0D, 0x0A) to
+                        byteArrayOf(0xA5.toByte(), 0x5A.toByte())
             } else {
-                byteArrayOf(0x43, 0x4D, 0x01, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00) to byteArrayOf(0x43, 0x4D, 0x01, 0x03)
+                byteArrayOf(0x43, 0x4D, 0x01, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00) to
+                        byteArrayOf(0x43, 0x4D, 0x01, 0x03)
             }
 
             port.write(probeCmd, 2000)
 
-            val deadline   = System.currentTimeMillis() + PROBE_TIMEOUT_MS
-            val readBuf    = ByteArray(64)
-            val response   = mutableListOf<Byte>()
+            val deadline = System.currentTimeMillis() + PROBE_TIMEOUT_MS
+            val readBuf  = ByteArray(64)
+            val response = mutableListOf<Byte>()
 
             while (System.currentTimeMillis() < deadline && response.size < 16) {
                 val n = try { port.read(readBuf, 100) } catch (_: Exception) { 0 }
@@ -448,7 +667,7 @@ class UHFReaderService : Service() {
                     return false
                 }
             }
-            Log.i(TAG, "Probe OK — $antennaType antenna confirmed")
+            Log.i(TAG, "Probe OK — $antennaType via ${port.portName}")
             true
         } catch (e: Exception) {
             Log.e(TAG, "Probe error", e)
@@ -476,9 +695,8 @@ class UHFReaderService : Service() {
     private fun winnixBuildStopInventory(): ByteArray = winnixBuildFrame(0x8C)
     private fun winnixBuildGetTemperature(): ByteArray = winnixBuildFrame(0x34)
 
-    private fun winnixBuildSetStatusLed(enabled: Boolean): ByteArray {
-        val led = if (enabled) 0x01.toByte() else 0x00.toByte()
-        return winnixBuildFrame(0x7A, byteArrayOf(0x00, 0x00, 0x00, led, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00))
+    private fun winnixBuildSetStatusLed(): ByteArray {
+        return winnixBuildFrame(0x7A, byteArrayOf(0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00))
     }
 
     /**
@@ -495,35 +713,64 @@ class UHFReaderService : Service() {
         return winnixBuildFrame(0x76, byteArrayOf(0x00, dbyte0.toByte()))
     }
 
-    private fun winnixReadTemperature(port: UsbSerialPort): Float? {
+    /**
+     * Read temperature for BT sessions — uses latch filled by onNewData.
+     * The btIoManager delivers all bytes via onNewData, so we cannot use
+     * winnixReadTemperature (available() polling) which competes with btIoManager.
+     * Instead: set latch, send 0x34, wait for onNewData to detect 0x35 and signal.
+     * Called ONLY when btIoManager is active (during capture or stop temp before port close).
+     */
+    private fun winnixReadTemperatureBt(port: ISerialPort): String {
+        winnixTempResult = ""
+        val latch = java.util.concurrent.CountDownLatch(1)
+        winnixTempLatch.set(latch)
         return try {
-            try { port.purgeHwBuffers(false, true) } catch (_: Exception) {}
+            port.write(winnixBuildGetTemperature(), 2000)
+            val received = latch.await(2000, java.util.concurrent.TimeUnit.MILLISECONDS)
+            if (received && winnixTempResult.isNotEmpty()) {
+                Log.i(TAG, "BT temperature via latch: $winnixTempResult°C")
+                winnixTempResult
+            } else {
+                Log.w(TAG, "BT temperature: no response within 2s")
+                ""
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "BT temperature read error: ${e.message}")
+            ""
+        } finally {
+            winnixTempLatch.set(null)
+        }
+    }
+    private fun winnixReadTemperature(port: ISerialPort): Float? {
+        return try {
+            try { port.purgeHwBuffers(true, false) } catch (_: Exception) {}
             Thread.sleep(100)
 
             port.write(winnixBuildGetTemperature(), 2000)
 
             val collected = mutableListOf<Byte>()
-            val deadline  = System.currentTimeMillis() + 1500L
-            val buf       = ByteArray(32)
-            while (System.currentTimeMillis() < deadline && collected.size < 11) {
+            val deadline  = System.currentTimeMillis() + 2000L  // 2s timeout
+            val buf       = ByteArray(64)
+            while (System.currentTimeMillis() < deadline) {
                 val n = try { port.read(buf, 200) } catch (_: Exception) { 0 }
                 for (i in 0 until n) collected.add(buf[i])
+                // Search for 0x35 response anywhere in collected bytes
+                val data = collected.toByteArray()
+                for (idx in 0 until data.size - 7) {
+                    if (data[idx]   == 0xA5.toByte() &&
+                        data[idx+1] == 0x5A.toByte() &&
+                        data[idx+4] == 0x35.toByte() &&
+                        data[idx+5] == 0x01.toByte()) {
+                        val raw    = ((data[idx+6].toInt() and 0xFF) shl 8) or (data[idx+7].toInt() and 0xFF)
+                        val signed = if (raw > 32767) raw - 65536 else raw
+                        val temp   = signed / 100.0f
+                        Log.i(TAG, "Temperature read: $temp°C")
+                        return temp
+                    }
+                }
             }
-
-            if (collected.size < 9) return null
-
-            val data = collected.toByteArray()
-            val idx  = data.indexOfFirst { it == 0xA5.toByte() }
-            if (idx < 0 || idx + 8 >= data.size)          return null
-            if (data[idx + 1] != 0x5A.toByte())           return null
-            if (data[idx + 4] != 0x35.toByte())           return null
-            if (data[idx + 5] != 0x01.toByte())           return null
-
-            val raw    = ((data[idx + 6].toInt() and 0xFF) shl 8) or (data[idx + 7].toInt() and 0xFF)
-            val signed = if (raw > 32767) raw - 65536 else raw
-            val temp   = signed / 100.0f
-            Log.i(TAG, "Temperature read: $temp°C")
-            temp
+            Log.w(TAG, "Temperature read: 0x35 not found in ${collected.size} bytes within timeout")
+            null
         } catch (e: Exception) {
             Log.w(TAG, "Temperature read failed: ${e.message}")
             null
@@ -566,11 +813,62 @@ class UHFReaderService : Service() {
         if (!isRunning.compareAndSet(true, false)) return
         isPausedState.set(true)
         stopAutoSaveTimer()
-        ioManager?.stop()
-        ioManager = null
+        ioManager?.stop();   ioManager   = null
+        btIoManager?.stop(); btIoManager = null
         closePort()
         updateNotification("Sinal perdido — ${totalCount.get()} tags aguardando salvamento")
         onCaptureError?.invoke()
+
+        // Only start BT reconnect loop if this was a BT session
+        // USB sessions reconnect via ACTION_USB_DEVICE_ATTACHED in MainActivity
+        if (activeIsBluetooth && activeAntennaType == SettingsManager.ANTENNA_TYPE_WINNIX &&
+            btIoManager == null && activePort == null) {
+            Log.i(TAG, "BT_RECONNECT: BT session lost — starting reconnect loop")
+            startBtReconnectLoop()
+        } else {
+            Log.i(TAG, "BT_RECONNECT: not starting loop — isBT=$activeIsBluetooth antenna=$activeAntennaType btIo=$btIoManager port=$activePort")
+        }
+    }
+
+    /**
+     * Retry loop that periodically calls startCapture() with BT_DEVICE_NAME.
+     * Conditions to keep running:
+     *   - isPausedState == true  (not stopped by user)
+     *   - isRunning == false     (not already capturing)
+     * Stops automatically when:
+     *   - User clicks Stop → stopCapture() → isPausedState = false
+     *   - Reconnect succeeds → startCapture() → isRunning = true
+     *   - onDestroy() → btReconnectExecutor.shutdownNow()
+     */
+    private fun startBtReconnectLoop() {
+        btReconnectExecutor?.shutdownNow()
+        btReconnectExecutor = Executors.newSingleThreadExecutor()
+        btReconnectExecutor?.submit {
+            Log.i(TAG, "BT_RECONNECT: loop started, will retry every ${BT_RECONNECT_INTERVAL_MS}ms")
+            var attempt = 0
+            while (isPausedState.get() && !isRunning.get()) {
+                attempt++
+                Log.i(TAG, "BT_RECONNECT: waiting ${BT_RECONNECT_INTERVAL_MS}ms before attempt #$attempt")
+                try { Thread.sleep(BT_RECONNECT_INTERVAL_MS) } catch (_: InterruptedException) { break }
+
+                if (!isPausedState.get() || isRunning.get()) {
+                    Log.i(TAG, "BT_RECONNECT: loop exiting — isPaused=${isPausedState.get()} isRunning=${isRunning.get()}")
+                    break
+                }
+
+                // Call startCapture() exactly like the Start button does.
+                // startCapture() handles isPausedState.getAndSet(false) → resuming=true internally.
+                // This is the exact same path that works when the user clicks Start.
+                Log.i(TAG, "BT_RECONNECT: attempt #$attempt — calling startCapture (same as Start button)")
+                startCapture(BT_DEVICE_NAME)
+
+                // Wait for startCapture to complete (runs on configExecutor)
+                Log.i(TAG, "BT_RECONNECT: waiting for result...")
+                try { Thread.sleep(BT_RECONNECT_INTERVAL_MS * 2) } catch (_: InterruptedException) { break }
+                Log.i(TAG, "BT_RECONNECT: after attempt #$attempt — isPaused=${isPausedState.get()} isRunning=${isRunning.get()}")
+            }
+            Log.i(TAG, "BT_RECONNECT: loop ended after $attempt attempts")
+        }
     }
 
     // =========================================================================
@@ -692,5 +990,9 @@ class UHFReaderService : Service() {
         const val ACTION_START      = "com.uhflogger.START"
         const val ACTION_STOP       = "com.uhflogger.STOP"
         const val EXTRA_DEVICE_NAME = "device_name"
+        const val BT_DEVICE_NAME    = "Winnix_BT"
+        private const val BT_MAX_RETRIES          = 3
+        private const val BT_RETRY_DELAY_MS       = 2000L
+        private const val BT_RECONNECT_INTERVAL_MS= 5000L  // retry interval when session is paused
     }
 }

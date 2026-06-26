@@ -136,7 +136,7 @@
         android:id="@+id/labelDevice"
         android:layout_width="0dp"
         android:layout_height="wrap_content"
-        android:text="DISPOSITIVO USB"
+        android:text="DISPOSITIVO USB/BLUETOOTH"
         android:textColor="#888888"
         android:textSize="11sp"
         android:letterSpacing="0.08"

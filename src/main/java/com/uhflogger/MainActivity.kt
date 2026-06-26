@@ -42,9 +42,12 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     // Configurações de GPS — ajuste aqui
     // -------------------------------------------------------------------------
     companion object {
-        const val GPS_UPDATE_INTERVAL_MS = 1000L   // intervalo mínimo em milissegundos
-        const val GPS_UPDATE_MIN_METERS  = 1f      // deslocamento mínimo em metros
-        private const val REQ_LOCATION   = 101
+        const val GPS_UPDATE_INTERVAL_MS     = 1000L
+        const val GPS_UPDATE_MIN_METERS      = 1f
+        const val MAX_LOCATION_AGE_MS        = 30_000L
+        const val MAX_LOCATION_ACCURACY_M    = 50f
+        private const val REQ_LOCATION       = 101
+        private const val REQ_BT_PERMISSION  = 102
     }
 
     private lateinit var binding: ActivityMainBinding
@@ -57,11 +60,49 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private lateinit var locationManager: LocationManager
     private var currentLocation: Location? = null
     private val locationListener = object : LocationListener {
-        override fun onLocationChanged(location: Location) { currentLocation = location }
-        override fun onProviderEnabled(provider: String)   {}
-        override fun onProviderDisabled(provider: String)  {}
+        override fun onLocationChanged(location: Location) {
+            if (isBetterLocation(location, currentLocation)) {
+                currentLocation = location
+            }
+        }
+        override fun onProviderEnabled(provider: String)  {}
+        override fun onProviderDisabled(provider: String) {}
         @Deprecated("Deprecated in Java")
         override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
+    }
+
+    /**
+     * Returns true if newLoc is a better position than current.
+     * - Rejects positions older than MAX_LOCATION_AGE_MS (30s)
+     * - Rejects positions with accuracy worse than MAX_LOCATION_ACCURACY_M
+     * - Prefers GPS over network when both are available
+     * - Falls back to any fresh position if current is too old
+     */
+    private fun isBetterLocation(newLoc: Location, current: Location?): Boolean {
+        val now = System.currentTimeMillis()
+
+        // Reject if the new position is too old (GPS waking up from sleep sends stale fixes)
+        if (now - newLoc.time > MAX_LOCATION_AGE_MS) return false
+
+        // Reject if accuracy is too poor (network location can be 100m+ off)
+        if (newLoc.hasAccuracy() && newLoc.accuracy > MAX_LOCATION_ACCURACY_M) return false
+
+        // No current position — accept anything that passed the checks above
+        if (current == null) return true
+
+        // Current position is too old — even a less accurate fresh one is better
+        if (now - current.time > MAX_LOCATION_AGE_MS) return true
+
+        // Prefer GPS over network when accuracy is comparable
+        val newIsGps     = newLoc.provider == LocationManager.GPS_PROVIDER
+        val currentIsGps = current.provider == LocationManager.GPS_PROVIDER
+        if (newIsGps && !currentIsGps) return true
+        if (!newIsGps && currentIsGps) return false
+
+        // Same provider — prefer the more accurate one
+        if (!newLoc.hasAccuracy()) return false
+        if (!current.hasAccuracy()) return true
+        return newLoc.accuracy <= current.accuracy
     }
 
     // Bússola
@@ -86,7 +127,10 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             serviceBound  = true
             readerService?.mainActivity = this@MainActivity
             readerService?.onStatusChanged = { capturing ->
-                runOnUiThread { setCapturingState(capturing) }
+                runOnUiThread {
+                    if (capturing) stoppedByError = false  // reconnect succeeded — normal stop from now on
+                    setCapturingState(capturing)
+                }
             }
             readerService?.onCaptureError = {
                 runOnUiThread {
@@ -139,8 +183,6 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 }
                 UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
                     refreshDeviceList()
-                    // Se estava pausado (antena desconectou no meio da leitura),
-                    // retoma automaticamente quando a antena é reconectada
                     val deviceName = binding.spinnerDevices.tag?.toString()
                     if (readerService?.isPaused() == true && deviceName != null) {
                         val usbManager = getSystemService(USB_SERVICE) as UsbManager
@@ -159,7 +201,47 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 }
                 UsbManager.ACTION_USB_DEVICE_DETACHED -> {
                     refreshDeviceList()
-                    // onRunError já tratou a desconexão
+                }
+            }
+        }
+    }
+
+    /**
+     * Bluetooth state receiver:
+     * - STATE_ON: Bluetooth activated → refresh list to show Winnix_BT if paired
+     * - STATE_OFF: Bluetooth deactivated → refresh list to remove BT device
+     * - ACL_CONNECTED: Winnix_BT reconnected while paused → resume capture
+     * - ACL_DISCONNECTED: Winnix_BT disconnected → handleRunError already handled it
+     */
+    private val btReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            when (intent.action) {
+                android.bluetooth.BluetoothAdapter.ACTION_STATE_CHANGED -> {
+                    val state = intent.getIntExtra(
+                        android.bluetooth.BluetoothAdapter.EXTRA_STATE,
+                        android.bluetooth.BluetoothAdapter.ERROR
+                    )
+                    if (state == android.bluetooth.BluetoothAdapter.STATE_ON ||
+                        state == android.bluetooth.BluetoothAdapter.STATE_OFF) {
+                        refreshDeviceList()
+                    }
+                }
+                android.bluetooth.BluetoothDevice.ACTION_ACL_CONNECTED -> {
+                    @Suppress("DEPRECATION")
+                    val device = intent.getParcelableExtra<android.bluetooth.BluetoothDevice>(
+                        android.bluetooth.BluetoothDevice.EXTRA_DEVICE
+                    )
+                    val deviceName = try { device?.name } catch (_: SecurityException) { null }
+                    if (deviceName == UHFReaderService.BT_DEVICE_NAME &&
+                        readerService?.isPaused() == true) {
+                        android.os.Handler(mainLooper).postDelayed({
+                            if (readerService?.isPaused() == true) {
+                                stoppedByError = false
+                                readerService?.startCapture(UHFReaderService.BT_DEVICE_NAME)
+                                toast("Winnix_BT reconectado — retomando leitura")
+                            }
+                        }, 2000)
+                    }
                 }
             }
         }
@@ -175,6 +257,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
         requestNotificationPermission()
         requestLocationPermission()
+        requestBluetoothPermission()
         registerUsbReceiver()
         bindToService()
         setupButtons()
@@ -209,6 +292,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         super.onDestroy()
         locationManager.removeUpdates(locationListener)
         unregisterReceiver(usbReceiver)
+        try { unregisterReceiver(btReceiver) } catch (_: Exception) {}
         if (serviceBound) {
             readerService?.mainActivity = null
             unbindService(serviceConnection)
@@ -232,6 +316,22 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 
     // GPS
+    private fun requestBluetoothPermission() {
+        // BLUETOOTH_CONNECT required on Android 12+ to access paired device names
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+            if (checkSelfPermission(android.Manifest.permission.BLUETOOTH_CONNECT)
+                != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(
+                    arrayOf(
+                        android.Manifest.permission.BLUETOOTH_CONNECT,
+                        android.Manifest.permission.BLUETOOTH_SCAN
+                    ),
+                    REQ_BT_PERMISSION
+                )
+            }
+        }
+    }
+
     private fun requestLocationPermission() {
         val perms = arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)
         val missing = perms.filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
@@ -255,9 +355,15 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
             // Fallback inicial enquanto GPS ainda não fixou
             if (currentLocation == null) {
-                currentLocation = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)
-                if (currentLocation == null && !gnssOnly) {
-                    currentLocation = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
+                // Only accept last known location if it's recent enough
+                val last = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)
+                if (last != null && System.currentTimeMillis() - last.time <= MAX_LOCATION_AGE_MS) {
+                    currentLocation = last
+                } else if (!gnssOnly) {
+                    val lastNet = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
+                    if (lastNet != null && System.currentTimeMillis() - lastNet.time <= MAX_LOCATION_AGE_MS) {
+                        currentLocation = lastNet
+                    }
                 }
             }
         } catch (_: Exception) {}
@@ -265,7 +371,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == REQ_LOCATION) startLocationUpdates()
+        if (requestCode == REQ_LOCATION)      startLocationUpdates()
+        if (requestCode == REQ_BT_PERMISSION) refreshDeviceList()  // show Winnix_BT if now paired
     }
 
     fun getCurrentLatitude()  = currentLocation?.let { "%.6f".format(java.util.Locale.US, it.latitude) }  ?: ""
@@ -284,7 +391,15 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
     private fun onStartClicked() {
         val deviceName = binding.spinnerDevices.tag?.toString()
-            ?: run { toast("Nenhum dispositivo USB selecionado"); return }
+            ?: run { toast("Nenhum dispositivo selecionado"); return }
+
+        // Bluetooth device — no USB permission needed, connect directly
+        if (deviceName == UHFReaderService.BT_DEVICE_NAME) {
+            startReaderService(deviceName)
+            return
+        }
+
+        // USB device — check permission as before
         val usbManager = getSystemService(USB_SERVICE) as UsbManager
         val device = usbManager.deviceList.values.firstOrNull { it.deviceName == deviceName }
             ?: run { toast("Dispositivo não encontrado"); return }
@@ -328,16 +443,40 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         val usbManager = getSystemService(USB_SERVICE) as UsbManager
         val drivers    = UsbSerialProber.getDefaultProber().findAllDrivers(usbManager)
 
-        val labels = if (drivers.isEmpty()) listOf("Nenhum dispositivo USB")
-        else drivers.map { driver ->
+        // Build device name list: USB devices first, then BT if paired
+        val deviceNames = mutableListOf<String>()
+        val labels      = mutableListOf<String>()
+
+        // USB devices
+        for (driver in drivers) {
             val dev = driver.device
             val vid = dev.vendorId.toString(16).uppercase().padStart(4, '0')
             val pid = dev.productId.toString(16).uppercase().padStart(4, '0')
             val mfr = dev.manufacturerName ?: "Desconhecido"
-            "VID:$vid / PID:$pid — $mfr"
+            deviceNames.add(dev.deviceName)
+            labels.add("USB — VID:$vid / PID:$pid — $mfr")
         }
 
-        // Adapter com texto preto forçado — independente do tema do celular
+        // Bluetooth — check if Winnix_BT is paired
+        try {
+            val btManager = getSystemService(BLUETOOTH_SERVICE) as? android.bluetooth.BluetoothManager
+            val adapter   = btManager?.adapter
+            @Suppress("DEPRECATION")
+            val btDevice  = adapter?.bondedDevices?.firstOrNull {
+                it.name == UHFReaderService.BT_DEVICE_NAME
+            }
+            if (btDevice != null) {
+                deviceNames.add(UHFReaderService.BT_DEVICE_NAME)
+                labels.add("BT — ${UHFReaderService.BT_DEVICE_NAME} (${btDevice.address})")
+            }
+        } catch (_: SecurityException) {
+            // BLUETOOTH_CONNECT permission not granted yet — BT device won't appear
+        } catch (_: Exception) {}
+
+        if (deviceNames.isEmpty()) {
+            labels.add("Nenhum dispositivo")
+        }
+
         val adapter = object : ArrayAdapter<String>(this,
             android.R.layout.simple_spinner_item, labels) {
             override fun getView(pos: Int, v: android.view.View?, parent: android.view.ViewGroup): android.view.View {
@@ -357,7 +496,15 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
         binding.spinnerDevices.adapter = adapter
         binding.spinnerDevices.setBackgroundResource(R.drawable.bg_spinner_white)
-        binding.spinnerDevices.tag = if (drivers.isEmpty()) null else drivers[0].device.deviceName
+        binding.spinnerDevices.tag = if (deviceNames.isEmpty()) null else deviceNames[0]
+
+        // Keep spinner selection in sync with deviceNames list
+        binding.spinnerDevices.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: android.view.View?, pos: Int, id: Long) {
+                binding.spinnerDevices.tag = deviceNames.getOrNull(pos)
+            }
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+        }
     }
 
     private fun requestUsbPermission(usbManager: UsbManager, device: UsbDevice) {
@@ -376,6 +523,14 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
         }
         registerReceiver(usbReceiver, filter, RECEIVER_NOT_EXPORTED)
+
+        // Bluetooth receiver — no export restriction needed for system BT broadcasts
+        val btFilter = IntentFilter().apply {
+            addAction(android.bluetooth.BluetoothAdapter.ACTION_STATE_CHANGED)
+            addAction(android.bluetooth.BluetoothDevice.ACTION_ACL_CONNECTED)
+            addAction(android.bluetooth.BluetoothDevice.ACTION_ACL_DISCONNECTED)
+        }
+        registerReceiver(btReceiver, btFilter)
     }
 
     private fun setCapturingState(capturing: Boolean) {
