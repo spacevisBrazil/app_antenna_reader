@@ -55,37 +55,25 @@ class BluetoothSerialPort(private val device: BluetoothDevice) : ISerialPort {
     }
 
     private fun tryConnect(): BluetoothSocket {
-        // Attempt 1: standard secure RFCOMM
+        // Single attempt using standard secure RFCOMM.
+        // Previously tried 3 fallback methods sequentially (secure → insecure →
+        // reflection), each connect() call taking up to ~12s to time out when
+        // the device is out of range. That meant a single tryConnect() call could
+        // take up to 36s, and with 3 outer retries (BT_MAX_RETRIES) the worst
+        // case ballooned to over 100s before the reconnect loop even got a chance
+        // to detect a successful connection.
+        // The outer retry loops (startBtConnection's 3 retries + the indefinite
+        // BT reconnect loop) already provide retry coverage — so a single,
+        // fast-failing attempt here is both simpler and far more responsive.
+        val s = device.createRfcommSocketToServiceRecord(SPP_UUID)
         try {
-            val s = device.createRfcommSocketToServiceRecord(SPP_UUID)
             s.connect()
             Log.d(TAG, "Connected via secure RFCOMM")
             return s
         } catch (e: Exception) {
-            Log.w(TAG, "Secure RFCOMM failed: ${e.message} — trying insecure")
-        }
-
-        // Attempt 2: insecure RFCOMM (no authentication)
-        try {
-            val s = device.createInsecureRfcommSocketToServiceRecord(SPP_UUID)
-            s.connect()
-            Log.d(TAG, "Connected via insecure RFCOMM")
-            return s
-        } catch (e: Exception) {
-            Log.w(TAG, "Insecure RFCOMM failed: ${e.message} — trying reflection fallback")
-        }
-
-        // Attempt 3: reflection fallback — uses channel 1 directly
-        // Works when ACL link is already established by the remote device
-        try {
-            val method = device.javaClass.getMethod("createRfcommSocket", Int::class.java)
-            val s = method.invoke(device, 1) as BluetoothSocket
-            s.connect()
-            Log.d(TAG, "Connected via reflection (channel 1)")
-            return s
-        } catch (e: Exception) {
-            Log.e(TAG, "All connection attempts failed: ${e.message}")
+            try { s.close() } catch (_: Exception) {}
             val name = try { device.name } catch (_: SecurityException) { device.address }
+            Log.w(TAG, "Connect failed: ${e.message}")
             throw Exception("Failed to connect to $name: ${e.message}")
         }
     }
