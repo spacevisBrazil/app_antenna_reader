@@ -17,6 +17,12 @@ object SettingsManager {
     const val KEY_WINNIX_POWER_DBM        = "winnix_power_dbm"
     const val KEY_WINNIX_WORKING_MS       = "winnix_working_ms"
     const val KEY_WINNIX_INVENTORY_MODE   = "winnix_inventory_mode"
+    // Estado de captura persistido — usado para retomar (ou não) a leitura
+    // sozinho depois que o processo é morto (SIGKILL de backup, OOM-kill, etc.)
+    // e o Android recria o Service. Sem isso, o app não tem como saber se
+    // estava lendo ou parado quando voltar.
+    const val KEY_WAS_CAPTURING           = "was_capturing"
+    const val KEY_LAST_DEVICE_NAME        = "last_device_name"
 
     // Location mode values
     const val LOCATION_MODE_HYBRID        = "hybrid"
@@ -108,4 +114,24 @@ object SettingsManager {
         WINNIX_INV_MODE_ADAPTIVE -> "Adaptive"
         else                     -> "Desconhecido"
     }
+
+    // -------------------------------------------------------------------
+    // Estado de captura — grava com commit() (síncrono) de propósito: essa
+    // gravação acontece raramente (só ao iniciar/parar), então o custo é
+    // desprezível, e queremos garantia de que já está em disco antes de
+    // continuar, já que um SIGKILL pode chegar a qualquer momento depois.
+    // apply() (assíncrono) correria o risco de perder essa escrita.
+    // -------------------------------------------------------------------
+    fun setCaptureState(context: Context, capturing: Boolean, deviceName: String? = null) {
+        prefs(context).edit().apply {
+            putBoolean(KEY_WAS_CAPTURING, capturing)
+            if (deviceName != null) putString(KEY_LAST_DEVICE_NAME, deviceName)
+        }.commit()
+    }
+
+    fun wasCapturing(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_WAS_CAPTURING, false)
+
+    fun getLastDeviceName(context: Context): String? =
+        prefs(context).getString(KEY_LAST_DEVICE_NAME, null)
 }

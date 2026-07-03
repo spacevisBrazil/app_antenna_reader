@@ -12,6 +12,15 @@
         android:maxSdkVersion="28" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <!-- Necessária no Android 10+ para o GPS continuar entregando fixes com o
+         app em background/tela apagada por longos períodos (captura de dias). -->
+    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
+    <!-- Segura o CPU acordado durante a captura (ver WakeLock no UHFReaderService),
+         evitando que o Doze suspenda GPS/sensores/leitura serial. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Necessária a partir do Android 14 (API 34) para declarar
+         foregroundServiceType="location" no UHFReaderService. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
@@ -25,7 +34,7 @@
 
     <application
         android:name=".UHFLoggerApplication"
-        android:allowBackup="true"
+        android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
         android:label="UHF Logger"
         android:roundIcon="@mipmap/ic_launcher_round"
@@ -86,7 +95,7 @@
             android:name=".service.UHFReaderService"
             android:enabled="true"
             android:exported="false"
-            android:foregroundServiceType="dataSync" />
+            android:foregroundServiceType="dataSync|location" />
 
         <activity
             android:name=".SettingsActivity"

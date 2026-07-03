@@ -1,6 +1,7 @@
 package com.uhflogger
 
 import android.Manifest
+import android.app.AlertDialog
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.ComponentName
@@ -9,20 +10,16 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
-import android.hardware.Sensor
-import android.hardware.SensorEvent
-import android.hardware.SensorEventListener
-import android.hardware.SensorManager
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
-import android.location.Location
-import android.location.LocationListener
-import android.location.LocationManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
+import android.provider.Settings
 import android.widget.ArrayAdapter
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
@@ -36,16 +33,12 @@ import com.uhflogger.SettingsActivity
 import com.uhflogger.drive.DriveHelper
 import com.uhflogger.drive.DriveMonitorService
 
-class MainActivity : AppCompatActivity(), SensorEventListener {
+// NOTA: GNSS e bússola foram movidos para dentro do UHFReaderService (foreground
+// service). Antes viviam aqui na Activity e travavam sempre que a tela apagava
+// ou o app ia para background — a MainActivity só cuida de UI/permissões agora.
+class MainActivity : AppCompatActivity() {
 
-    // -------------------------------------------------------------------------
-    // Configurações de GPS — ajuste aqui
-    // -------------------------------------------------------------------------
     companion object {
-        const val GPS_UPDATE_INTERVAL_MS     = 1000L
-        const val GPS_UPDATE_MIN_METERS      = 1f
-        const val MAX_LOCATION_AGE_MS        = 30_000L
-        const val MAX_LOCATION_ACCURACY_M    = 50f
         private const val REQ_LOCATION       = 101
         private const val REQ_BT_PERMISSION  = 102
     }
@@ -55,61 +48,6 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private var serviceBound = false
     private var currentToast: Toast? = null
     private var stoppedByError = false
-
-    // GPS
-    private lateinit var locationManager: LocationManager
-    private var currentLocation: Location? = null
-    private val locationListener = object : LocationListener {
-        override fun onLocationChanged(location: Location) {
-            if (isBetterLocation(location, currentLocation)) {
-                currentLocation = location
-            }
-        }
-        override fun onProviderEnabled(provider: String)  {}
-        override fun onProviderDisabled(provider: String) {}
-        @Deprecated("Deprecated in Java")
-        override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
-    }
-
-    /**
-     * Returns true if newLoc is a better position than current.
-     * - Rejects positions older than MAX_LOCATION_AGE_MS (30s)
-     * - Rejects positions with accuracy worse than MAX_LOCATION_ACCURACY_M
-     * - Prefers GPS over network when both are available
-     * - Falls back to any fresh position if current is too old
-     */
-    private fun isBetterLocation(newLoc: Location, current: Location?): Boolean {
-        val now = System.currentTimeMillis()
-
-        // Reject if the new position is too old (GPS waking up from sleep sends stale fixes)
-        if (now - newLoc.time > MAX_LOCATION_AGE_MS) return false
-
-        // Reject if accuracy is too poor (network location can be 100m+ off)
-        if (newLoc.hasAccuracy() && newLoc.accuracy > MAX_LOCATION_ACCURACY_M) return false
-
-        // No current position — accept anything that passed the checks above
-        if (current == null) return true
-
-        // Current position is too old — even a less accurate fresh one is better
-        if (now - current.time > MAX_LOCATION_AGE_MS) return true
-
-        // Prefer GPS over network when accuracy is comparable
-        val newIsGps     = newLoc.provider == LocationManager.GPS_PROVIDER
-        val currentIsGps = current.provider == LocationManager.GPS_PROVIDER
-        if (newIsGps && !currentIsGps) return true
-        if (!newIsGps && currentIsGps) return false
-
-        // Same provider — prefer the more accurate one
-        if (!newLoc.hasAccuracy()) return false
-        if (!current.hasAccuracy()) return true
-        return newLoc.accuracy <= current.accuracy
-    }
-
-    // Bússola
-    private lateinit var sensorManager: SensorManager
-    private var accelerometerData = FloatArray(3)
-    private var magnetometerData  = FloatArray(3)
-    private var currentBearing    = Float.NaN
 
     private val uiHandler = Handler(Looper.getMainLooper())
     private val tagCountUpdater = object : Runnable {
@@ -252,12 +190,10 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        sensorManager   = getSystemService(SENSOR_SERVICE)  as SensorManager
-        locationManager = getSystemService(LOCATION_SERVICE) as LocationManager
-
         requestNotificationPermission()
         requestLocationPermission()
         requestBluetoothPermission()
+        ensureBatteryOptimizationExemption()
         registerUsbReceiver()
         bindToService()
         setupButtons()
@@ -268,29 +204,17 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         super.onResume()
         uiHandler.post(tagCountUpdater)
         refreshDeviceList()
-        startLocationUpdates()
-        sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)?.let {
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
-        }
-        sensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)?.let {
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
-        }
     }
 
     override fun onPause() {
         super.onPause()
         uiHandler.removeCallbacks(tagCountUpdater)
-        sensorManager.unregisterListener(this)
-        // Remove GPS quando não está capturando — economiza bateria
-        // Durante captura mantém ativo para registrar posição nas tags
-        if (readerService?.isCapturing() != true && readerService?.isPaused() != true) {
-            locationManager.removeUpdates(locationListener)
-        }
+        // GNSS/bússola NÃO são mais tocados aqui — vivem no UHFReaderService e
+        // continuam ativos com a tela apagada, independente do onPause da Activity.
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        locationManager.removeUpdates(locationListener)
         unregisterReceiver(usbReceiver)
         try { unregisterReceiver(btReceiver) } catch (_: Exception) {}
         if (serviceBound) {
@@ -299,23 +223,6 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         }
     }
 
-    // Bússola
-    override fun onSensorChanged(event: SensorEvent) {
-        when (event.sensor.type) {
-            Sensor.TYPE_ACCELEROMETER  -> accelerometerData = event.values.clone()
-            Sensor.TYPE_MAGNETIC_FIELD -> magnetometerData  = event.values.clone()
-        }
-        val rotationMatrix    = FloatArray(9)
-        val orientationAngles = FloatArray(3)
-        if (SensorManager.getRotationMatrix(rotationMatrix, null, accelerometerData, magnetometerData)) {
-            SensorManager.getOrientation(rotationMatrix, orientationAngles)
-            currentBearing = Math.toDegrees(orientationAngles[0].toDouble()).toFloat()
-            if (currentBearing < 0) currentBearing += 360f
-        }
-    }
-    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
-
-    // GPS
     private fun requestBluetoothPermission() {
         // BLUETOOTH_CONNECT required on Android 12+ to access paired device names
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
@@ -332,52 +239,71 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         }
     }
 
+    /**
+     * Pede ACCESS_FINE_LOCATION/COARSE (necessária pro Service usar GPS) e, no
+     * Android 10+, também ACCESS_BACKGROUND_LOCATION em uma segunda etapa — o
+     * sistema exige que ela seja pedida separadamente, depois da foreground.
+     */
     private fun requestLocationPermission() {
         val perms = arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)
         val missing = perms.filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
-        if (missing.isNotEmpty()) ActivityCompat.requestPermissions(this, missing.toTypedArray(), REQ_LOCATION)
+        if (missing.isNotEmpty()) {
+            ActivityCompat.requestPermissions(this, missing.toTypedArray(), REQ_LOCATION)
+        } else {
+            requestBackgroundLocationIfNeeded()
+        }
     }
 
-    private fun startLocationUpdates() {
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
-            != PackageManager.PERMISSION_GRANTED) return
-        val gnssOnly = SettingsManager.getLocationMode(this) == SettingsManager.LOCATION_MODE_GNSS
-        try {
-            // GNSS — usa as constantes configuráveis
-            locationManager.requestLocationUpdates(
-                LocationManager.GPS_PROVIDER, GPS_UPDATE_INTERVAL_MS, GPS_UPDATE_MIN_METERS, locationListener)
+    private fun requestBackgroundLocationIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+            != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(
+                this, arrayOf(Manifest.permission.ACCESS_BACKGROUND_LOCATION), REQ_LOCATION
+            )
+        }
+    }
 
-            // Modo híbrido — registra também o NETWORK_PROVIDER
-            if (!gnssOnly) {
-                locationManager.requestLocationUpdates(
-                    LocationManager.NETWORK_PROVIDER, GPS_UPDATE_INTERVAL_MS, GPS_UPDATE_MIN_METERS, locationListener)
-            }
+    /**
+     * Sem isso, o Android (Doze/App Standby) pode suspender GPS, sensores e até
+     * a thread de leitura serial quando a tela fica apagada por muito tempo —
+     * foi exatamente o que causou o congelamento de GNSS/bearing que investigamos.
+     * Pede a isenção automaticamente ao abrir o app, explicando o motivo.
+     */
+    private fun ensureBatteryOptimizationExemption() {
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        if (pm.isIgnoringBatteryOptimizations(packageName)) return
 
-            // Fallback inicial enquanto GPS ainda não fixou
-            if (currentLocation == null) {
-                // Only accept last known location if it's recent enough
-                val last = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)
-                if (last != null && System.currentTimeMillis() - last.time <= MAX_LOCATION_AGE_MS) {
-                    currentLocation = last
-                } else if (!gnssOnly) {
-                    val lastNet = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
-                    if (lastNet != null && System.currentTimeMillis() - lastNet.time <= MAX_LOCATION_AGE_MS) {
-                        currentLocation = lastNet
-                    }
+        AlertDialog.Builder(this)
+            .setTitle("Otimização de bateria")
+            .setMessage(
+                "Este app registra GPS, bússola e tags continuamente, inclusive " +
+                        "com a tela desligada por longos períodos. Para evitar falhas, " +
+                        "permita que ele rode sem restrições de bateria na próxima tela."
+            )
+            .setCancelable(false)
+            .setPositiveButton("Permitir") { _, _ ->
+                try {
+                    startActivity(Intent(
+                        Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                        Uri.parse("package:$packageName")
+                    ))
+                } catch (_: Exception) {
+                    // Alguns fabricantes (Xiaomi, Huawei, Samsung...) bloqueiam este
+                    // intent — nesse caso oriente o usuário a liberar manualmente
+                    // nas configurações de bateria específicas do aparelho.
+                    toast("Abra as configurações de bateria do aparelho e libere o app manualmente")
                 }
             }
-        } catch (_: Exception) {}
+            .setNegativeButton("Agora não", null)
+            .show()
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == REQ_LOCATION)      startLocationUpdates()
+        if (requestCode == REQ_LOCATION)      requestBackgroundLocationIfNeeded()
         if (requestCode == REQ_BT_PERMISSION) refreshDeviceList()  // show Winnix_BT if now paired
     }
-
-    fun getCurrentLatitude()  = currentLocation?.let { "%.6f".format(java.util.Locale.US, it.latitude) }  ?: ""
-    fun getCurrentLongitude() = currentLocation?.let { "%.6f".format(java.util.Locale.US, it.longitude) } ?: ""
-    fun getCurrentBearing()   = if (!currentBearing.isNaN()) "%.1f".format(java.util.Locale.US, currentBearing) else ""
 
     private fun setupButtons() {
         binding.btnStart.setOnClickListener    { onStartClicked() }
