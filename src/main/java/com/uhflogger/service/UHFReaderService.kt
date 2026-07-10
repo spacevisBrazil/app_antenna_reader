@@ -9,6 +9,8 @@ import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
+import android.os.Build
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
@@ -139,6 +141,12 @@ class UHFReaderService : Service(), SensorEventListener {
         if (!locationSensorsActive.compareAndSet(false, true)) return  // já ativo — evita registrar 2x
         val ctx = appContext ?: return
 
+        // Se a permissão foi concedida DEPOIS do onCreate (ex: usuário acabou de
+        // tocar em "Permitir"), promove o foreground service pra incluir o tipo
+        // "location" agora — chamar startForeground() de novo com o tipo
+        // atualizado é seguro e é a forma documentada de "upgrade" o tipo.
+        startForegroundWithSafeType()
+
         // Thread + Looper dedicados. É isso que garante que onLocationChanged e
         // onSensorChanged nunca rodem na UI thread nem na thread de leitura serial.
         val thread = android.os.HandlerThread("UHFLogger-LocationSensor").also { it.start() }
@@ -264,9 +272,19 @@ class UHFReaderService : Service(), SensorEventListener {
 
     private var usbPort        : UsbSerialPort? = null
     private var usbConnection  : UsbDeviceConnection? = null
-    private var activePort     : ISerialPort? = null   // USB or Bluetooth — single active port
+    // @Volatile garante visibilidade entre threads (leitura serial, config,
+    // stop). closePort() já usa synchronized(this) como seção crítica — os
+    // pontos de write que adicionamos abaixo usam o MESMO lock (this), não um
+    // lock separado, senão um write() e um closePort() concorrentes não se
+    // excluiriam mutuamente de verdade (locks diferentes não protegem nada
+    // entre si).
+    @Volatile private var activePort: ISerialPort? = null   // USB or Bluetooth — single active port
     private var ioManager      : SerialInputOutputManager? = null
     private var btIoManager    : BluetoothInputOutputManager? = null  // BT equivalent of ioManager
+
+    // Nome do dispositivo em uso na sessão atual — necessário pro loop de
+    // reconexão USB (o BT já tem um nome fixo, BT_DEVICE_NAME).
+    @Volatile private var activeDeviceName: String? = null
 
     private val stopExecutor   = Executors.newSingleThreadExecutor()
     private val configExecutor = Executors.newSingleThreadExecutor()
@@ -275,6 +293,14 @@ class UHFReaderService : Service(), SensorEventListener {
     // Independent flag controlling the reconnect loop's lifetime — separate from
     // isPausedState which fluctuates during each connection attempt.
     private val btReconnectActive = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    // Mesma ideia, agora pro USB: antes disso, a reconexão USB dependia 100% do
+    // usbReceiver (ACTION_USB_DEVICE_ATTACHED) registrado na MainActivity — se a
+    // Activity fosse destruída com a tela apagada por muito tempo, o app nunca
+    // mais retomava a leitura USB sozinho. Agora o próprio Service tenta de novo
+    // periodicamente, igual já acontecia com BT.
+    @Volatile private var usbReconnectExecutor: java.util.concurrent.ExecutorService? = null
+    private val usbReconnectActive = java.util.concurrent.atomic.AtomicBoolean(false)
 
     // Auto-save
     private var autoSaveTagCount   : Int  = SettingsManager.DEFAULT_AUTO_SAVE_TAGS
@@ -312,7 +338,7 @@ class UHFReaderService : Service(), SensorEventListener {
         super.onCreate()
         appContext = applicationContext
         createNotificationChannel()
-        startForeground(NOTIF_ID, buildNotification("Aguardando conexão USB…"))
+        startForegroundWithSafeType()
 
         // Retomada automática: se o Service está sendo (re)criado porque o
         // Android o religou sozinho depois de um SIGKILL/OOM-kill — não
@@ -328,6 +354,32 @@ class UHFReaderService : Service(), SensorEventListener {
                 Log.i(TAG, "Retomando captura automaticamente após restart do processo: $lastDevice")
                 startCapture(lastDevice)
             }
+        }
+    }
+
+    /**
+     * A partir do Android 14 (API 34), iniciar um foreground service com o tipo
+     * "location" ATIVO exige que ACCESS_FINE_LOCATION/COARSE já esteja concedida
+     * NA HORA da chamada — senão o sistema lança SecurityException e o serviço
+     * cai. Isso é um risco real logo na primeira instalação: a Activity ainda
+     * está esperando o usuário tocar em "Permitir" enquanto este Service já
+     * está subindo. Por isso resolvemos o tipo dinamicamente: só incluímos
+     * "location" se a permissão já estiver concedida; caso contrário sobe só
+     * com "dataSync", e cada vez que uma nova sessão de captura começa
+     * (startLocationAndSensors) tentamos de novo — se a permissão já tiver sido
+     * concedida nesse meio tempo, dá pra promover o tipo numa chamada futura.
+     */
+    private fun startForegroundWithSafeType() {
+        val notification = buildNotification("Aguardando conexão USB…")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+            if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.ACCESS_FINE_LOCATION)
+                == PackageManager.PERMISSION_GRANTED) {
+                type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+            }
+            startForeground(NOTIF_ID, notification, type)
+        } else {
+            startForeground(NOTIF_ID, notification)
         }
     }
 
@@ -352,18 +404,22 @@ class UHFReaderService : Service(), SensorEventListener {
 
     override fun onDestroy() {
         // Se Winnix estava ativo e app fecha sem Stop, envia 0x8C para parar o módulo
-        if (activeAntennaType == SettingsManager.ANTENNA_TYPE_WINNIX && activePort != null) {
-            try {
-                activePort?.write(winnixBuildStopInventory(), 1000)
-                Thread.sleep(200)
-            } catch (_: Exception) {}
+        synchronized(this) {
+            if (activeAntennaType == SettingsManager.ANTENNA_TYPE_WINNIX && activePort != null) {
+                try {
+                    activePort?.write(winnixBuildStopInventory(), 1000)
+                    Thread.sleep(200)
+                } catch (_: Exception) {}
+            }
         }
-        stopCapture()
+        stopCapture(userInitiated = false)
         stopLocationAndSensors()
         releaseCaptureWakeLock()
         mainActivity = null
         btReconnectActive.set(false)
         btReconnectExecutor?.shutdownNow(); btReconnectExecutor = null
+        usbReconnectActive.set(false)
+        usbReconnectExecutor?.shutdownNow(); usbReconnectExecutor = null
         stopExecutor.shutdownNow()
         configExecutor.shutdownNow()
         super.onDestroy()
@@ -378,6 +434,7 @@ class UHFReaderService : Service(), SensorEventListener {
 
         val ctx = appContext ?: return
         activeAntennaType = SettingsManager.getAntennaType(ctx)
+        activeDeviceName  = deviceName
 
         // Persistido ANTES de tentar conectar: se o processo morrer nos
         // próximos milissegundos (ex: durante a própria tentativa de conexão),
@@ -413,7 +470,7 @@ class UHFReaderService : Service(), SensorEventListener {
         winnixDecoder.reset()
 
         activeIsBluetooth = (deviceName == BT_DEVICE_NAME)
-        winnixResponseBuffer.clear()  // clear stale bytes from previous session
+        winnixRingClear()  // clear stale bytes from previous session
 
         if (deviceName == BT_DEVICE_NAME) {
             startBtConnection(deviceName, resuming)
@@ -570,7 +627,15 @@ class UHFReaderService : Service(), SensorEventListener {
         }
     }
 
-    fun stopCapture() {
+    /**
+     * @param userInitiated true = usuário apertou "Parar" (ou erro real) — persiste
+     *   capturing=false, então o app NÃO retoma sozinho depois.
+     *   false = chamado a partir de onDestroy() como limpeza de recursos (o processo
+     *   está sendo derrubado por algum motivo fora do nosso controle) — mantemos o
+     *   estado persistido como estava, para que se era pra estar capturando, o
+     *   próximo onCreate() retome sozinho.
+     */
+    fun stopCapture(userInitiated: Boolean = true) {
         // Handle two cases:
         // 1. Actively capturing (isRunning=true) — normal stop
         // 2. Paused with BT reconnect loop running (isRunning=false, isPaused=true) — stop loop + finalize
@@ -581,13 +646,19 @@ class UHFReaderService : Service(), SensorEventListener {
         isPausedState.set(false)  // stops the reconnect loop if running
         btReconnectActive.set(false)
         btReconnectExecutor?.shutdownNow(); btReconnectExecutor = null
+        usbReconnectActive.set(false)
+        usbReconnectExecutor?.shutdownNow(); usbReconnectExecutor = null
         stopAutoSaveTimer()
 
-        // Parada real confirmada (não é pausa transitória de reconexão BT) —
-        // persiste já, antes do trabalho assíncrono abaixo, para que um
-        // SIGKILL durante o encerramento não deixe o estado "capturando=true"
-        // gravado por engano.
-        appContext?.let { SettingsManager.setCaptureState(it, capturing = false) }
+        // Só marca "não capturando" se for parada REAL/intencional. Se for
+        // onDestroy() sendo chamado porque o Android está derrubando o processo
+        // (ex: falta de memória, sem sequer um SIGKILL bruto), o estado
+        // persistido continua "capturando=true", e o próximo onCreate() retoma
+        // sozinho — esse era exatamente o bug: onDestroy() chamava stopCapture()
+        // sem distinção, apagando a intenção de retomar.
+        if (userInitiated) {
+            appContext?.let { SettingsManager.setCaptureState(it, capturing = false) }
+        }
 
         stopExecutor.submit {
             // 1. Para o inventário
@@ -641,6 +712,8 @@ class UHFReaderService : Service(), SensorEventListener {
         isPausedState.set(false)  // stops reconnect loop if running
         btReconnectActive.set(false)
         btReconnectExecutor?.shutdownNow(); btReconnectExecutor = null
+        usbReconnectActive.set(false)
+        usbReconnectExecutor?.shutdownNow(); usbReconnectExecutor = null
         appContext?.let { SettingsManager.setCaptureState(it, capturing = false) }
         stopExecutor.submit {
             val tagCount = totalCount.get()
@@ -801,16 +874,45 @@ class UHFReaderService : Service(), SensorEventListener {
             override fun onRunError(e: Exception)   = handleRunError(e)
         }
 
-    // Accumulation buffer for detecting fragmented 0x8D/0x35 frames from BT
-    private val winnixResponseBuffer = java.util.concurrent.CopyOnWriteArrayList<Byte>()
+    // Accumulation buffer for detecting fragmented 0x8D/0x35 frames from BT.
+    // Antes: CopyOnWriteArrayList<Byte>, que copia o array inteiro a cada
+    // add()/removeAt() — para centenas de tags/seg isso gera lixo e pressão de
+    // GC desnecessários. Agora: ring buffer manual de tamanho fixo (256 bytes),
+    // sincronizado (é escrito pela thread de leitura serial e lido pela thread
+    // de config/temperatura), sem nenhuma alocação por byte.
+    private val winnixRingLock  = Any()
+    private val winnixRing      = ByteArray(256)
+    private var winnixRingHead  = 0   // próxima posição de escrita
+    private var winnixRingCount = 0   // quantos bytes válidos (até 256)
+
+    private fun winnixRingAppend(data: ByteArray) {
+        synchronized(winnixRingLock) {
+            for (b in data) {
+                winnixRing[winnixRingHead] = b
+                winnixRingHead = (winnixRingHead + 1) % winnixRing.size
+                if (winnixRingCount < winnixRing.size) winnixRingCount++
+            }
+        }
+    }
+
+    private fun winnixRingSnapshot(): ByteArray {
+        synchronized(winnixRingLock) {
+            val out   = ByteArray(winnixRingCount)
+            val start = (winnixRingHead - winnixRingCount + winnixRing.size) % winnixRing.size
+            for (i in 0 until winnixRingCount) out[i] = winnixRing[(start + i) % winnixRing.size]
+            return out
+        }
+    }
+
+    private fun winnixRingClear() {
+        synchronized(winnixRingLock) { winnixRingCount = 0; winnixRingHead = 0 }
+    }
 
     private fun winnixOnNewData(data: ByteArray) {
         // Accumulate bytes — BT can fragment frames across multiple onNewData calls
-        data.forEach { winnixResponseBuffer.add(it) }
-        // Keep buffer bounded — max 256 bytes (response frames are small)
-        while (winnixResponseBuffer.size > 256) winnixResponseBuffer.removeAt(0)
+        winnixRingAppend(data)
 
-        val buf = winnixResponseBuffer.toByteArray()
+        val buf = winnixRingSnapshot()
 
         // Check for stop confirmation (0x8D)
         if (!winnixStopConfirmed.get()) {
@@ -819,7 +921,7 @@ class UHFReaderService : Service(), SensorEventListener {
                     && buf[i+4] == 0x8D.toByte()) {
                     Log.i(TAG, "Winnix stop confirmed (0x8D) via onNewData")
                     winnixStopConfirmed.set(true)
-                    winnixResponseBuffer.clear()
+                    winnixRingClear()
                     break
                 }
             }
@@ -837,7 +939,7 @@ class UHFReaderService : Service(), SensorEventListener {
                     winnixTempResult = "%.1f".format(java.util.Locale.US, temp)
                     Log.i(TAG, "Temperature 0x35 captured via onNewData: $winnixTempResult°C")
                     tempLatch.countDown()
-                    winnixResponseBuffer.clear()
+                    winnixRingClear()
                     break
                 }
             }
@@ -880,11 +982,13 @@ class UHFReaderService : Service(), SensorEventListener {
      * Retries up to 3 times if no confirmation received within 1s per attempt.
      */
     private fun sendWinnixStop() {
-        val port = activePort ?: return
         winnixStopConfirmed.set(false)
         try {
             Log.i(TAG, "Sending stop inventory (0x8C)")
-            port.write(winnixBuildStopInventory(), 2000)
+            // Só o write() precisa do lock — não a espera de confirmação abaixo,
+            // pra não segurar o lock por até 3s à toa.
+            val sent = synchronized(this) { activePort?.write(winnixBuildStopInventory(), 2000); activePort != null }
+            if (!sent) return
             // Wait up to 3s for 0x8D confirmation via onNewData
             // Send only ONCE — sending multiple 0x8C confuses the module
             val deadline = System.currentTimeMillis() + 3000L
@@ -1094,14 +1198,56 @@ class UHFReaderService : Service(), SensorEventListener {
         updateNotification("Sinal perdido — ${totalCount.get()} tags aguardando salvamento")
         onCaptureError?.invoke()
 
-        // Only start BT reconnect loop if this was a BT session
-        // USB sessions reconnect via ACTION_USB_DEVICE_ATTACHED in MainActivity
+        // BT tem loop de reconexão próprio; USB agora também — antes dependia
+        // 100% do usbReceiver da MainActivity (ACTION_USB_DEVICE_ATTACHED), que
+        // não existe se a Activity foi destruída com a tela apagada por muito
+        // tempo. Com os dois loops, a retomada não depende mais da Activity.
         if (activeIsBluetooth && activeAntennaType == SettingsManager.ANTENNA_TYPE_WINNIX &&
             btIoManager == null && activePort == null) {
             Log.i(TAG, "BT_RECONNECT: BT session lost — starting reconnect loop")
             startBtReconnectLoop()
+        } else if (!activeIsBluetooth && activePort == null && activeDeviceName != null) {
+            Log.i(TAG, "USB_RECONNECT: USB session lost — starting reconnect loop")
+            startUsbReconnectLoop()
         } else {
-            Log.i(TAG, "BT_RECONNECT: not starting loop — isBT=$activeIsBluetooth antenna=$activeAntennaType btIo=$btIoManager port=$activePort")
+            Log.i(TAG, "RECONNECT: not starting loop — isBT=$activeIsBluetooth antenna=$activeAntennaType btIo=$btIoManager port=$activePort")
+        }
+    }
+
+    /**
+     * Retry loop para sessões USB — espelha startBtReconnectLoop(). Antes disso,
+     * uma sessão USB que perdesse o sinal (cabo balançou, hub USB reiniciou,
+     * fabricante cortou energia da porta em modo de economia) só voltava a
+     * capturar se a MainActivity estivesse viva pra receber o broadcast
+     * ACTION_USB_DEVICE_ATTACHED. Com a tela apagada por horas/dias, isso não
+     * era garantido. Agora o próprio Service tenta reabrir a porta sozinho,
+     * periodicamente, independente da Activity existir ou não.
+     */
+    private fun startUsbReconnectLoop() {
+        val deviceName = activeDeviceName ?: return
+        usbReconnectExecutor?.shutdownNow()
+        usbReconnectExecutor = Executors.newSingleThreadExecutor()
+        usbReconnectActive.set(true)
+        usbReconnectExecutor?.submit {
+            Log.i(TAG, "USB_RECONNECT: loop started, will retry every ${USB_RECONNECT_INTERVAL_MS}ms")
+            var attempt = 0
+            while (usbReconnectActive.get() && !isRunning.get()) {
+                attempt++
+                try { Thread.sleep(USB_RECONNECT_INTERVAL_MS) } catch (_: InterruptedException) { break }
+                if (!usbReconnectActive.get() || isRunning.get()) break
+
+                if (!isPausedState.get() && !isRunning.get()) continue  // tentativa anterior ainda em andamento
+
+                Log.i(TAG, "USB_RECONNECT: attempt #$attempt — calling startCapture (same as Start button)")
+                startCapture(deviceName)
+
+                var waited = 0L
+                while (waited < USB_ATTEMPT_SETTLE_MS && !isRunning.get() && usbReconnectActive.get()) {
+                    try { Thread.sleep(USB_POLL_INTERVAL_MS) } catch (_: InterruptedException) { break }
+                    waited += USB_POLL_INTERVAL_MS
+                }
+            }
+            Log.i(TAG, "USB_RECONNECT: loop exiting — isRunning=${isRunning.get()}")
         }
     }
 
@@ -1305,6 +1451,12 @@ class UHFReaderService : Service(), SensorEventListener {
         // Small enough to react quickly when reconnect succeeds,
         // large enough to not busy-loop.
         private const val BT_POLL_INTERVAL_MS      = 500L
+
+        // USB — abrir a porta é rápido (sem handshake de pareamento/timeout como
+        // BT), então intervalos mais curtos são seguros aqui.
+        private const val USB_RECONNECT_INTERVAL_MS = 3000L
+        private const val USB_ATTEMPT_SETTLE_MS      = 5000L
+        private const val USB_POLL_INTERVAL_MS       = 300L
 
         // GNSS — mesmas constantes que existiam na MainActivity
         private const val GPS_UPDATE_INTERVAL_MS = 1000L
