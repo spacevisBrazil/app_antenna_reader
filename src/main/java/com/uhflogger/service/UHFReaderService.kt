@@ -82,30 +82,92 @@ class UHFReaderService : Service(), SensorEventListener {
     private var locationSensorHandler: android.os.Handler? = null
 
     @Volatile private var currentLocation: Location? = null
-    @Volatile private var currentBearing : Float = Float.NaN
+    // Bearing "de fusão de sensores" (acelerômetro+magnetômetro) — fallback
+    // sempre disponível, usado quando não há GNSS confiável pra essa amostra.
+    @Volatile private var currentSensorBearing: Float = Float.NaN
+    // Bearing vindo do GNSS (direção de deslocamento real, imune a interferência
+    // magnética do trator) — só é confiável em movimento.
+    @Volatile private var currentGnssBearing: Float = Float.NaN
+    // Qual fonte está "ativa" agora (histerese) — escrito SÓ dentro de
+    // onLocationChanged (roda na locationSensorThread), lido pela thread de
+    // RFID em getCurrentBearing(). @Volatile garante visibilidade sem lock.
+    @Volatile private var bearingSourceIsGnss: Boolean = false
+    @Volatile private var currentGnssSpeed: Float? = null           // null = hasSpeed()==false
+    @Volatile private var currentLocationTimeMs: Long = 0L          // 0 = nenhum fix ainda
+    @Volatile private var currentLocationProviderLabel: String = "" // "GNSS" ou "NETWORK"
     private var accelerometerData = FloatArray(3)
     private var magnetometerData  = FloatArray(3)
 
     private val locationListener = object : LocationListener {
         override fun onLocationChanged(location: Location) {
-            if (isBetterLocation(location, currentLocation)) {
-                currentLocation = location
-            }
+            val accepted = isBetterLocation(location, currentLocation)
+            // Log de diagnóstico: mostra TODA chegada de fix, aceito ou não, com
+            // motivo. Sem isso, não dá pra distinguir "Android nunca entregou
+            // nada" de "entregou mas foi rejeitado por precisão" — os dois
+            // parecem iguais de fora (CSV vazio), mas são causas bem diferentes.
+            Log.i(TAG, "LOCATION_RX: provider=${location.provider} " +
+                    "accuracy=${if (location.hasAccuracy()) "%.1f".format(java.util.Locale.US, location.accuracy) else "n/a"}m " +
+                    "age=${System.currentTimeMillis() - location.time}ms " +
+                    "aceito=$accepted" +
+                    (if (!accepted) " (motivo provável: fix mais velho que o atual, degradou demais um fix já bom, ou provider pior que o atual)" else ""))
+            if (accepted) applyLocation(location)
         }
-        override fun onProviderEnabled(provider: String)  {}
-        override fun onProviderDisabled(provider: String) {}
+        override fun onProviderEnabled(provider: String)  {
+            Log.i(TAG, "LOCATION_PROVIDER_ENABLED: $provider")
+        }
+        override fun onProviderDisabled(provider: String) {
+            Log.w(TAG, "LOCATION_PROVIDER_DISABLED: $provider")
+        }
         @Deprecated("Deprecated in Java")
         override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
     }
 
     /**
-     * Mesma lógica de antes (ex-MainActivity): rejeita fixes velhos ou pouco
-     * precisos, prefere GPS sobre rede, e mantém o fix mais recente/preciso.
+     * Adota `location` como a posição atual — atualiza lat/lon, speed,
+     * timestamp, provider e decide a histerese do bearing híbrido. Chamado
+     * tanto pelo listener de updates novos quanto pelo fallback de
+     * getLastKnownLocation() no início da captura, pra nunca duplicar essa
+     * lógica em dois lugares (e arriscar um ficar desatualizado).
+     */
+    private fun applyLocation(location: Location) {
+        currentLocation = location
+        currentLocationTimeMs        = location.time
+        currentLocationProviderLabel = if (location.provider == LocationManager.GPS_PROVIDER) "GNSS" else "NETWORK"
+        currentGnssSpeed = if (location.hasSpeed()) location.speed else null
+
+        // Histerese do bearing híbrido: só troca de fonte quando cruza a borda
+        // apropriada, pra não "piscar" entre GNSS e sensores quando a
+        // velocidade oscila perto do limiar (ex: fazendo curva devagar).
+        val speed = currentGnssSpeed
+        if (speed != null && location.hasBearing()) {
+            currentGnssBearing = location.bearing
+            if (!bearingSourceIsGnss && speed > BEARING_SPEED_HIGH_MS) {
+                bearingSourceIsGnss = true
+            } else if (bearingSourceIsGnss && speed < BEARING_SPEED_LOW_MS) {
+                bearingSourceIsGnss = false
+            }
+        } else {
+            // Sem speed ou sem bearing confiável neste fix — não dá pra avaliar
+            // o GNSS, cai pra fusão de sensores.
+            bearingSourceIsGnss = false
+        }
+    }
+
+    /**
+     * Mesma lógica de antes, com uma mudança: em vez de exigir precisão
+     * igual-ou-melhor que a atual, aceita qualquer fix dentro do teto de 50m
+     * que não seja MUITO pior (>3x) que o atual. Isso prioriza recência (dado
+     * mais "casado" com cada tag) sem aceitar degradação absurda — importante
+     * porque o trator passa por áreas de sinal fraco e a posição real precisa
+     * continuar atualizando, não "congelar" só porque um fix é um pouco pior.
      */
     private fun isBetterLocation(newLoc: Location, current: Location?): Boolean {
         val now = System.currentTimeMillis()
         if (now - newLoc.time > GPS_MAX_LOCATION_AGE_MS) return false
-        if (newLoc.hasAccuracy() && newLoc.accuracy > GPS_MAX_ACCURACY_M) return false
+        // Sem posição nenhuma ainda — aceita mesmo que a precisão seja ruim.
+        // "Algo é melhor que nada": nunca deixar o dado em branco quando existe
+        // QUALQUER fix disponível (ex: só NETWORK_PROVIDER funcionando, com erro
+        // de centenas de metros, dentro de um galpão sem GNSS).
         if (current == null) return true
         if (now - current.time > GPS_MAX_LOCATION_AGE_MS) return true
         val newIsGps     = newLoc.provider == LocationManager.GPS_PROVIDER
@@ -114,7 +176,16 @@ class UHFReaderService : Service(), SensorEventListener {
         if (!newIsGps && currentIsGps) return false
         if (!newLoc.hasAccuracy()) return false
         if (!current.hasAccuracy()) return true
-        return newLoc.accuracy <= current.accuracy
+        // O teto de 50m só faz sentido pra PROTEGER um fix que já é bom — se o
+        // atual já é ruim (aceito por falta de opção melhor), qualquer melhora
+        // serve, mesmo que continue acima do teto. Sem essa distinção, o
+        // primeiro fix ruim aceito ficava "preso" mesmo quando fixes bem
+        // melhores (mas ainda acima de 50m) chegavam depois.
+        return if (current.accuracy <= GPS_MAX_ACCURACY_M) {
+            newLoc.accuracy <= current.accuracy * GPS_ACCURACY_DEGRADE_FACTOR
+        } else {
+            newLoc.accuracy <= current.accuracy
+        }
     }
 
     override fun onSensorChanged(event: SensorEvent) {
@@ -128,7 +199,7 @@ class UHFReaderService : Service(), SensorEventListener {
             SensorManager.getOrientation(rotationMatrix, orientationAngles)
             var bearing = Math.toDegrees(orientationAngles[0].toDouble()).toFloat()
             if (bearing < 0) bearing += 360f
-            currentBearing = bearing
+            currentSensorBearing = bearing
         }
     }
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
@@ -170,14 +241,15 @@ class UHFReaderService : Service(), SensorEventListener {
                     lm.requestLocationUpdates(
                         LocationManager.NETWORK_PROVIDER, GPS_UPDATE_INTERVAL_MS, GPS_UPDATE_MIN_METERS, locationListener, handler.looper)
                 }
+                Log.i(TAG, "LOCATION_REGISTERED: modo=${if (gnssOnly) "GNSS puro" else "híbrido (GNSS+NETWORK)"} — GPS_PROVIDER e${if (gnssOnly) "" else " NETWORK_PROVIDER"} registrados sem exceção")
                 if (currentLocation == null) {
                     val last = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER)
                     if (last != null && System.currentTimeMillis() - last.time <= GPS_MAX_LOCATION_AGE_MS) {
-                        currentLocation = last
+                        applyLocation(last)
                     } else if (!gnssOnly) {
                         val lastNet = lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
                         if (lastNet != null && System.currentTimeMillis() - lastNet.time <= GPS_MAX_LOCATION_AGE_MS) {
-                            currentLocation = lastNet
+                            applyLocation(lastNet)
                         }
                     }
                 }
@@ -209,7 +281,23 @@ class UHFReaderService : Service(), SensorEventListener {
 
     fun getCurrentLatitude()  = currentLocation?.let { "%.6f".format(java.util.Locale.US, it.latitude) }  ?: ""
     fun getCurrentLongitude() = currentLocation?.let { "%.6f".format(java.util.Locale.US, it.longitude) } ?: ""
-    fun getCurrentBearing()   = if (!currentBearing.isNaN()) "%.1f".format(java.util.Locale.US, currentBearing) else ""
+
+    /** Bearing híbrido: GNSS quando em movimento (histerese em onLocationChanged
+     *  decide isso), fusão de sensores caso contrário — ou se o GNSS não tiver
+     *  valor válido ainda mesmo com bearingSourceIsGnss=true (defensivo). */
+    fun getCurrentBearing(): String {
+        val value = if (bearingSourceIsGnss && !currentGnssBearing.isNaN()) currentGnssBearing
+        else currentSensorBearing
+        return if (!value.isNaN()) "%.1f".format(java.util.Locale.US, value) else ""
+    }
+
+    fun getCurrentGnssSpeed(): String =
+        currentGnssSpeed?.let { "%.2f".format(java.util.Locale.US, it) } ?: ""
+
+    fun getCurrentLocationTimestamp(): String =
+        if (currentLocationTimeMs > 0) currentLocationTimeMs.toString() else ""
+
+    fun getCurrentLocationProvider(): String = currentLocationProviderLabel
 
     // =========================================================================
     // WakeLock — impede o CPU de dormir (Doze) enquanto a captura estiver ativa,
@@ -740,7 +828,10 @@ class UHFReaderService : Service(), SensorEventListener {
                 val lat  = getCurrentLatitude()
                 val lon  = getCurrentLongitude()
                 val brg  = getCurrentBearing()
-                val tags = jietongDecoder.feed(data, lat, lon, brg)
+                val spd  = getCurrentGnssSpeed()
+                val locTs = getCurrentLocationTimestamp()
+                val prov  = getCurrentLocationProvider()
+                val tags = jietongDecoder.feed(data, lat, lon, brg, spd, locTs, prov)
                 if (tags.isNotEmpty()) {
                     tagBuffer.addAll(tags)
                     totalCount.addAndGet(tags.size)
@@ -948,7 +1039,10 @@ class UHFReaderService : Service(), SensorEventListener {
         val lat  = getCurrentLatitude()
         val lon  = getCurrentLongitude()
         val brg  = getCurrentBearing()
-        val tags = winnixDecoder.feed(data, lat, lon, brg)
+        val spd  = getCurrentGnssSpeed()
+        val locTs = getCurrentLocationTimestamp()
+        val prov  = getCurrentLocationProvider()
+        val tags = winnixDecoder.feed(data, lat, lon, brg, spd, locTs, prov)
         if (tags.isNotEmpty()) {
             val processedTags = tags.toMutableList()
             val temp = winnixStartTemp
@@ -1458,11 +1552,24 @@ class UHFReaderService : Service(), SensorEventListener {
         private const val USB_ATTEMPT_SETTLE_MS      = 5000L
         private const val USB_POLL_INTERVAL_MS       = 300L
 
-        // GNSS — mesmas constantes que existiam na MainActivity
-        private const val GPS_UPDATE_INTERVAL_MS = 1000L
-        private const val GPS_UPDATE_MIN_METERS  = 1f
+        // GNSS — 500ms/0m: prioriza recência (trator lento, "andou 1m" descartava
+        // fixes válidos demais). O chip nunca entrega mais rápido do que consegue
+        // de verdade — isso é só o pedido máximo, não uma garantia.
+        private const val GPS_UPDATE_INTERVAL_MS = 500L
+        private const val GPS_UPDATE_MIN_METERS  = 0f
         private const val GPS_MAX_LOCATION_AGE_MS = 30_000L
         private const val GPS_MAX_ACCURACY_M      = 50f
+        // "Meio termo" acordado: aceita o fix mais novo mesmo se um pouco pior
+        // que o atual (nunca "congela" a posição por rejeição), mas rejeita se
+        // for MUITO pior (>3x) — o teto absoluto de 50m acima já barra o lixo
+        // total (galpão fechado etc), isso aqui só evita descartar degradação
+        // razoável de sinal em movimento.
+        private const val GPS_ACCURACY_DEGRADE_FACTOR = 3.0f
+
+        // Bearing híbrido — histerese pra não trocar de fonte a cada oscilação
+        // de velocidade perto do limiar (ex: reduzindo numa curva).
+        private const val BEARING_SPEED_HIGH_MS = 1.2f  // acima disso, passa a usar GNSS
+        private const val BEARING_SPEED_LOW_MS  = 0.8f  // abaixo disso, volta pra sensores
 
         // WakeLock renovado a cada 15 min — cobre captura de dias sem nunca
         // segurar um acquire() sem timeout.

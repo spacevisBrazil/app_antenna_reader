@@ -10,7 +10,10 @@ class ProtocolDecoder {
         data     : ByteArray,
         latitude : String = "",
         longitude: String = "",
-        bearing  : String = ""
+        bearing  : String = "",
+        gnssSpeed        : String = "",
+        locationTimestamp: String = "",
+        locationProvider : String = ""
     ): List<TagRecord> {
         val results = mutableListOf<TagRecord>()
         for (b in data) accumulator.addLast(b)
@@ -42,7 +45,8 @@ class ProtocolDecoder {
 
             val tag = decodeTagBody(                             // offset=8, available=dataLen-2
                 packet, offset = 8, available = dataLen - 2,
-                latitude = latitude, longitude = longitude, bearing = bearing
+                latitude = latitude, longitude = longitude, bearing = bearing,
+                gnssSpeed = gnssSpeed, locationTimestamp = locationTimestamp, locationProvider = locationProvider
             )
             if (tag != null) results.add(tag)
         }
@@ -65,7 +69,10 @@ class ProtocolDecoder {
         available: Int,
         latitude : String = "",
         longitude: String = "",
-        bearing  : String = ""
+        bearing  : String = "",
+        gnssSpeed        : String = "",
+        locationTimestamp: String = "",
+        locationProvider : String = ""
     ): TagRecord? {
         if (available < 3) return null
 
@@ -108,7 +115,10 @@ class ProtocolDecoder {
             androidTs = System.currentTimeMillis(),
             latitude  = latitude,
             longitude = longitude,
-            bearing   = bearing
+            bearing   = bearing,
+            gnssSpeed         = gnssSpeed,
+            locationTimestamp = locationTimestamp,
+            locationProvider  = locationProvider
         )
     }
 }

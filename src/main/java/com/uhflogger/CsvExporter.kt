@@ -14,8 +14,12 @@ object CsvExporter {
     private var sessionWriter   : BufferedWriter? = null
     private var sessionFile     : String?         = null
     private var sessionFilePath : String?         = null
-    // Last tag line held in memory — flushed with temperature when session finalizes
-    private var pendingLastLine : String?         = null
+    // Last tag held in memory (not yet serialized) — flushed with temperature
+    // applied when session finalizes. Guardar o TagRecord em vez da linha CSV
+    // já pronta evita depender de qual coluna é "a última" (era uma pegadinha:
+    // o código antigo concatenava ",$stopTemperature" no fim da string, o que
+    // quebraria assim que qualquer coluna fosse adicionada depois de Temperature).
+    private var pendingLastTag  : TagRecord?       = null
 
     // -------------------------------------------------------------------------
     // Session API
@@ -42,7 +46,7 @@ object CsvExporter {
             sessionWriter   = writer
             sessionFile     = fileName
             sessionFilePath = file.absolutePath
-            pendingLastLine = null
+            pendingLastTag  = null
             Log.i(TAG, "Session started: ${file.absolutePath}")
             fileName
         } catch (e: Exception) {
@@ -55,17 +59,17 @@ object CsvExporter {
         if (tags.isEmpty()) return true
         val writer = sessionWriter ?: return false.also { Log.e(TAG, "No active session") }
         return try {
-            // Flush any previously held last line before writing new tags
-            pendingLastLine?.let { writer.write(it); writer.newLine() }
-            pendingLastLine = null
+            // Flush any previously held last tag before writing new tags
+            pendingLastTag?.let { writer.write(it.toCsvLine()); writer.newLine() }
+            pendingLastTag = null
 
             // Write all but the last tag immediately
-            // Hold the last tag as pendingLastLine so temperature can be applied later
+            // Hold the last tag as pendingLastTag so temperature can be applied later
             for (i in 0 until tags.size - 1) {
                 writer.write(tags[i].toCsvLine())
                 writer.newLine()
             }
-            pendingLastLine = tags.last().toCsvLine()
+            pendingLastTag = tags.last()
             writer.flush()
             true
         } catch (e: Exception) {
@@ -83,17 +87,18 @@ object CsvExporter {
         if (writer != null) {
             try {
                 if (tags.isEmpty()) {
-                    // Final batch is empty — apply temperature to the pendingLastLine if available
-                    val line = if (stopTemperature.isNotEmpty() && pendingLastLine != null)
-                        pendingLastLine!! + ",$stopTemperature"
+                    // Final batch is empty — apply temperature to the pendingLastTag if available
+                    val pending = pendingLastTag
+                    val record = if (stopTemperature.isNotEmpty() && pending != null)
+                        pending.copy(temperature = stopTemperature)
                     else
-                        pendingLastLine
-                    line?.let { writer.write(it); writer.newLine() }
-                    pendingLastLine = null
+                        pending
+                    record?.let { writer.write(it.toCsvLine()); writer.newLine() }
+                    pendingLastTag = null
                 } else {
-                    // Flush pending line without temperature (not the last tag overall)
-                    pendingLastLine?.let { writer.write(it); writer.newLine() }
-                    pendingLastLine = null
+                    // Flush pending tag without temperature (not the last tag overall)
+                    pendingLastTag?.let { writer.write(it.toCsvLine()); writer.newLine() }
+                    pendingLastTag = null
 
                     // Write all but last of the final batch
                     for (i in 0 until tags.size - 1) {
@@ -139,6 +144,6 @@ object CsvExporter {
         sessionWriter   = null
         sessionFile     = null
         sessionFilePath = null
-        pendingLastLine = null
+        pendingLastTag  = null
     }
 }

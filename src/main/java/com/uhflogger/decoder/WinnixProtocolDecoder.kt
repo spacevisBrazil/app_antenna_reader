@@ -28,7 +28,10 @@ class WinnixProtocolDecoder {
         data     : ByteArray,
         latitude : String = "",
         longitude: String = "",
-        bearing  : String = ""
+        bearing  : String = "",
+        gnssSpeed        : String = "",
+        locationTimestamp: String = "",
+        locationProvider : String = ""
     ): List<TagRecord> {
         val results = mutableListOf<TagRecord>()
         for (b in data) accumulator.addLast(b)
@@ -55,7 +58,7 @@ class WinnixProtocolDecoder {
             // Only process inventory responses (0x83)
             if (packet[4].toInt() and 0xFF != 0x83) continue
 
-            val tag = decodeTag(packet, latitude, longitude, bearing)
+            val tag = decodeTag(packet, latitude, longitude, bearing, gnssSpeed, locationTimestamp, locationProvider)
             if (tag != null) results.add(tag)
         }
         return results
@@ -77,7 +80,10 @@ class WinnixProtocolDecoder {
         packet   : ByteArray,
         latitude : String,
         longitude: String,
-        bearing  : String
+        bearing  : String,
+        gnssSpeed        : String = "",
+        locationTimestamp: String = "",
+        locationProvider : String = ""
     ): TagRecord? {
         return try {
             // data = packet[5..-3] (strip header(2)+length(2)+cmd(1) at start, check(1)+end(2) at end)
@@ -107,7 +113,10 @@ class WinnixProtocolDecoder {
                 androidTs = System.currentTimeMillis(),
                 latitude  = latitude,
                 longitude = longitude,
-                bearing   = bearing
+                bearing   = bearing,
+                gnssSpeed         = gnssSpeed,
+                locationTimestamp = locationTimestamp,
+                locationProvider  = locationProvider
             )
         } catch (_: Exception) { null }
     }
