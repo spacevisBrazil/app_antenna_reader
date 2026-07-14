@@ -17,6 +17,6 @@ data class TagRecord(
         "$epc,$rssi,$antenna,$androidTs,$latitude,$longitude,$bearing,$temperature,$gnssSpeed,$locationTimestamp,$locationProvider"
 
     companion object {
-        const val CSV_HEADER = "EPC,RSSI,Antenna,Timestamp,Latitude,Longitude,Bearing,Temperature,gnss speed,location timestamp,Location provider"
+        const val CSV_HEADER = "EPC,RSSI,Antenna,Timestamp,Latitude,Longitude,Bearing,Temperature,GNSS Speed,Location Timestamp,Location Provider"
     }
 }

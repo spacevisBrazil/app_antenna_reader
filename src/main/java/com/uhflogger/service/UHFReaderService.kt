@@ -131,7 +131,13 @@ class UHFReaderService : Service(), SensorEventListener {
      */
     private fun applyLocation(location: Location) {
         currentLocation = location
-        currentLocationTimeMs        = location.time
+        // System.currentTimeMillis() capturado AQUI — no exato instante em que
+        // o app recebe/aceita este fix — em vez de location.time (relógio
+        // interno do chip GNSS, que pode divergir do relógio do Android em
+        // algumas centenas de ms, inclusive "no futuro"). Mesmo domínio de
+        // relógio que o Timestamp do EPC, então Location Timestamp nunca pode
+        // vir maior que o Timestamp — é sequencial por construção.
+        currentLocationTimeMs        = System.currentTimeMillis()
         currentLocationProviderLabel = if (location.provider == LocationManager.GPS_PROVIDER) "GNSS" else "NETWORK"
         currentGnssSpeed = if (location.hasSpeed()) location.speed else null
 
@@ -243,14 +249,28 @@ class UHFReaderService : Service(), SensorEventListener {
                 }
                 Log.i(TAG, "LOCATION_REGISTERED: modo=${if (gnssOnly) "GNSS puro" else "híbrido (GNSS+NETWORK)"} — GPS_PROVIDER e${if (gnssOnly) "" else " NETWORK_PROVIDER"} registrados sem exceção")
                 if (currentLocation == null) {
-                    val last = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER)
-                    if (last != null && System.currentTimeMillis() - last.time <= GPS_MAX_LOCATION_AGE_MS) {
-                        applyLocation(last)
-                    } else if (!gnssOnly) {
-                        val lastNet = lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
-                        if (lastNet != null && System.currentTimeMillis() - lastNet.time <= GPS_MAX_LOCATION_AGE_MS) {
-                            applyLocation(lastNet)
-                        }
+                    // Usa a última posição conhecida MAIS RECENTE entre GPS e
+                    // NETWORK — sem limite de idade ("algo é melhor que nada"),
+                    // mas também sem preferir GPS cegamente: se o cache do GPS
+                    // tem 2h e o do NETWORK tem 10min, o NETWORK é o certo aqui.
+                    // Preferir provider sem olhar a idade só faz sentido quando
+                    // os dois são comparavelmente frescos — não é o caso ao
+                    // comparar dois caches parados, potencialmente muito
+                    // diferentes em idade um do outro.
+                    val lastGps = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER)
+                    val lastNet = if (!gnssOnly) lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER) else null
+                    val best = when {
+                        lastGps != null && lastNet != null -> if (lastGps.time >= lastNet.time) lastGps else lastNet
+                        lastGps != null -> lastGps
+                        lastNet != null -> lastNet
+                        else -> null
+                    }
+                    if (best != null) {
+                        applyLocation(best)
+                        val label = if (best.provider == LocationManager.GPS_PROVIDER) "GPS" else "NETWORK"
+                        Log.i(TAG, "LOCATION_CACHE: usando última posição $label conhecida (mais recente entre as disponíveis), idade=${System.currentTimeMillis()-best.time}ms")
+                    } else {
+                        Log.i(TAG, "LOCATION_CACHE: nenhuma posição em cache disponível (GPS nem NETWORK) — aguardando fix novo")
                     }
                 }
             } catch (e: Exception) {
@@ -427,6 +447,16 @@ class UHFReaderService : Service(), SensorEventListener {
         appContext = applicationContext
         createNotificationChannel()
         startForegroundWithSafeType()
+
+        // GPS/bússola/WakeLock começam a "esquentar" assim que o serviço existe
+        // (app aberto), não só quando a captura começa de fato. Sem isso, todo
+        // início de captura (principalmente em ambiente fechado, onde o
+        // NETWORK_PROVIDER pode levar até ~1-2min pra conseguir o primeiro fix
+        // "a frio") ficava com um buraco de dado logo no começo. Como o
+        // aparelho fica ligado na energia do trator o tempo todo, manter isso
+        // ativo entre sessões de captura tem custo de bateria desprezível.
+        acquireCaptureWakeLock()
+        startLocationAndSensors()
 
         // Retomada automática: se o Service está sendo (re)criado porque o
         // Android o religou sozinho depois de um SIGKILL/OOM-kill — não
@@ -784,11 +814,10 @@ class UHFReaderService : Service(), SensorEventListener {
             updateNotification("Captura encerrada — $tagCount tags")
             totalCount.set(0)
 
-            // Só desliga GPS/bússola/wakelock se não for uma pausa transitória de
-            // reconexão BT — stopCapture só chega aqui quando é encerramento real
-            // (isPausedState já foi setado false no início desta função).
-            stopLocationAndSensors()
-            releaseCaptureWakeLock()
+            // GPS/bússola/wakelock NÃO são mais desligados aqui — continuam
+            // ativos enquanto o serviço existir (ver onCreate), pra não
+            // "esfriar" o NETWORK_PROVIDER a cada ciclo Parar/Iniciar. Só
+            // param de verdade em onDestroy().
 
             Log.i(TAG, "Capture stopped. Total: $tagCount, file: $fileName")
             onStatusChanged?.invoke(false)
@@ -807,8 +836,7 @@ class UHFReaderService : Service(), SensorEventListener {
             val tagCount = totalCount.get()
             val fileName = drainAndFinalize("")
             totalCount.set(0)
-            stopLocationAndSensors()
-            releaseCaptureWakeLock()
+            // GPS/bússola/wakelock continuam ativos — ver onCreate/onDestroy.
             Log.i(TAG, "Saved after error. Total: $tagCount, file: $fileName")
             onStopComplete?.invoke(fileName, tagCount)
         }

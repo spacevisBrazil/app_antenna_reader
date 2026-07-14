@@ -41,6 +41,9 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val REQ_LOCATION       = 101
         private const val REQ_BT_PERMISSION  = 102
+        // Bem acima do pior caso observado de conexão (BT connect() ~12s) —
+        // só reabilita o botão se a captura genuinamente não tiver começado.
+        private const val START_BUTTON_SAFETY_TIMEOUT_MS = 15_000L
     }
 
     private lateinit var binding: ActivityMainBinding
@@ -48,6 +51,16 @@ class MainActivity : AppCompatActivity() {
     private var serviceBound = false
     private var currentToast: Toast? = null
     private var stoppedByError = false
+
+    // Diferente de "capturing" (que pisca false durante reconexões — BT caiu,
+    // app tentando religar sozinho), isSessionActive fica true do clique em
+    // Iniciar até uma parada REAL (Parar, ou Parar após erro) — cobre toda a
+    // janela de reconexão automática. É isso que trava o botão Configurações:
+    // sem essa distinção, cada reconexão automática re-habilitava o menu de
+    // configurações (setCapturingState(false) mexia nele junto), permitindo
+    // mudar configurações que pareciam salvar mas não entravam em vigor até a
+    // próxima parada/início real (o retry de reconexão não recarrega tudo).
+    private var isSessionActive = false
 
     private val uiHandler = Handler(Looper.getMainLooper())
     private val tagCountUpdater = object : Runnable {
@@ -66,7 +79,13 @@ class MainActivity : AppCompatActivity() {
             readerService?.mainActivity = this@MainActivity
             readerService?.onStatusChanged = { capturing ->
                 runOnUiThread {
-                    if (capturing) stoppedByError = false  // reconnect succeeded — normal stop from now on
+                    if (capturing) {
+                        stoppedByError = false  // reconnect succeeded — normal stop from now on
+                    } else {
+                        // Só chega aqui numa parada REAL (stopCapture) — nunca
+                        // durante reconexão automática, que usa onCaptureError.
+                        isSessionActive = false
+                    }
                     setCapturingState(capturing)
                 }
             }
@@ -82,8 +101,12 @@ class MainActivity : AppCompatActivity() {
             }
             readerService?.onWrongAntennaType = { msg ->
                 runOnUiThread {
-                    // Probe failed — antenna type mismatch or not responding
-                    // Do NOT change stoppedByError or button state — no capture was started
+                    // Probe failed — antenna type mismatch or not responding.
+                    // Este callback também dispara durante tentativas automáticas
+                    // de reconexão em background — por isso NÃO mexe no estado do
+                    // botão aqui (faria ele piscar "habilitado" a cada retry
+                    // automático, reabrindo risco de corrida). O botão é
+                    // reabilitado por um timeout de segurança em onStartClicked.
                     toast(msg)
                 }
             }
@@ -98,6 +121,7 @@ class MainActivity : AppCompatActivity() {
                     else toast("Nenhuma tag para exportar")
                 }
             }
+            isSessionActive = readerService?.isCapturing() == true || readerService?.isPaused() == true
             setCapturingState(readerService?.isCapturing() == true)
         }
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -117,6 +141,7 @@ class MainActivity : AppCompatActivity() {
                         device?.let { startReaderService(it.deviceName) }
                     } else {
                         toast("Permissão USB negada")
+                        binding.btnStart.isEnabled = true
                     }
                 }
                 UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
@@ -319,6 +344,36 @@ class MainActivity : AppCompatActivity() {
         val deviceName = binding.spinnerDevices.tag?.toString()
             ?: run { toast("Nenhum dispositivo selecionado"); return }
 
+        // Desabilita já aqui, otimisticamente — a conexão (principalmente BT)
+        // pode levar vários segundos, e o botão continuava clicável nesse meio
+        // tempo, permitindo apertar Iniciar duas vezes e disparar duas tentativas
+        // de conexão simultâneas (visto em campo: duas sessões abertas ao mesmo
+        // tempo, uma delas derrubando a outra).
+        //
+        // Reabilitação: NÃO usamos os callbacks de erro do Service pra isso —
+        // onWrongAntennaType também dispara durante retries automáticos em
+        // background (a cada 5s), e mexer no botão ali faria ele "piscar"
+        // habilitado a cada tentativa automática, reabrindo risco de corrida.
+        // Em vez disso, um timeout de segurança reabilita sozinho depois de um
+        // tempo bem maior que o pior caso observado de conexão (~12s BT) — só
+        // reabilita se a captura realmente não tiver começado nesse meio tempo.
+        binding.btnStart.isEnabled = false
+        isSessionActive = true
+        binding.btnSettings.isEnabled = false
+        uiHandler.postDelayed({
+            if (readerService?.isCapturing() != true) {
+                binding.btnStart.isEnabled = true
+                // Conexão nunca teve sucesso nem entrou em reconexão de verdade
+                // (senão isRunning ou isPaused estariam true) — sessão nunca
+                // começou, libera o menu de configurações de novo.
+                if (readerService?.isPaused() != true) {
+                    isSessionActive = false
+                    binding.btnSettings.isEnabled = true
+                }
+                updateButtonColors()
+            }
+        }, START_BUTTON_SAFETY_TIMEOUT_MS)
+
         // Bluetooth device — no USB permission needed, connect directly
         if (deviceName == UHFReaderService.BT_DEVICE_NAME) {
             startReaderService(deviceName)
@@ -328,7 +383,7 @@ class MainActivity : AppCompatActivity() {
         // USB device — check permission as before
         val usbManager = getSystemService(USB_SERVICE) as UsbManager
         val device = usbManager.deviceList.values.firstOrNull { it.deviceName == deviceName }
-            ?: run { toast("Dispositivo não encontrado"); return }
+            ?: run { toast("Dispositivo não encontrado"); binding.btnStart.isEnabled = true; return }
         if (!usbManager.hasPermission(device)) requestUsbPermission(usbManager, device)
         else startReaderService(deviceName)
     }
@@ -336,6 +391,7 @@ class MainActivity : AppCompatActivity() {
     private fun onStopClicked() {
         if (stoppedByError) {
             stoppedByError = false
+            isSessionActive = false
             setCapturingState(false)
             readerService?.saveAfterError()
         } else {
@@ -462,7 +518,11 @@ class MainActivity : AppCompatActivity() {
     private fun setCapturingState(capturing: Boolean) {
         binding.btnStart.isEnabled       = !capturing
         binding.btnStop.isEnabled        = capturing
-        binding.btnSettings.isEnabled    = !capturing
+        // NÃO usa `capturing` aqui — capturing pisca false durante reconexão
+        // automática (onCaptureError chama isso com false), o que reabriria o
+        // menu de configurações no meio de uma tentativa de religar sozinho.
+        // isSessionActive só desliga numa parada real.
+        binding.btnSettings.isEnabled    = !isSessionActive
         binding.spinnerDevices.isEnabled = !capturing
 
         binding.tvStatus.text = if (capturing) "Lendo" else "Parado"
