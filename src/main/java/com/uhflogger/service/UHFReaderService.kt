@@ -41,6 +41,7 @@ import com.uhflogger.serial.ISerialPort
 import com.uhflogger.serial.UsbSerialPortWrapper
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
+import com.uhflogger.drive.DriveHelper
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
@@ -573,7 +574,7 @@ class UHFReaderService : Service(), SensorEventListener {
             autoSaveIntervalMin = SettingsManager.getAutoSaveMinutes(ctx)
             autoSaveMode        = SettingsManager.getAutoSaveMode(ctx)
 
-            val prefix   = if (activeAntennaType == SettingsManager.ANTENNA_TYPE_WINNIX) "winnix" else "jietong"
+            val prefix   = buildFileIdentifier(ctx, isBluetooth = deviceName == BT_DEVICE_NAME)
             val fileName = CsvExporter.startSession(ctx, prefix)
             if (fileName == null) {
                 Log.e(TAG, "Failed to create CSV session")
@@ -598,6 +599,25 @@ class UHFReaderService : Service(), SensorEventListener {
     }
 
     // ── USB connection ─────────────────────────────────────────────────────
+    /**
+     * Identificador usado no nome do arquivo CSV: MAC do módulo (sem os dois
+     * pontos, que são inválidos em nome de arquivo no Windows) quando é BT,
+     * ou o nome do aparelho Android (já existe pronto e sanitizado em
+     * DriveHelper, usado pra organizar as pastas do Drive) quando é USB.
+     * A estrutura de pastas do Drive não muda — só o nome do arquivo em si.
+     */
+    private fun buildFileIdentifier(ctx: Context, isBluetooth: Boolean): String {
+        if (!isBluetooth) return DriveHelper.getDeviceName(ctx)
+        return try {
+            val adapter = (ctx.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
+            val mac = adapter?.bondedDevices?.firstOrNull { it.name == BT_DEVICE_NAME }?.address
+            mac?.replace(":", "") ?: "BT"
+        } catch (se: SecurityException) {
+            Log.w(TAG, "buildFileIdentifier: sem permissão pra ler MAC do BT (${se.message})")
+            "BT"
+        }
+    }
+
     private fun startUsbConnection(deviceName: String, resuming: Boolean) {
         val ctx = appContext ?: return
         val usbManager = getSystemService(Context.USB_SERVICE) as UsbManager
@@ -1489,7 +1509,7 @@ class UHFReaderService : Service(), SensorEventListener {
             val fileName = CsvExporter.finalizeSession(batch)
             Log.i(TAG, "Auto-save (new file): $fileName — ${batch.size} tags")
             // Start a new session for the next batch
-            val prefix   = if (activeAntennaType == SettingsManager.ANTENNA_TYPE_WINNIX) "winnix" else "jietong"
+            val prefix   = buildFileIdentifier(ctx, isBluetooth = activeIsBluetooth)
             val newFile  = CsvExporter.startSession(ctx, prefix)
             Log.i(TAG, "New session started: $newFile")
             updateNotification("Capturando… (${totalCount.get()} tags)")

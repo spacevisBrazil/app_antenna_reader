@@ -33,7 +33,9 @@ object CsvExporter {
      */
     fun startSession(context: Context, prefix: String = "rfid"): String? {
         closeWriter()
-        val fileName = "${prefix}_${System.currentTimeMillis()}.csv"
+        val timestamp = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US)
+            .format(java.util.Date())
+        val fileName = "${prefix}_${timestamp}.csv"
         val folder   = getCsvFolder(context)
         val file     = File(folder, fileName)
 
