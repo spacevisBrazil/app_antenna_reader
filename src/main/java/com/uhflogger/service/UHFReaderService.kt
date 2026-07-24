@@ -1,4 +1,3 @@
-
 package com.uhflogger.service
 
 import android.app.Notification
@@ -212,12 +211,23 @@ class UHFReaderService : Service(), SensorEventListener {
     }
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 
-    private val locationSensorsActive = java.util.concurrent.atomic.AtomicBoolean(false)
+    // Trava dos SENSORES (bússola) — não precisa de permissão, então uma vez
+    // registrado, fica registrado pro resto da vida do serviço.
+    private val sensorsRegistered = java.util.concurrent.atomic.AtomicBoolean(false)
+    // Trava da LOCALIZAÇÃO — separada de propósito. Antes, uma única trava
+    // cobria as duas coisas: se a permissão de localização ainda não tivesse
+    // sido concedida na primeira chamada (ex: app acabou de abrir, diálogo de
+    // permissão ainda não respondido), a trava já ficava "true" e o GPS NUNCA
+    // MAIS era tentado de novo — nem quando startCapture() chamava essa
+    // função de novo já com a permissão concedida. Resultado: sessão inteira
+    // sem nenhum dado de localização, mesmo com permissão OK depois. Agora,
+    // enquanto isso não tiver sucesso pelo menos uma vez, toda chamada tenta
+    // de novo.
+    @Volatile private var locationRegistered = false
 
     /** Inicia GPS + bússola numa thread própria. Chamado a partir de startCapture —
      *  roda mesmo com tela apagada, e não compartilha thread com a leitura RFID. */
     private fun startLocationAndSensors() {
-        if (!locationSensorsActive.compareAndSet(false, true)) return  // já ativo — evita registrar 2x
         val ctx = appContext ?: return
 
         // Se a permissão foi concedida DEPOIS do onCreate (ex: usuário acabou de
@@ -226,67 +236,73 @@ class UHFReaderService : Service(), SensorEventListener {
         // atualizado é seguro e é a forma documentada de "upgrade" o tipo.
         startForegroundWithSafeType()
 
-        // Thread + Looper dedicados. É isso que garante que onLocationChanged e
-        // onSensorChanged nunca rodem na UI thread nem na thread de leitura serial.
-        val thread = android.os.HandlerThread("UHFLogger-LocationSensor").also { it.start() }
-        locationSensorThread  = thread
-        val handler = android.os.Handler(thread.looper)
-        locationSensorHandler = handler
+        // Thread + Looper dedicados — só cria uma vez, reaproveita nas
+        // chamadas seguintes (não recria a cada retry de localização).
+        val handler = locationSensorHandler ?: run {
+            val thread = android.os.HandlerThread("UHFLogger-LocationSensor").also { it.start() }
+            locationSensorThread = thread
+            android.os.Handler(thread.looper).also { locationSensorHandler = it }
+        }
 
-        if (ContextCompat.checkSelfPermission(ctx, android.Manifest.permission.ACCESS_FINE_LOCATION)
-            != PackageManager.PERMISSION_GRANTED) {
-            Log.w(TAG, "ACCESS_FINE_LOCATION não concedida — GNSS não será registrado")
-        } else {
-            try {
-                val lm = (locationManager ?: (ctx.getSystemService(LOCATION_SERVICE) as LocationManager)
-                    .also { locationManager = it })
-                val gnssOnly = SettingsManager.getLocationMode(ctx) == SettingsManager.LOCATION_MODE_GNSS
-                // Passando `handler` explicitamente: os callbacks chegam na
-                // locationSensorThread, não na thread que chamou startCapture().
-                lm.requestLocationUpdates(
-                    LocationManager.GPS_PROVIDER, GPS_UPDATE_INTERVAL_MS, GPS_UPDATE_MIN_METERS, locationListener, handler.looper)
-                if (!gnssOnly) {
+        if (!locationRegistered) {
+            if (ContextCompat.checkSelfPermission(ctx, android.Manifest.permission.ACCESS_FINE_LOCATION)
+                != PackageManager.PERMISSION_GRANTED) {
+                Log.w(TAG, "ACCESS_FINE_LOCATION não concedida — GNSS não será registrado (vai tentar de novo na próxima chamada)")
+            } else {
+                try {
+                    val lm = (locationManager ?: (ctx.getSystemService(LOCATION_SERVICE) as LocationManager)
+                        .also { locationManager = it })
+                    val gnssOnly = SettingsManager.getLocationMode(ctx) == SettingsManager.LOCATION_MODE_GNSS
+                    // Passando `handler` explicitamente: os callbacks chegam na
+                    // locationSensorThread, não na thread que chamou startCapture().
                     lm.requestLocationUpdates(
-                        LocationManager.NETWORK_PROVIDER, GPS_UPDATE_INTERVAL_MS, GPS_UPDATE_MIN_METERS, locationListener, handler.looper)
-                }
-                Log.i(TAG, "LOCATION_REGISTERED: modo=${if (gnssOnly) "GNSS puro" else "híbrido (GNSS+NETWORK)"} — GPS_PROVIDER e${if (gnssOnly) "" else " NETWORK_PROVIDER"} registrados sem exceção")
-                if (currentLocation == null) {
-                    // Usa a última posição conhecida MAIS RECENTE entre GPS e
-                    // NETWORK — sem limite de idade ("algo é melhor que nada"),
-                    // mas também sem preferir GPS cegamente: se o cache do GPS
-                    // tem 2h e o do NETWORK tem 10min, o NETWORK é o certo aqui.
-                    // Preferir provider sem olhar a idade só faz sentido quando
-                    // os dois são comparavelmente frescos — não é o caso ao
-                    // comparar dois caches parados, potencialmente muito
-                    // diferentes em idade um do outro.
-                    val lastGps = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER)
-                    val lastNet = if (!gnssOnly) lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER) else null
-                    val best = when {
-                        lastGps != null && lastNet != null -> if (lastGps.time >= lastNet.time) lastGps else lastNet
-                        lastGps != null -> lastGps
-                        lastNet != null -> lastNet
-                        else -> null
+                        LocationManager.GPS_PROVIDER, GPS_UPDATE_INTERVAL_MS, GPS_UPDATE_MIN_METERS, locationListener, handler.looper)
+                    if (!gnssOnly) {
+                        lm.requestLocationUpdates(
+                            LocationManager.NETWORK_PROVIDER, GPS_UPDATE_INTERVAL_MS, GPS_UPDATE_MIN_METERS, locationListener, handler.looper)
                     }
-                    if (best != null) {
-                        applyLocation(best)
-                        val label = if (best.provider == LocationManager.GPS_PROVIDER) "GPS" else "NETWORK"
-                        Log.i(TAG, "LOCATION_CACHE: usando última posição $label conhecida (mais recente entre as disponíveis), idade=${System.currentTimeMillis()-best.time}ms")
-                    } else {
-                        Log.i(TAG, "LOCATION_CACHE: nenhuma posição em cache disponível (GPS nem NETWORK) — aguardando fix novo")
+                    locationRegistered = true
+                    Log.i(TAG, "LOCATION_REGISTERED: modo=${if (gnssOnly) "GNSS puro" else "híbrido (GNSS+NETWORK)"} — GPS_PROVIDER e${if (gnssOnly) "" else " NETWORK_PROVIDER"} registrados sem exceção")
+                    if (currentLocation == null) {
+                        // Usa a última posição conhecida MAIS RECENTE entre GPS e
+                        // NETWORK — sem limite de idade ("algo é melhor que nada"),
+                        // mas também sem preferir GPS cegamente: se o cache do GPS
+                        // tem 2h e o do NETWORK tem 10min, o NETWORK é o certo aqui.
+                        // Preferir provider sem olhar a idade só faz sentido quando
+                        // os dois são comparavelmente frescos — não é o caso ao
+                        // comparar dois caches parados, potencialmente muito
+                        // diferentes em idade um do outro.
+                        val lastGps = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER)
+                        val lastNet = if (!gnssOnly) lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER) else null
+                        val best = when {
+                            lastGps != null && lastNet != null -> if (lastGps.time >= lastNet.time) lastGps else lastNet
+                            lastGps != null -> lastGps
+                            lastNet != null -> lastNet
+                            else -> null
+                        }
+                        if (best != null) {
+                            applyLocation(best)
+                            val label = if (best.provider == LocationManager.GPS_PROVIDER) "GPS" else "NETWORK"
+                            Log.i(TAG, "LOCATION_CACHE: usando última posição $label conhecida (mais recente entre as disponíveis), idade=${System.currentTimeMillis()-best.time}ms")
+                        } else {
+                            Log.i(TAG, "LOCATION_CACHE: nenhuma posição em cache disponível (GPS nem NETWORK) — aguardando fix novo")
+                        }
                     }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Falha ao registrar location updates", e)
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "Falha ao registrar location updates", e)
             }
         }
 
-        val sm = (sensorManager ?: (ctx.getSystemService(SENSOR_SERVICE) as SensorManager)
-            .also { sensorManager = it })
-        sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)?.let {
-            sm.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL, handler)
-        }
-        sm.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)?.let {
-            sm.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL, handler)
+        if (sensorsRegistered.compareAndSet(false, true)) {
+            val sm = (sensorManager ?: (ctx.getSystemService(SENSOR_SERVICE) as SensorManager)
+                .also { sensorManager = it })
+            sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)?.let {
+                sm.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL, handler)
+            }
+            sm.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)?.let {
+                sm.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL, handler)
+            }
         }
     }
 
@@ -298,7 +314,8 @@ class UHFReaderService : Service(), SensorEventListener {
         try { locationSensorThread?.quitSafely() } catch (_: Exception) {}
         locationSensorThread  = null
         locationSensorHandler = null
-        locationSensorsActive.set(false)
+        locationRegistered = false
+        sensorsRegistered.set(false)
     }
 
     fun getCurrentLatitude()  = currentLocation?.let { "%.6f".format(java.util.Locale.US, it.latitude) }  ?: ""
