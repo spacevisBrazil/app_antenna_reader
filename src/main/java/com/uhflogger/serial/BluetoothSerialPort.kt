@@ -9,13 +9,11 @@ import java.io.OutputStream
 import java.util.UUID
 
 /**
- * Bluetooth SPP (Serial Port Profile) implementation of ISerialPort.
- * Uses RFCOMM with the standard SPP UUID.
+ * Implementação de ISerialPort via Bluetooth SPP (Serial Port Profile), usando RFCOMM com UUID padrão SPP.
  *
- * @SuppressLint("MissingPermission") is safe here because:
- * - BLUETOOTH_CONNECT permission is checked in UHFReaderService.startBtConnection()
- *   before this class is instantiated or connect() is called.
- * - All calls are also wrapped in try/catch SecurityException as defense in depth.
+ * @SuppressLint("MissingPermission") é seguro aqui porque:
+ * - A permissão BLUETOOTH_CONNECT é verificada em UHFReaderService.startBtConnection() antes de instanciar esta classe.
+ * - Todas as chamadas também estão envoltas em try/catch SecurityException como defesa em profundidade.
  */
 @SuppressLint("MissingPermission")
 class BluetoothSerialPort(private val device: BluetoothDevice) : ISerialPort {
@@ -38,10 +36,7 @@ class BluetoothSerialPort(private val device: BluetoothDevice) : ISerialPort {
     }
 
     /**
-     * Connect to the device.
-     * Tries secure RFCOMM first, then insecure, then fallback via reflection
-     * (port 1 directly) which works when the ACL link is already established
-     * by the remote device (ESP32 auto-reconnect scenario).
+     * Conecta ao dispositivo via RFCOMM seguro.
      */
     fun connect() {
         val name = try { device.name } catch (_: SecurityException) { device.address }
@@ -55,16 +50,12 @@ class BluetoothSerialPort(private val device: BluetoothDevice) : ISerialPort {
     }
 
     private fun tryConnect(): BluetoothSocket {
-        // Single attempt using standard secure RFCOMM.
-        // Previously tried 3 fallback methods sequentially (secure → insecure →
-        // reflection), each connect() call taking up to ~12s to time out when
-        // the device is out of range. That meant a single tryConnect() call could
-        // take up to 36s, and with 3 outer retries (BT_MAX_RETRIES) the worst
-        // case ballooned to over 100s before the reconnect loop even got a chance
-        // to detect a successful connection.
-        // The outer retry loops (startBtConnection's 3 retries + the indefinite
-        // BT reconnect loop) already provide retry coverage — so a single,
-        // fast-failing attempt here is both simpler and far more responsive.
+        // Tentativa única via RFCOMM seguro padrão.
+        // Anteriormente tentava 3 métodos sequenciais (seguro → inseguro → reflection),
+        // cada connect() podendo levar ~12s para timeout quando fora de alcance — isso
+        // totalizava até 36s antes do loop externo de reconexão agir.
+        // Os loops externos (startBtConnection + startBtReconnectLoop) já cobrem retentativas,
+        // então falhar rápido aqui é mais responsivo.
         val s = device.createRfcommSocketToServiceRecord(SPP_UUID)
         try {
             s.connect()
@@ -90,19 +81,18 @@ class BluetoothSerialPort(private val device: BluetoothDevice) : ISerialPort {
     }
 
     /**
-     * Blocking read — blocks until data arrives OR throws IOException on disconnect.
-     * Critical: available() polling never throws on disconnect so the IOManager
-     * never detects it. Blocking read() does — propagates to onRunError → reconnect.
+     * Leitura bloqueante — bloqueia até dados chegarem OU lança IOException ao desconectar.
+     * Importante: available() polling nunca lança exceção na desconexão, o que impede o IOManager
+     * de detectá-la. A leitura bloqueante lança — propagando para onRunError → reconexão.
      */
     override fun read(buf: ByteArray, timeout: Int): Int {
         val stream = inputStream ?: return 0
         return if (timeout == 0) {
-            // Blocking read — used by BluetoothInputOutputManager for continuous data.
-            // Blocks until data arrives OR throws IOException on disconnect.
+            // Leitura bloqueante — usada pelo BluetoothInputOutputManager para dados contínuos.
             stream.read(buf, 0, buf.size)
         } else {
-            // Timed read: spawn a thread that does blocking read, interrupt after timeout.
-            // More reliable than available() polling on BT sockets.
+            // Leitura temporizada: spawn de thread com leitura bloqueante, interrompida após timeout.
+            // Mais confiável que polling de available() em sockets BT.
             var result = 0
             var exception: Exception? = null
             val readerThread = Thread {

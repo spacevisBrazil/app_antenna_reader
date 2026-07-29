@@ -4,15 +4,14 @@ import android.hardware.usb.UsbDeviceConnection
 import com.hoho.android.usbserial.driver.UsbSerialPort
 
 /**
- * Wraps UsbSerialPort to implement ISerialPort.
- * Keeps the existing USB behavior exactly as before.
+ * Adapta UsbSerialPort para a interface ISerialPort, mantendo o comportamento USB existente.
  */
 class UsbSerialPortWrapper(
     private val port      : UsbSerialPort,
     private val connection: UsbDeviceConnection
 ) : ISerialPort {
 
-    override val isConnected: Boolean get() = true  // checked externally
+    override val isConnected: Boolean get() = true
     override val portName   : String  get() = "USB:${port.device.deviceName}"
 
     override fun write(data: ByteArray, timeout: Int): Int {
@@ -32,6 +31,6 @@ class UsbSerialPortWrapper(
         try { port.purgeHwBuffers(input, output) } catch (_: Exception) {}
     }
 
-    /** Expose raw UsbSerialPort for SerialInputOutputManager (USB only) */
+    /** Expõe o UsbSerialPort bruto para uso pelo SerialInputOutputManager (USB) */
     fun rawPort(): UsbSerialPort = port
 }

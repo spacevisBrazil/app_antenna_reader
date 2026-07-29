@@ -21,9 +21,7 @@ class SettingsActivity : AppCompatActivity() {
     private val MUTED  = Color.parseColor("#888888")
     private val LABEL  = Color.parseColor("#2E7D32")
 
-    // Root layout reference — needed to show/hide Winnix section
     private lateinit var root: LinearLayout
-    // Winnix-only container — shown/hidden based on antenna type selection
     private lateinit var winnixSection: LinearLayout
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -93,7 +91,7 @@ class SettingsActivity : AppCompatActivity() {
             showAntennaTypeDialog(root)
         }
 
-        // Winnix-only section — visible only when Winnix is selected
+        // Seção Winnix — visível apenas quando Winnix estiver selecionado
         winnixSection = buildWinnixSection()
         root.addView(winnixSection)
         winnixSection.visibility = if (currentType == SettingsManager.ANTENNA_TYPE_WINNIX)
@@ -122,15 +120,13 @@ class SettingsActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        // Refresh Drive account status when returning from GoogleSignInActivity
+        // Atualiza o status da conta Drive ao voltar da GoogleSignInActivity
         val account = com.uhflogger.drive.DriveHelper.getSignedInAccount(this)
         val status  = if (account != null) account.email ?: "Conectado" else "Não conectado"
         root.findViewById<android.widget.TextView>(ROW_DRIVE_ACCOUNT)?.text = status
     }
 
-    // -------------------------------------------------------------------------
-    // Winnix section
-    // -------------------------------------------------------------------------
+    // ─── Seção Winnix ───
 
     private fun buildWinnixSection(): LinearLayout {
         val section = LinearLayout(this).apply {
@@ -140,7 +136,6 @@ class SettingsActivity : AppCompatActivity() {
         section.addView(spacer(8))
         buildSectionLabel(section, "CONFIGURAÇÃO WINNIX")
 
-        // Antenna count (1-4)
         val antCount = SettingsManager.getWinnixAntCount(this)
         buildRow(section, "Número de antenas",
             "$antCount antena${if (antCount > 1) "s" else ""}",
@@ -148,7 +143,6 @@ class SettingsActivity : AppCompatActivity() {
             showWinnixAntCountDialog(section)
         }
 
-        // Power
         val power = SettingsManager.getWinnixPowerDbm(this)
         buildRow(section, "Potência",
             "$power dBm",
@@ -163,7 +157,6 @@ class SettingsActivity : AppCompatActivity() {
             }
         }
 
-        // Working time
         val workMs = SettingsManager.getWinnixWorkingMs(this)
         buildRow(section, "Tempo por antena",
             "${workMs}ms",
@@ -178,7 +171,6 @@ class SettingsActivity : AppCompatActivity() {
             }
         }
 
-        // Inventory mode
         val invMode = SettingsManager.getWinnixInventoryMode(this)
         buildRow(section, "Modo de inventário",
             SettingsManager.winnixInventoryModeLabel(invMode),
@@ -189,9 +181,7 @@ class SettingsActivity : AppCompatActivity() {
         return section
     }
 
-    // -------------------------------------------------------------------------
-    // Dialogs
-    // -------------------------------------------------------------------------
+    // ─── Diálogos ───
 
     private fun showAntennaTypeDialog(parent: LinearLayout) {
         val current = SettingsManager.getAntennaType(this)
@@ -231,7 +221,6 @@ class SettingsActivity : AppCompatActivity() {
                 SettingsManager.setAntennaType(this, type)
                 val label = if (type == SettingsManager.ANTENNA_TYPE_WINNIX) "Winnix HYM750E" else "Jietong"
                 updateRowValue(parent, ROW_ANTENNA_TYPE, label)
-                // Show/hide Winnix section
                 winnixSection.visibility = if (type == SettingsManager.ANTENNA_TYPE_WINNIX)
                     View.VISIBLE else View.GONE
                 toast("Salvo: $label")
@@ -450,9 +439,7 @@ class SettingsActivity : AppCompatActivity() {
             .show()
     }
 
-    // -------------------------------------------------------------------------
-    // Restore defaults
-    // -------------------------------------------------------------------------
+    // ─── Restaurar padrões ───
 
     private fun buildRestoreButton(parent: LinearLayout) {
         val btn = Button(this).apply {
@@ -494,7 +481,7 @@ class SettingsActivity : AppCompatActivity() {
                         updateRowValue(parent, ROW_LOCATION, "GNSS + Rede")
                         updateRowValue(parent, ROW_ANTENNA_TYPE, "Jietong")
 
-                        // Hide Winnix section — default is Jietong
+                        // Esconde seção Winnix — padrão é Jietong
                         winnixSection.visibility = View.GONE
 
                         toast("Configurações restauradas")
@@ -509,9 +496,7 @@ class SettingsActivity : AppCompatActivity() {
         parent.addView(btn)
     }
 
-    // -------------------------------------------------------------------------
-    // UI helpers
-    // -------------------------------------------------------------------------
+    // ─── Utilitários de UI ───
 
     private fun buildSectionLabel(parent: LinearLayout, text: String) {
         val tv = TextView(this).apply {

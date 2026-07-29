@@ -415,10 +415,10 @@ class UHFReaderService : Service(), SensorEventListener {
 
     private val stopExecutor   = Executors.newSingleThreadExecutor()
     private val configExecutor = Executors.newSingleThreadExecutor()
-    // Dedicated executor for BT reconnect loop — separate so it never blocks stop/config ops
+    // Executor dedicado ao loop de reconexão BT — separado para nunca bloquear stop/config
     @Volatile private var btReconnectExecutor: java.util.concurrent.ExecutorService? = null
-    // Independent flag controlling the reconnect loop's lifetime — separate from
-    // isPausedState which fluctuates during each connection attempt.
+    // Flag que controla exclusivamente o ciclo de vida do loop de reconexão — independente
+    // de isPausedState, que oscila durante cada tentativa de conexão.
     private val btReconnectActive = java.util.concurrent.atomic.AtomicBoolean(false)
 
     // Mesma ideia, agora pro USB: antes disso, a reconexão USB dependia 100% do
@@ -461,10 +461,10 @@ class UHFReaderService : Service(), SensorEventListener {
 
     // Winnix temperature tracking
     @Volatile private var winnixStartTemp     : String = ""
-    // Generic temperature read via onNewData — used for both start and stop temp on BT
+    // Temperatura lida via onNewData — usada tanto para temp. inicial quanto de encerramento em BT
     @Volatile private var winnixTempResult    : String = ""
     private val winnixTempLatch     = java.util.concurrent.atomic.AtomicReference<java.util.concurrent.CountDownLatch?>(null)
-    // Flag set by onNewData when 0x8D (stop confirmation) is received
+    // Sinalizado por onNewData quando a confirmação de parada 0x8D é recebida
     private val winnixStopConfirmed = java.util.concurrent.atomic.AtomicBoolean(false)
 
     // Callbacks
@@ -639,7 +639,7 @@ class UHFReaderService : Service(), SensorEventListener {
         winnixDecoder.reset()
 
         activeIsBluetooth = (deviceName == BT_DEVICE_NAME)
-        winnixRingClear()  // clear stale bytes from previous session
+        winnixRingClear()  // descarta bytes residuais da sessão anterior
 
         if (deviceName == BT_DEVICE_NAME) {
             startBtConnection(deviceName, resuming)
@@ -729,7 +729,7 @@ class UHFReaderService : Service(), SensorEventListener {
         Log.i(TAG, "BT_CONNECT: startBtConnection called resuming=$resuming retryCount=$retryCount")
         configExecutor.submit {
             try {
-                // Check BLUETOOTH_CONNECT permission (required on Android 12+)
+                // Verifica permissão BLUETOOTH_CONNECT (obrigatória no Android 12+)
                 if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
                     if (ctx.checkSelfPermission(android.Manifest.permission.BLUETOOTH_CONNECT)
                         != android.content.pm.PackageManager.PERMISSION_GRANTED) {
@@ -768,11 +768,9 @@ class UHFReaderService : Service(), SensorEventListener {
                     btPort.connect()
                     Log.i(TAG, "BT_CONNECT: socket connected successfully")
                 } catch (e: Exception) {
-                    // No internal retry here — the outer BT reconnect loop
-                    // (startBtReconnectLoop) already retries every BT_RECONNECT_INTERVAL_MS
-                    // indefinitely. Retrying here too just burned time in nested
-                    // attempts without improving odds — a fresh attempt after a real
-                    // wait is just as effective. Fail fast, let the outer loop retry.
+                    // Sem retry interno — o loop externo (startBtReconnectLoop) já retenta
+                    // a cada BT_RECONNECT_INTERVAL_MS indefinidamente. Falhar rápido aqui
+                    // e deixar o loop externo tentar é mais eficaz.
                     Log.e(TAG, "BT_CONNECT: socket connect FAILED: ${e.message}")
                     btPort.close()
                     if (!resuming) CsvExporter.cancelSession()
@@ -787,9 +785,8 @@ class UHFReaderService : Service(), SensorEventListener {
                     Log.w(TAG, "BT_CONNECT: probe FAILED")
                     btPort.close()
                     activePort = null
-                    // Connection succeeded but module didn't answer the probe — this is
-                    // fast (not a connect() timeout), so one quick local retry is cheap
-                    // and catches transient issues without the outer loop's 5s wait.
+                    // Conexão OK mas módulo não respondeu ao probe — como é rápido (sem timeout de connect()),
+                    // uma tentativa local de retry é barata e resolve problemas transitórios.
                     if (retryCount < 1) {
                         Log.i(TAG, "BT_CONNECT: retrying probe once")
                         Thread.sleep(BT_RETRY_DELAY_MS)
@@ -1000,12 +997,11 @@ class UHFReaderService : Service(), SensorEventListener {
 
         winnixStartTemp = ""
 
-        // Config runs on configExecutor — btPort is already connected at this point
         configExecutor.submit {
             try {
                 winnixConfigSequence(btPort, antennas, powerDbm, workingMs, invMode, inactiveMs)
 
-                // Start temperature — read BEFORE starting btIoManager (no competition)
+                // Temperatura inicial — lida ANTES de iniciar o btIoManager (sem concorrência na porta)
                 val startTemp = winnixReadTemperature(btPort)
                 winnixStartTemp = if (startTemp != null) "%.1f".format(java.util.Locale.US, startTemp) else ""
                 Log.i(TAG, "Winnix BT start temperature: $winnixStartTemp°C")
@@ -1015,8 +1011,7 @@ class UHFReaderService : Service(), SensorEventListener {
                 btPort.write(winnixBuildStartInventory(), 2000)
                 Log.i(TAG, "Winnix BT inventory started")
 
-                // Guard: only assign btIoManager if still running
-                // Prevents race where stopCapture() ran while configExecutor was still starting
+                // Garante que stopCapture() não foi chamado enquanto o configExecutor ainda inicializava
                 if (!isRunning.get()) {
                     Log.w(TAG, "BT capture aborted — stop was called during startup")
                     btPort.close()
@@ -1100,12 +1095,12 @@ class UHFReaderService : Service(), SensorEventListener {
 
     private fun winnixOnNewData(data: ByteArray) {
         lastDataReceivedAt = System.currentTimeMillis()
-        // Accumulate bytes — BT can fragment frames across multiple onNewData calls
+        // Acumula bytes — o BT pode fragmentar frames em múltiplas chamadas onNewData
         winnixRingAppend(data)
 
         val buf = winnixRingSnapshot()
 
-        // Check for stop confirmation (0x8D)
+        // Verifica confirmação de parada (0x8D)
         if (!winnixStopConfirmed.get()) {
             for (i in 0 until buf.size - 4) {
                 if (buf[i] == 0xA5.toByte() && buf[i+1] == 0x5A.toByte()
@@ -1118,7 +1113,7 @@ class UHFReaderService : Service(), SensorEventListener {
             }
         }
 
-        // Check for temperature response (0x35) — fills latch for winnixReadTemperatureBt()
+        // Verifica resposta de temperatura (0x35) — preenche o latch para winnixReadTemperatureBt()
         val tempLatch = winnixTempLatch.get()
         if (tempLatch != null && tempLatch.count > 0) {
             for (i in 0 until buf.size - 7) {
@@ -1183,8 +1178,8 @@ class UHFReaderService : Service(), SensorEventListener {
             // pra não segurar o lock por até 3s à toa.
             val sent = synchronized(this) { activePort?.write(winnixBuildStopInventory(), 2000); activePort != null }
             if (!sent) return
-            // Wait up to 3s for 0x8D confirmation via onNewData
-            // Send only ONCE — sending multiple 0x8C confuses the module
+            // Aguarda até 3s pela confirmação 0x8D via onNewData
+            // Envia apenas UMA vez — múltiplos 0x8C confundem o módulo
             val deadline = System.currentTimeMillis() + 3000L
             while (!winnixStopConfirmed.get() && System.currentTimeMillis() < deadline) {
                 Thread.sleep(50)
@@ -1273,9 +1268,9 @@ class UHFReaderService : Service(), SensorEventListener {
     }
 
     /**
-     * mode: table mode 1-5 (as defined in SettingsManager WINNIX_INV_MODE_*).
-     * Protocol DByte0 values are 0-4, with a -1 offset from the table numbering.
-     * Verified against doc example: Fast read (table Mode 2) = DByte0 0x01.
+     * mode: modo de tabela 1-5 (conforme SettingsManager WINNIX_INV_MODE_*).
+     * Valores de DByte0 no protocolo são 0-4, com offset -1 em relação à tabela.
+     * Verificado contra doc: Fast read (Mode 2) = DByte0 0x01.
      *   Multi-tag (1) → DByte0=0x00
      *   Fast read (2) → DByte0=0x01
      *   Ultra Low Power (3) → DByte0=0x02
@@ -1287,11 +1282,11 @@ class UHFReaderService : Service(), SensorEventListener {
     }
 
     /**
-     * Read temperature for BT sessions — uses latch filled by onNewData.
-     * The btIoManager delivers all bytes via onNewData, so we cannot use
-     * winnixReadTemperature (available() polling) which competes with btIoManager.
-     * Instead: set latch, send 0x34, wait for onNewData to detect 0x35 and signal.
-     * Called ONLY when btIoManager is active (during capture or stop temp before port close).
+     * Lê a temperatura em sessões BT — usa latch preenchido via onNewData.
+     * O btIoManager consome todos os bytes via onNewData, então winnixReadTemperature
+     * (polling de available()) não funciona — concorreria com o btIoManager pelo mesmo stream.
+     * Em vez disso: define o latch, envia 0x34, aguarda onNewData detectar 0x35 e sinalizar.
+     * Chamada SOMENTE com btIoManager ativo (durante captura ou na temperatura de encerramento).
      */
     private fun winnixReadTemperatureBt(port: ISerialPort): String {
         winnixTempResult = ""
@@ -1327,7 +1322,7 @@ class UHFReaderService : Service(), SensorEventListener {
             while (System.currentTimeMillis() < deadline) {
                 val n = try { port.read(buf, 200) } catch (_: Exception) { 0 }
                 for (i in 0 until n) collected.add(buf[i])
-                // Search for 0x35 response anywhere in collected bytes
+                // Procura resposta 0x35 em qualquer posição dos bytes coletados
                 val data = collected.toByteArray()
                 for (idx in 0 until data.size - 7) {
                     if (data[idx]   == 0xA5.toByte() &&
@@ -1517,23 +1512,22 @@ class UHFReaderService : Service(), SensorEventListener {
     }
 
     /**
-     * Retry loop that periodically calls startCapture() with BT_DEVICE_NAME.
-     * Conditions to keep running:
-     *   - isPausedState == true  (not stopped by user)
-     *   - isRunning == false     (not already capturing)
-     * Stops automatically when:
-     *   - User clicks Stop → stopCapture() → isPausedState = false
-     *   - Reconnect succeeds → startCapture() → isRunning = true
+     * Loop de reconexão BT — chama startCapture() periodicamente com BT_DEVICE_NAME.
+     * Continua rodando enquanto:
+     *   - isPausedState == true  (não parado pelo usuário)
+     *   - isRunning == false     (ainda não capturando)
+     * Para automaticamente quando:
+     *   - Usuário clica Parar → stopCapture() → isPausedState = false
+     *   - Reconexão tem sucesso → startCapture() → isRunning = true
      *   - onDestroy() → btReconnectExecutor.shutdownNow()
      */
     private fun startBtReconnectLoop() {
         btReconnectExecutor?.shutdownNow()
         btReconnectExecutor = Executors.newSingleThreadExecutor()
-        // Dedicated flag — controls ONLY this loop's lifetime.
-        // Independent of isPausedState, which startCapture() flips during each attempt.
-        // This prevents the loop from exiting prematurely while a connection
-        // attempt is still in progress on configExecutor (BluetoothSocket.connect()
-        // can take 10-12s to time out on a powered-off device).
+        // Flag dedicada — controla SOMENTE o ciclo de vida deste loop.
+        // Independente de isPausedState, que startCapture() altera durante cada tentativa.
+        // Evita que o loop saia prematuramente enquanto uma tentativa ainda está em andamento
+        // no configExecutor (BluetoothSocket.connect() pode levar 10-12s para timeout).
         btReconnectActive.set(true)
         btReconnectExecutor?.submit {
             Log.i(TAG, "BT_RECONNECT: loop started, will retry every ${BT_RECONNECT_INTERVAL_MS}ms")
@@ -1548,11 +1542,8 @@ class UHFReaderService : Service(), SensorEventListener {
                     break
                 }
 
-                // Only call startCapture if no attempt is currently in flight.
-                // isPausedState is restored to true by startBtConnection's failure
-                // paths, but during the attempt itself it's false — we must NOT
-                // call startCapture again while one is already running, and we
-                // must NOT exit the loop just because isPausedState is momentarily false.
+                // Só chama startCapture se nenhuma tentativa estiver em andamento.
+                // isPausedState fica false durante a tentativa — não sair do loop por isso.
                 if (!isPausedState.get() && !isRunning.get()) {
                     Log.i(TAG, "BT_RECONNECT: previous attempt still in flight, skipping this cycle")
                     continue
@@ -1567,11 +1558,8 @@ class UHFReaderService : Service(), SensorEventListener {
                 try {
                     startCapture(BT_DEVICE_NAME)
 
-                    // Poll in small increments instead of one fixed sleep.
-                    // Exits AS SOON AS isRunning becomes true — no wasted waiting
-                    // on the common case (fast reconnect). Still waits up to
-                    // BT_ATTEMPT_SETTLE_MS total on the worst case (connect() timeout),
-                    // so it never exits prematurely while an attempt is still in flight.
+                    // Polling em pequenos incrementos — sai assim que isRunning se tornar true,
+                    // sem esperar o tempo máximo no caso comum (reconexão rápida).
                     Log.i(TAG, "BT_RECONNECT: waiting for result (polling)...")
                     val settleDeadline = System.currentTimeMillis() + BT_ATTEMPT_SETTLE_MS
                     while (System.currentTimeMillis() < settleDeadline) {
@@ -1599,10 +1587,9 @@ class UHFReaderService : Service(), SensorEventListener {
     }
 
     /**
-     * (Re)schedules the time-based auto-save job starting from now.
-     * Called on initial start AND whenever a tag-count-triggered save happens,
-     * so the time counter resets — preventing a near-immediate duplicate
-     * save right after a count-triggered one.
+     * (Re)agenda o job de auto-save por tempo a partir de agora.
+     * Chamado na inicialização e a cada save disparado por contagem de tags,
+     * reiniciando o contador — evita um save duplicado logo após o save por contagem.
      */
     private fun rescheduleTimerJob() {
         autoSaveTimerJob?.cancel(false)
@@ -1640,7 +1627,7 @@ class UHFReaderService : Service(), SensorEventListener {
             // Modo arquivo novo: encerra a sessão atual e abre uma nova
             val fileName = CsvExporter.finalizeSession(batch)
             Log.i(TAG, "Auto-save (new file): $fileName — ${batch.size} tags")
-            // Start a new session for the next batch
+            // Abre nova sessão para o próximo lote
             val prefix   = buildFileIdentifier(ctx, isBluetooth = activeIsBluetooth)
             val newFile  = CsvExporter.startSession(ctx, prefix)
             Log.i(TAG, "New session started: $newFile")
@@ -1712,18 +1699,11 @@ class UHFReaderService : Service(), SensorEventListener {
         const val BT_DEVICE_NAME    = "Winnix_BT"
         private const val BT_RETRY_DELAY_MS       = 2000L  // delay before the single probe retry
         private const val BT_RECONNECT_INTERVAL_MS= 5000L  // retry interval when session is paused
-        // Must exceed worst case: BluetoothSocket.connect() timeout (~12s) is NOT
-        // bounded by our code — it's an Android system timeout we cannot control.
-        // 20s gives comfortable headroom above the ~12s connect() worst case.
-        // Worst case per startBtConnection now: 1 connect() attempt (~12s timeout
-        // when device out of range) + optionally 1 probe retry (~2.5s).
-        // No more nested connect() retries — the outer reconnect loop handles
-        // retrying entirely, every BT_RECONNECT_INTERVAL_MS.
-        // 12s + 2.5s + margin → 18s covers it comfortably.
+        // Deve superar o pior caso: timeout do BluetoothSocket.connect() (~12s) é um
+        // timeout do sistema Android, fora do nosso controle. Pior caso por tentativa:
+        // 1 connect() (~12s) + 1 retry de probe (~2.5s) = ~14.5s → 18s com margem.
         private const val BT_ATTEMPT_SETTLE_MS     = 18000L
-        // Polling interval while waiting for an attempt to settle.
-        // Small enough to react quickly when reconnect succeeds,
-        // large enough to not busy-loop.
+        // Intervalo de polling: pequeno o suficiente para reagir rápido, grande o suficiente para não ser busy-loop.
         private const val BT_POLL_INTERVAL_MS      = 500L
 
         // USB — abrir a porta é rápido (sem handshake de pareamento/timeout como

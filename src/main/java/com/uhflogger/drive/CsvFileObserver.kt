@@ -7,9 +7,9 @@ import com.uhflogger.CsvExporter
 import java.io.File
 
 /**
- * Watches the app's CSV folder for new files.
- * When a CSV file is fully written (CLOSE_WRITE event), enqueues it for Drive upload.
- * Uses CLOSE_WRITE (not CREATE) to ensure the file is complete before uploading.
+ * Monitora a pasta de CSVs do app em busca de novos arquivos.
+ * Ao detectar o evento CLOSE_WRITE (arquivo completamente gravado), enfileira para upload no Drive.
+ * Usa CLOSE_WRITE (não CREATE) para garantir que o arquivo está completo antes do upload.
  */
 class CsvFileObserver(
     private val context: Context,

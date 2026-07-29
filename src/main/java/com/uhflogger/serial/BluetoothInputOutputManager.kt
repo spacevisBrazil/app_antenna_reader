@@ -4,11 +4,11 @@ import android.util.Log
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Replicates the behavior of SerialInputOutputManager but for Bluetooth streams.
- * Runs a blocking read loop on a dedicated thread, calling onNewData() when
- * data arrives — exactly the same contract as SerialInputOutputManager.Listener.
+ * Equivalente ao SerialInputOutputManager para streams Bluetooth.
+ * Executa um loop de leitura bloqueante em thread dedicada, chamando onNewData() quando
+ * dados chegam — mesmo contrato do SerialInputOutputManager.Listener.
  *
- * Usage:
+ * Uso:
  *   val manager = BluetoothInputOutputManager(btPort, listener)
  *   Executors.newSingleThreadExecutor().submit(manager)
  *   ...
@@ -29,8 +29,8 @@ class BluetoothInputOutputManager(
 
     companion object {
         private const val TAG          = "BtIOManager"
-        private const val READ_TIMEOUT  = 200   // ms per read attempt
-        private const val IDLE_SLEEP_MS = 20L   // yield when no data — prevents busy-loop
+        private const val READ_TIMEOUT  = 200   // ms por tentativa de leitura
+        private const val IDLE_SLEEP_MS = 20L   // yield quando sem dados — evita busy-loop
     }
 
     fun stop() {
@@ -42,7 +42,7 @@ class BluetoothInputOutputManager(
         try {
             while (running.get()) {
                 val n = try {
-                    port.read(buf, 0)  // blocking — returns when data arrives or throws on disconnect
+                    port.read(buf, 0)  // bloqueante — retorna quando há dados ou lança ao desconectar
                 } catch (e: Exception) {
                     if (running.get()) {
                         Log.e(TAG, "Read error (disconnect detected): ${e.message}")
@@ -53,7 +53,7 @@ class BluetoothInputOutputManager(
                 if (n > 0) {
                     listener.onNewData(buf.copyOf(n))
                 } else if (n < 0) {
-                    // stream.read() returns -1 on end-of-stream (clean disconnect)
+                    // stream.read() retorna -1 no fim do stream (desconexão limpa)
                     Log.w(TAG, "BT stream ended (read returned -1)")
                     if (running.get()) listener.onRunError(java.io.IOException("BT stream closed"))
                     break

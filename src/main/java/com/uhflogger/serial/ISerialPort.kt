@@ -1,30 +1,30 @@
 package com.uhflogger.serial
 
 /**
- * Abstraction over a serial communication channel.
- * Implemented by UsbSerialPortWrapper (USB) and BluetoothSerialPort (BT RFCOMM).
- * Allows UHFReaderService to work with both transports without changes to protocol logic.
+ * Abstração sobre um canal de comunicação serial.
+ * Implementada por UsbSerialPortWrapper (USB) e BluetoothSerialPort (BT RFCOMM).
+ * Permite que UHFReaderService trabalhe com ambos os transportes sem alterar a lógica de protocolo.
  */
 interface ISerialPort {
-    /** Write bytes to the port. Returns number of bytes written. */
+    /** Escreve bytes na porta. Retorna o número de bytes escritos. */
     fun write(data: ByteArray, timeout: Int): Int
 
-    /** Read bytes from the port into buf. Returns number of bytes read. */
+    /** Lê bytes da porta para buf. Retorna o número de bytes lidos. */
     fun read(buf: ByteArray, timeout: Int): Int
 
-    /** Close the port and release resources. */
+    /** Fecha a porta e libera recursos. */
     fun close()
 
     /**
-     * Purge hardware buffers.
-     * USB: delegates to UsbSerialPort.purgeHwBuffers().
-     * Bluetooth: clears the internal read buffer (no-op for output).
+     * Limpa buffers de hardware.
+     * USB: delega para UsbSerialPort.purgeHwBuffers().
+     * Bluetooth: limpa o buffer de leitura interno (sem efeito no output).
      */
     fun purgeHwBuffers(input: Boolean, output: Boolean)
 
-    /** True if the port is currently open and connected. */
+    /** True se a porta está aberta e conectada. */
     val isConnected: Boolean
 
-    /** Human-readable name for logging (e.g. "USB:/dev/bus/usb/..." or "BT:Winnix_BT") */
+    /** Nome legível para logs (ex: "USB:/dev/bus/usb/..." ou "BT:Winnix_BT") */
     val portName: String
 }

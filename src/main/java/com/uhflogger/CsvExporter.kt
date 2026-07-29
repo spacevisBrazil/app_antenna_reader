@@ -14,18 +14,17 @@ object CsvExporter {
     private var sessionWriter   : BufferedWriter? = null
     private var sessionFile     : String?         = null
     private var sessionFilePath : String?         = null
-    // Last tag held in memory (not yet serialized) — flushed with temperature
-    // applied when session finalizes. Guardar o TagRecord em vez da linha CSV
-    // já pronta evita depender de qual coluna é "a última" (era uma pegadinha:
-    // o código antigo concatenava ",$stopTemperature" no fim da string, o que
-    // quebraria assim que qualquer coluna fosse adicionada depois de Temperature).
+    // Última tag mantida em memória (ainda não serializada) — gravada com temperatura aplicada
+    // ao finalizar a sessão. Guardar o TagRecord em vez da linha CSV já pronta evita depender
+    // de qual coluna é "a última" (o código antigo concatenava ",$stopTemperature" no fim da
+    // string, o que quebrava ao adicionar colunas depois de Temperature).
     private var pendingLastTag  : TagRecord?       = null
 
     /**
-     * prefix: "jietong" or "winnix" — used in filename.
-     * Files saved to: /sdcard/Android/data/com.uhflogger/files/csv/
-     * No storage permission needed (scoped storage, Android 10+).
-     * FileObserver watches this folder and triggers Drive upload automatically.
+     * prefix: identificador usado no nome do arquivo (ex: MAC do BT sem ":", ou nome do dispositivo).
+     * Arquivos salvos em: /sdcard/Android/data/com.uhflogger/files/csv/
+     * Não requer permissão de armazenamento (scoped storage, Android 10+).
+     * O FileObserver monitora esta pasta e dispara o upload para o Drive automaticamente.
      */
     fun startSession(context: Context, prefix: String = "rfid"): String? {
         closeWriter()
@@ -75,15 +74,15 @@ object CsvExporter {
     }
 
     /**
-     * Finalize session and signal file is ready for Drive upload.
-     * If stopTemperature is provided (Winnix only), it is applied to the last tag line.
+     * Finaliza a sessão e sinaliza que o arquivo está pronto para upload no Drive.
+     * Se stopTemperature for fornecida (apenas Winnix), é aplicada à última linha de tag.
      */
     fun finalizeSession(tags: List<TagRecord>, stopTemperature: String = ""): String? {
         val writer = sessionWriter
         if (writer != null) {
             try {
                 if (tags.isEmpty()) {
-                    // Final batch is empty — apply temperature to the pendingLastTag if available
+                    // Lote final vazio — aplica temperatura à pendingLastTag, se houver
                     val pending = pendingLastTag
                     val record = if (stopTemperature.isNotEmpty() && pending != null)
                         pending.copy(temperature = stopTemperature)
@@ -92,7 +91,7 @@ object CsvExporter {
                     record?.let { writer.write(it.toCsvLine()); writer.newLine() }
                     pendingLastTag = null
                 } else {
-                    // Flush pending tag without temperature (not the last tag overall)
+                    // Grava pendingLastTag sem temperatura (não é a última tag da sessão)
                     pendingLastTag?.let { writer.write(it.toCsvLine()); writer.newLine() }
                     pendingLastTag = null
 
@@ -101,7 +100,7 @@ object CsvExporter {
                         writer.newLine()
                     }
 
-                    // Last tag — apply stop temperature if provided
+                    // Última tag — aplica temperatura de encerramento, se fornecida
                     val lastTag = if (stopTemperature.isNotEmpty())
                         tags.last().copy(temperature = stopTemperature)
                     else
@@ -123,7 +122,7 @@ object CsvExporter {
 
     fun cancelSession() = closeWriter()
 
-    /** Returns (and creates if needed) the folder where CSV files are stored */
+    /** Retorna (e cria se necessário) a pasta onde os arquivos CSV são armazenados */
     fun getCsvFolder(context: Context): File {
         val dir = File(context.getExternalFilesDir(null), "csv")
         if (!dir.exists()) dir.mkdirs()

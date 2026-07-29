@@ -3,22 +3,22 @@ package com.uhflogger.decoder
 import com.uhflogger.model.TagRecord
 
 /**
- * Decoder for Winnix/RealID HYM750E protocol.
+ * Decoder para o protocolo Winnix/RealID HYM750E.
  *
- * Frame structure:
- *   [0-1] 0xA5 0x5A  header
- *   [2-3] Length      big-endian, total frame size (self-describing)
+ * Estrutura do frame:
+ *   [0-1] 0xA5 0x5A  cabeçalho
+ *   [2-3] Length      big-endian, tamanho total do frame
  *   [4]   Command     0x83 = Continue Inventory Response
  *   [5..N-3] Data
- *   [N-2] Check      XOR of bytes[2..N-3] (Length+Command+Data, no header)
+ *   [N-2] Check      XOR dos bytes[2..N-3] (Length+Command+Data, sem cabeçalho)
  *   [N-1] 0x0D
  *   [N]   0x0A
  *
- * Inventory response data (0x83):
- *   PC(2) + EPC(n) + RSSI(2, signed int16 / 10.0 = dBm) + AntNum(1) + [Freq(3)]
+ * Dados da resposta de inventário (0x83):
+ *   PC(2) + EPC(n) + RSSI(2, int16 com sinal / 10.0 = dBm) + AntNum(1) + [Freq(3)]
  *
- * Frame builder:
- *   BCC = XOR of (Length bytes + Command + Data), NOT including header 0xA5 0x5A
+ * Cálculo do BCC:
+ *   XOR de (bytes de Length + Command + Data), NÃO inclui o cabeçalho 0xA5 0x5A
  */
 class WinnixProtocolDecoder {
 
@@ -37,7 +37,7 @@ class WinnixProtocolDecoder {
         for (b in data) accumulator.addLast(b)
 
         while (accumulator.size >= 8) {
-            // Find header 0xA5 0x5A
+            // Localiza cabeçalho 0xA5 0x5A
             val startIdx = findHeader()
             if (startIdx < 0) {
                 val last = accumulator.last()
@@ -55,7 +55,7 @@ class WinnixProtocolDecoder {
 
             val packet = ByteArray(length) { accumulator.removeFirst() }
 
-            // Only process inventory responses (0x83)
+            // Processa apenas respostas de inventário (0x83)
             if (packet[4].toInt() and 0xFF != 0x83) continue
 
             val tag = decodeTag(packet, latitude, longitude, bearing, gnssSpeed, locationTimestamp, locationProvider)
@@ -86,11 +86,11 @@ class WinnixProtocolDecoder {
         locationProvider : String = ""
     ): TagRecord? {
         return try {
-            // data = packet[5..-3] (strip header(2)+length(2)+cmd(1) at start, check(1)+end(2) at end)
+            // data = packet[5..-3] (remove cabeçalho(2)+length(2)+cmd(1) no início, check(1)+fim(2) no final)
             val data = packet.copyOfRange(5, packet.size - 3)
             if (data.size < 5) return null
 
-            // PC word — high 5 bits × 2 = EPC length in bytes
+            // PC word — 5 bits altos × 2 = comprimento do EPC em bytes
             val pc      = ((data[0].toInt() and 0xFF) shl 8) or (data[1].toInt() and 0xFF)
             val epcLen  = ((pc shr 11) and 0x1F) * 2
             if (data.size < 2 + epcLen + 3) return null
@@ -98,11 +98,11 @@ class WinnixProtocolDecoder {
             val epc     = data.copyOfRange(2, 2 + epcLen)
                 .joinToString("") { "%02X".format(it) }
 
-            // RSSI: signed 16-bit big-endian, value = raw / 10 dBm
+            // RSSI: int16 com sinal big-endian, valor = raw / 10 dBm
             val rssiRaw = ((data[2 + epcLen].toInt() and 0xFF) shl 8) or
                     (data[2 + epcLen + 1].toInt() and 0xFF)
             val rssiSigned = if (rssiRaw > 32767) rssiRaw - 65536 else rssiRaw
-            val rssi    = (rssiSigned / 10.0).toInt()  // cast to Int, 0.1 dBm precision loss accepted
+            val rssi    = (rssiSigned / 10.0).toInt()
 
             val antenna = data[2 + epcLen + 2].toInt() and 0xFF
 
