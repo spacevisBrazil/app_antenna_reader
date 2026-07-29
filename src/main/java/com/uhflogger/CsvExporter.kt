@@ -21,10 +21,6 @@ object CsvExporter {
     // quebraria assim que qualquer coluna fosse adicionada depois de Temperature).
     private var pendingLastTag  : TagRecord?       = null
 
-    // -------------------------------------------------------------------------
-    // Session API
-    // -------------------------------------------------------------------------
-
     /**
      * prefix: "jietong" or "winnix" — used in filename.
      * Files saved to: /sdcard/Android/data/com.uhflogger/files/csv/
@@ -61,12 +57,10 @@ object CsvExporter {
         if (tags.isEmpty()) return true
         val writer = sessionWriter ?: return false.also { Log.e(TAG, "No active session") }
         return try {
-            // Flush any previously held last tag before writing new tags
             pendingLastTag?.let { writer.write(it.toCsvLine()); writer.newLine() }
             pendingLastTag = null
 
-            // Write all but the last tag immediately
-            // Hold the last tag as pendingLastTag so temperature can be applied later
+            // Retém a última tag para que a temperatura possa ser aplicada depois
             for (i in 0 until tags.size - 1) {
                 writer.write(tags[i].toCsvLine())
                 writer.newLine()
@@ -102,7 +96,6 @@ object CsvExporter {
                     pendingLastTag?.let { writer.write(it.toCsvLine()); writer.newLine() }
                     pendingLastTag = null
 
-                    // Write all but last of the final batch
                     for (i in 0 until tags.size - 1) {
                         writer.write(tags[i].toCsvLine())
                         writer.newLine()
@@ -129,10 +122,6 @@ object CsvExporter {
     }
 
     fun cancelSession() = closeWriter()
-
-    // -------------------------------------------------------------------------
-    // Helpers
-    // -------------------------------------------------------------------------
 
     /** Returns (and creates if needed) the folder where CSV files are stored */
     fun getCsvFolder(context: Context): File {

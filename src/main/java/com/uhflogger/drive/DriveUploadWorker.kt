@@ -12,11 +12,9 @@ class DriveUploadWorker(
 ) : Worker(context, workerParams) {
 
     override fun doWork(): Result {
-        // Process-wide lock — absolute guarantee that only one upload pass
-        // runs at a time, regardless of how many WorkManager workers were triggered.
-        // This is the real fix for duplicate folders/files: even if WorkManager
-        // schedules a one-time AND a periodic worker at the same instant,
-        // only one enters this block at a time.
+        // Trava de processo — garante que apenas um upload rode por vez,
+        // independentemente de quantos workers o WorkManager tiver acionado.
+        // Previne duplicatas de arquivos no Drive mesmo com workers concorrentes.
         synchronized(UPLOAD_LOCK) {
             return doUploadPass()
         }
@@ -52,7 +50,8 @@ class DriveUploadWorker(
             try {
                 val driveFileId = DriveHelper.uploadCsv(context, drive, file)
 
-                // Save driveFileId SYNCHRONOUSLY before deleting local file
+                // Persiste o driveFileId antes de apagar o arquivo local —
+                // garante que um crash entre os dois passos não perca o registro do upload.
                 UploadQueueDatabase.get(context).dao().setDriveFileId(entry.id, driveFileId)
 
                 file.delete()
@@ -82,16 +81,13 @@ class DriveUploadWorker(
 
     companion object {
         private const val TAG       = "DriveUploadWorker"
-        // Single shared work name — ensures WorkManager NEVER runs two
-        // upload workers concurrently, regardless of trigger source
-        // (manual scheduleNow, periodic check, or network reconnect).
+        // Nome único compartilhado — garante que o WorkManager nunca rode dois
+        // workers de upload ao mesmo tempo, independente da origem do disparo.
         const val WORK_NAME = "drive_upload_serial"
 
         /**
-         * Schedule a one-time upload — called immediately when a new CSV is created
-         * or when network connectivity is restored.
-         * Uses the SAME unique work name as schedulePeriodic to guarantee
-         * only one upload worker ever runs at a time.
+         * Agenda um upload imediato — chamado quando um novo CSV é criado
+         * ou quando a conectividade de rede é restaurada.
          */
         fun scheduleNow(context: Context) {
             val request = OneTimeWorkRequestBuilder<DriveUploadWorker>()
@@ -112,10 +108,8 @@ class DriveUploadWorker(
         }
 
         /**
-         * Schedule a periodic check every 15 minutes — catches any missed files.
-         * Uses a SEPARATE periodic chain, but doWork() itself is protected by
-         * a process-wide lock (see UPLOAD_LOCK) so it never overlaps with
-         * a one-time scheduleNow() execution.
+         * Agenda uma verificação periódica a cada 15 minutos — captura arquivos
+         * que possam ter ficado pendentes entre uploads imediatos.
          */
         fun schedulePeriodic(context: Context) {
             val request = PeriodicWorkRequestBuilder<DriveUploadWorker>(15, TimeUnit.MINUTES)
@@ -137,9 +131,9 @@ class DriveUploadWorker(
 
         private const val WORK_NAME_PERIODIC = "drive_upload_periodic"
 
-        // Process-wide lock — guarantees doWork() body never runs concurrently
-        // even if WorkManager somehow schedules two workers at the same instant
-        // (different unique-work chains: one-time vs periodic).
+        // Trava de processo — garante que o corpo do doWork() nunca rode concorrentemente,
+        // mesmo que o WorkManager agende dois workers ao mesmo instante
+        // (cadeias distintas: one-time vs periodic).
         val UPLOAD_LOCK = Any()
     }
 }

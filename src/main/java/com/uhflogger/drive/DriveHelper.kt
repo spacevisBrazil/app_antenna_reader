@@ -98,7 +98,6 @@ object DriveHelper {
                 p.edit().putString(KEY_ROOT_ID, it).apply()
             }
 
-        // Get or create device subfolder using user-configured device name
         val deviceId = findOrCreateFolder(drive, getDeviceName(context), rootId).also {
             p.edit().putString(KEY_DEVICE_ID, it).apply()
         }
@@ -123,7 +122,6 @@ object DriveHelper {
     }
 
     private fun findOrCreateFolder(drive: Drive, name: String, parentId: String): String {
-        // Search for existing folder
         val query = "name='$name' and mimeType='application/vnd.google-apps.folder' " +
                 "and '$parentId' in parents and trashed=false"
         val result = drive.files().list()
@@ -133,7 +131,6 @@ object DriveHelper {
 
         result.files.firstOrNull()?.id?.let { return it }
 
-        // Create if not found
         val metadata = DriveFile().apply {
             this.name    = name
             mimeType     = "application/vnd.google-apps.folder"
@@ -151,10 +148,6 @@ object DriveHelper {
 
     // ─── Upload ───────────────────────────────────────────────────────────────
 
-    /**
-     * Uploads a CSV file to the device folder on Google Drive.
-     * Returns the Drive file ID on success, throws on failure.
-     */
     /**
      * Checks if a file with the given name already exists in the device folder.
      * Returns the existing file ID, or null if not found.
@@ -177,8 +170,11 @@ object DriveHelper {
     // the other's in-flight upload) and both creating the file in Drive.
     private val uploadLock = Any()
 
+    /**
+     * Envia um arquivo CSV para a pasta do dispositivo no Google Drive.
+     * Retorna o ID do arquivo no Drive em caso de sucesso; lança exceção em caso de falha.
+     */
     fun uploadCsv(context: Context, drive: Drive, localFile: File): String = synchronized(uploadLock) {
-        // Check if file already exists in Drive (handles retry duplicates)
         val existing = findExistingFile(drive, context, localFile.name)
         if (existing != null) {
             Log.i(TAG, "Skipping upload — file already in Drive: ${localFile.name}")

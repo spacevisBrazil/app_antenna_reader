@@ -435,7 +435,7 @@ class UHFReaderService : Service(), SensorEventListener {
     private var autoSaveMode       : Int  = SettingsManager.DEFAULT_AUTO_SAVE_MODE
     private var autoSaveExecutor   : ScheduledExecutorService? = null
     private var autoSaveTimerJob   : ScheduledFuture<*>? = null
-    // Tags accumulated since the last auto-save — resets after each save (req 1)
+    // Tags acumuladas desde o último auto-save — reinicia após cada gravação
     private val tagsSinceLastSave  = AtomicInteger(0)
 
     private var appContext: Context? = null
@@ -830,9 +830,6 @@ class UHFReaderService : Service(), SensorEventListener {
      *   próximo onCreate() retome sozinho.
      */
     fun stopCapture(userInitiated: Boolean = true) {
-        // Handle two cases:
-        // 1. Actively capturing (isRunning=true) — normal stop
-        // 2. Paused with BT reconnect loop running (isRunning=false, isPaused=true) — stop loop + finalize
         val wasRunning = isRunning.compareAndSet(true, false)
         val wasPaused  = isPausedState.get()
         if (!wasRunning && !wasPaused) return
@@ -855,10 +852,8 @@ class UHFReaderService : Service(), SensorEventListener {
         }
 
         stopExecutor.submit {
-            // 1. Para o inventário
             sendWinnixStop()
 
-            // 2. Para o btIoManager via flag, lê temperatura, depois fecha porta
             val localBtIo = btIoManager
             val localIo   = ioManager
             btIoManager = null
@@ -875,7 +870,6 @@ class UHFReaderService : Service(), SensorEventListener {
                 if (port != null) winnixReadTemperatureBt(port) else ""
             } else ""
 
-            // 4. Para IOManagers e fecha porta
             if (localBtIo != null) {
                 closePort()        // interrompe stream.read() bloqueante → btIoManager sai via IOException
                 localBtIo.stop()   // garante flag running=false
@@ -1631,19 +1625,19 @@ class UHFReaderService : Service(), SensorEventListener {
         val batch = mutableListOf<TagRecord>()
         while (tagBuffer.isNotEmpty()) tagBuffer.poll()?.let { batch.add(it) }
 
-        // Req 4: skip if no new tags to save
+        // Sem tags novas a gravar
         if (batch.isEmpty()) {
             Log.d(TAG, "Auto-save skipped — no new tags")
             return
         }
 
-        // Reset the per-save counter (Req 1: resets the other counter)
+        // Reinicia o contador de tags por intervalo
         tagsSinceLastSave.set(0)
 
         val ctx = appContext ?: return
 
         if (autoSaveMode == SettingsManager.AUTO_SAVE_MODE_NEW_FILE) {
-            // Req 2: new file mode — finalize current session and start a new one
+            // Modo arquivo novo: encerra a sessão atual e abre uma nova
             val fileName = CsvExporter.finalizeSession(batch)
             Log.i(TAG, "Auto-save (new file): $fileName — ${batch.size} tags")
             // Start a new session for the next batch
@@ -1653,7 +1647,7 @@ class UHFReaderService : Service(), SensorEventListener {
             updateNotification("Capturando… (${totalCount.get()} tags)")
             onAutoSaved?.invoke(totalCount.get())
         } else {
-            // Req 2: append mode — default, existing behavior
+            // Modo append: acrescenta ao arquivo corrente (padrão)
             val ok = CsvExporter.appendTags(batch)
             if (ok) {
                 Log.i(TAG, "Auto-save (append): ${batch.size} tags, total: ${totalCount.get()}")
@@ -1671,7 +1665,7 @@ class UHFReaderService : Service(), SensorEventListener {
         val lastBatch = mutableListOf<TagRecord>()
         while (tagBuffer.isNotEmpty()) tagBuffer.poll()?.let { lastBatch.add(it) }
 
-        // Req 4: if no tags at all this session, cancel — don't create empty CSV
+        // Nenhuma tag lida — cancela sem criar CSV vazio
         if (totalCount.get() == 0 && lastBatch.isEmpty()) {
             Log.i(TAG, "Session cancelled — no tags read")
             CsvExporter.cancelSession()

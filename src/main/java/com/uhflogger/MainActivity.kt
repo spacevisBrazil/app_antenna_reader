@@ -33,9 +33,6 @@ import com.uhflogger.SettingsActivity
 import com.uhflogger.drive.DriveHelper
 import com.uhflogger.drive.DriveMonitorService
 
-// NOTA: GNSS e bússola foram movidos para dentro do UHFReaderService (foreground
-// service). Antes viviam aqui na Activity e travavam sempre que a tela apagava
-// ou o app ia para background — a MainActivity só cuida de UI/permissões agora.
 class MainActivity : AppCompatActivity() {
 
     companion object {
@@ -396,9 +393,6 @@ class MainActivity : AppCompatActivity() {
             readerService?.saveAfterError()
         } else {
             readerService?.stopCapture()
-            // stopCapture runs on background thread
-            // UI update (setCapturingState) comes via onStatusChanged callback
-            // Toast comes via onStopComplete callback
         }
     }
 
@@ -425,11 +419,9 @@ class MainActivity : AppCompatActivity() {
         val usbManager = getSystemService(USB_SERVICE) as UsbManager
         val drivers    = UsbSerialProber.getDefaultProber().findAllDrivers(usbManager)
 
-        // Build device name list: USB devices first, then BT if paired
         val deviceNames = mutableListOf<String>()
         val labels      = mutableListOf<String>()
 
-        // USB devices
         for (driver in drivers) {
             val dev = driver.device
             val vid = dev.vendorId.toString(16).uppercase().padStart(4, '0')
@@ -480,7 +472,6 @@ class MainActivity : AppCompatActivity() {
         binding.spinnerDevices.setBackgroundResource(R.drawable.bg_spinner_white)
         binding.spinnerDevices.tag = if (deviceNames.isEmpty()) null else deviceNames[0]
 
-        // Keep spinner selection in sync with deviceNames list
         binding.spinnerDevices.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
             override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: android.view.View?, pos: Int, id: Long) {
                 binding.spinnerDevices.tag = deviceNames.getOrNull(pos)
@@ -532,7 +523,6 @@ class MainActivity : AppCompatActivity() {
         updateButtonColors()
     }
 
-    /** Cores sempre derivadas do isEnabled — fonte única de verdade */
     private fun updateButtonColors() {
         binding.btnStart.backgroundTintList = android.content.res.ColorStateList.valueOf(
             if (binding.btnStart.isEnabled) 0xFF2E7D32.toInt() else 0xFFA5D6A7.toInt()
