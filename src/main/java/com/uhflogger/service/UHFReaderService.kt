@@ -101,6 +101,22 @@ class UHFReaderService : Service(), SensorEventListener {
 
     private val locationListener = object : LocationListener {
         override fun onLocationChanged(location: Location) {
+            // Speed e bearing via Doppler são extraídos de TODO fix entrante,
+            // independente de a posição ser aceita ou não pelo isBetterLocation.
+            // Doppler (variação de frequência) é calculado pelo chip separadamente
+            // do pseudorange (posição) — permanece confiável mesmo quando o fix
+            // tem acurácia degradada (ex: multipath de telhado metálico entrega
+            // 25m de erro de posição mas Doppler de velocidade ainda é preciso).
+            // Sem essa extração antecipada, speed e bearing ficavam congelados
+            // durante qualquer janela de rejeição de fix por acurácia.
+            // Nota: bearingSourceIsGnss (histerese) só é atualizado em
+            // applyLocation() — a flag não muda para fixes rejeitados, apenas os
+            // valores brutos são pré-populados aqui.
+            if (location.hasSpeed()) currentGnssSpeed = location.speed
+            if (location.hasBearing() && location.hasSpeed()
+                    && location.speed > BEARING_SPEED_HIGH_MS) {
+                currentGnssBearing = location.bearing
+            }
             val accepted = isBetterLocation(location, currentLocation)
             // Log de diagnóstico: mostra TODA chegada de fix, aceito ou não, com
             // motivo. Sem isso, não dá pra distinguir "Android nunca entregou
@@ -108,9 +124,10 @@ class UHFReaderService : Service(), SensorEventListener {
             // parecem iguais de fora (CSV vazio), mas são causas bem diferentes.
             Log.i(TAG, "LOCATION_RX: provider=${location.provider} " +
                     "accuracy=${if (location.hasAccuracy()) "%.1f".format(java.util.Locale.US, location.accuracy) else "n/a"}m " +
+                    "speed=${if (location.hasSpeed()) "%.1f".format(java.util.Locale.US, location.speed) else "n/a"}m/s " +
                     "age=${System.currentTimeMillis() - location.time}ms " +
                     "aceito=$accepted" +
-                    (if (!accepted) " (motivo provável: fix mais velho que o atual, degradou demais um fix já bom, ou provider pior que o atual)" else ""))
+                    (if (!accepted) " (motivo: degradou demais fix bom, provider pior, fix velho, ou acima do teto absoluto em movimento)" else ""))
             if (accepted) applyLocation(location)
         }
         override fun onProviderEnabled(provider: String)  {
@@ -176,7 +193,15 @@ class UHFReaderService : Service(), SensorEventListener {
         // QUALQUER fix disponível (ex: só NETWORK_PROVIDER funcionando, com erro
         // de centenas de metros, dentro de um galpão sem GNSS).
         if (current == null) return true
-        if (now - current.time > GPS_MAX_LOCATION_AGE_MS) return true
+        // Regra 3: fix em cache expirou — force-aceita qualquer coisa para não
+        // manter uma posição velha indefinidamente. Checa nos dois domínios de
+        // relógio possíveis: current.time (relógio interno do chip GNSS) e
+        // currentLocationTimeMs (System.currentTimeMillis() gravado no momento
+        // do aceite, mesmo domínio dos timestamps do CSV e dos EPCs). O chip
+        // GNSS pode divergir centenas de ms do relógio do Android — o OR garante
+        // que o timeout de 30s dispara corretamente independente de qualquer deriva.
+        if (now - current.time > GPS_MAX_LOCATION_AGE_MS ||
+                now - currentLocationTimeMs > GPS_MAX_LOCATION_AGE_MS) return true
         val newIsGps     = newLoc.provider == LocationManager.GPS_PROVIDER
         val currentIsGps = current.provider == LocationManager.GPS_PROVIDER
         if (newIsGps && !currentIsGps) return true
@@ -189,7 +214,24 @@ class UHFReaderService : Service(), SensorEventListener {
         // primeiro fix ruim aceito ficava "preso" mesmo quando fixes bem
         // melhores (mas ainda acima de 50m) chegavam depois.
         return if (current.accuracy <= GPS_MAX_ACCURACY_M) {
-            newLoc.accuracy <= current.accuracy * GPS_ACCURACY_DEGRADE_FACTOR
+            // Caminho 1 — relativo (comportamento original, inalterado):
+            // aceita se o novo fix não for muito pior que o atual (fator 3×).
+            val passesRelative = newLoc.accuracy <= current.accuracy * GPS_ACCURACY_DEGRADE_FACTOR
+            // Caminho 2 — absoluto confirmado por Doppler:
+            // aceita se o fix entrante indica via Doppler que estamos em
+            // movimento E a acurácia está dentro do teto absoluto. Resolve o
+            // "fix-âncora": parado 5 min → fix de 3m → threshold relativo = 9m
+            // → multipath de telhado metálico (20-30m) rejeitado em cadeia.
+            // Usa newLoc.speed (Doppler do fix ENTRANTE) em vez de
+            // currentGnssSpeed (cache do último aceito) para evitar dependência
+            // circular — se a posição estiver congelando, o cache de speed
+            // também estaria, mas o Doppler do fix entrante reflete estado atual.
+            // Nenhum dos dois caminhos aceita tudo sozinho: o caminho 2 exige
+            // confirmação de movimento via Doppler E acurácia dentro do teto.
+            val incomingSpeed = if (newLoc.hasSpeed()) newLoc.speed else 0f
+            val passesAbsolute = incomingSpeed > BEARING_SPEED_HIGH_MS
+                    && newLoc.accuracy <= GPS_MOVING_ABSOLUTE_MAX_M
+            passesRelative || passesAbsolute
         } else {
             newLoc.accuracy <= current.accuracy
         }
@@ -1725,6 +1767,14 @@ class UHFReaderService : Service(), SensorEventListener {
         // total (galpão fechado etc), isso aqui só evita descartar degradação
         // razoável de sinal em movimento.
         private const val GPS_ACCURACY_DEGRADE_FACTOR = 3.0f
+        // Teto absoluto de acurácia aceito quando o fix entrante confirma via
+        // Doppler que estamos em movimento — segundo caminho de aceitação em
+        // isBetterLocation(), paralelo ao relativo. Evita o "fix-âncora" (fix
+        // muito bom obtido parado bloqueando updates degradados por multipath)
+        // sem abrir para fixes ruins (>30m ainda são rejeitados mesmo em movimento).
+        // Valor de partida conservador — ajustar para 35m se dados de campo
+        // mostrarem multipath de telhado metálico excedendo 30m com frequência.
+        private const val GPS_MOVING_ABSOLUTE_MAX_M = 30f
 
         // Bearing híbrido — histerese pra não trocar de fonte a cada oscilação
         // de velocidade perto do limiar (ex: reduzindo numa curva).
