@@ -36,8 +36,9 @@ import com.uhflogger.drive.DriveMonitorService
 class MainActivity : AppCompatActivity() {
 
     companion object {
-        private const val REQ_LOCATION       = 101
-        private const val REQ_BT_PERMISSION  = 102
+        private const val REQ_LOCATION            = 101
+        private const val REQ_BT_PERMISSION       = 102
+        private const val REQ_BACKGROUND_LOCATION = 103
         // Bem acima do pior caso observado de conexão (BT connect() ~12s) —
         // só reabilita o botão se a captura genuinamente não tiver começado.
         private const val START_BUTTON_SAFETY_TIMEOUT_MS = 15_000L
@@ -280,8 +281,12 @@ class MainActivity : AppCompatActivity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_BACKGROUND_LOCATION)
             != PackageManager.PERMISSION_GRANTED) {
+            // REQ_BACKGROUND_LOCATION — código diferente de REQ_LOCATION para
+            // evitar recursão infinita: onRequestPermissionsResult chama
+            // requestBackgroundLocationIfNeeded() só para REQ_LOCATION, então
+            // o resultado desta requisição não gera nova chamada em loop.
             ActivityCompat.requestPermissions(
-                this, arrayOf(Manifest.permission.ACCESS_BACKGROUND_LOCATION), REQ_LOCATION
+                this, arrayOf(Manifest.permission.ACCESS_BACKGROUND_LOCATION), REQ_BACKGROUND_LOCATION
             )
         }
     }
