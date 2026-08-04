@@ -59,7 +59,12 @@ object BackendApi {
     ): Response {
         var conn: HttpURLConnection? = null
         return try {
-            conn = (URL(url).openConnection() as HttpURLConnection).apply {
+            // `open` é val NÃO-nulo de propósito: `conn` existe só pra o finally
+            // fechar a conexão, e usar uma var nullable no corpo depende de smart
+            // cast pra compilar — foi exatamente esse tipo de dependência que
+            // quebrou o build em DeviceAuthManager.refresh (548b805). Com o val,
+            // não há o que inferir.
+            val open = (URL(url).openConnection() as HttpURLConnection).apply {
                 requestMethod  = method
                 connectTimeout = CONNECT_TIMEOUT_MS
                 readTimeout    = READ_TIMEOUT_MS
@@ -70,15 +75,16 @@ object BackendApi {
                     setRequestProperty("Content-Type", "application/json; charset=utf-8")
                 }
             }
+            conn = open
 
             if (body != null) {
-                conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+                open.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
             }
 
-            val status = conn.responseCode
+            val status = open.responseCode
             // errorStream nos status de erro: o corpo do erro carrega o `i18n`
             // que diferencia "chave inativa" de "captura não encontrada".
-            val stream = if (status in 200..299) conn.inputStream else conn.errorStream
+            val stream = if (status in 200..299) open.inputStream else open.errorStream
             val text = stream?.bufferedReader()?.use(BufferedReader::readText).orEmpty()
 
             if (status !in 200..299) {

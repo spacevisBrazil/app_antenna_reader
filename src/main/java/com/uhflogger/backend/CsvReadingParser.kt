@@ -62,17 +62,30 @@ object CsvReadingParser {
                 putOrNull("longitude", parts.getOrNull(5)?.trim()?.toDoubleOrNull())
                 putOrNull("compass_bearing", parts.getOrNull(6)?.trim()?.toDoubleOrNull())
                 putOrNull("temperature", parts.getOrNull(7)?.trim()?.toDoubleOrNull())
-                // Colunas 8-10 (GNSS Speed, Location Timestamp, Location Provider)
-                // existem no CSV mas NÃO são enviadas: `antenna_reading_raw` não
-                // tem onde guardá-las hoje, e inventar um destino (concatenar em
-                // outro campo, por exemplo) corromperia a evidência bruta, que é
-                // justamente o que a tabela existe pra preservar. Ficam no CSV —
-                // que continua indo pro Drive — até o backend ganhar as colunas.
+                // GPS por leitura (colunas 8-10). O instante do FIX é gravado
+                // como epoch pelo app; vai como ISO porque a coluna no servidor
+                // é timestamptz. Ele NÃO é o mesmo que `read_at` de propósito:
+                // um fix velho posiciona a tag onde o veículo esteve, e só dá
+                // pra perceber isso comparando os dois.
+                putOrNull("gnss_speed", parts.getOrNull(8)?.trim()?.toDoubleOrNull())
+                putOrNull("location_captured_at", isoFromEpoch(parts.getOrNull(9)))
+                putOrNull("location_provider", parts.getOrNull(10)?.trim()?.ifEmpty { null })
             }
         } catch (e: Exception) {
             Log.w(TAG, "Linha $lineIndex de $sourceFile ignorada: ${e.message}")
             null
         }
+    }
+
+    /**
+     * Coluna "Location Timestamp" — epoch em milissegundos, vazia quando não há
+     * fix. Fora do formato, devolve null: melhor a coluna vazia do que uma data
+     * inventada num registro que serve de prova do que aconteceu em campo.
+     */
+    private fun isoFromEpoch(value: String?): String? {
+        val millis = value?.trim()?.toLongOrNull() ?: return null
+        if (millis <= 0L) return null
+        return ISO_UTC.format(java.util.Date(millis))
     }
 
     /**
