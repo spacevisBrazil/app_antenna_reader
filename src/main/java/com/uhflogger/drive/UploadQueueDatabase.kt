@@ -49,10 +49,19 @@ class Converters {
 
 // ─── Database ─────────────────────────────────────────────────────────────────
 
-@Database(entities = [UploadEntry::class], version = 2, exportSchema = false)
+// v3 acrescenta `backend_upload` (envio ao backend SpaceVis). Mesmo banco de
+// propósito: os dois destinos falam do MESMO arquivo local, e é a exclusão dele
+// que precisa ser coordenada entre eles (ver FileRetention). Bancos separados
+// tornariam essa coordenação uma transação distribuída sem necessidade nenhuma.
+@Database(
+    entities = [UploadEntry::class, com.uhflogger.backend.BackendUploadEntry::class],
+    version = 3,
+    exportSchema = false,
+)
 @TypeConverters(Converters::class)
 abstract class UploadQueueDatabase : RoomDatabase() {
     abstract fun dao(): UploadQueueDao
+    abstract fun backendDao(): com.uhflogger.backend.BackendUploadDao
 
     companion object {
         @Volatile private var INSTANCE: UploadQueueDatabase? = null
@@ -64,7 +73,7 @@ abstract class UploadQueueDatabase : RoomDatabase() {
                     UploadQueueDatabase::class.java,
                     "upload_queue.db"
                 )
-                    .addMigrations(MIGRATION_1_2)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
                     // fallbackToDestructiveMigration removido intencionalmente.
                     // Se a migração falhar, preferimos crash a perder a fila silenciosamente.
                     // O scan de inicialização em DriveMonitorService recupera arquivos órfãos.
@@ -75,6 +84,28 @@ abstract class UploadQueueDatabase : RoomDatabase() {
         val MIGRATION_1_2 = object : androidx.room.migration.Migration(1, 2) {
             override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
                 db.execSQL("ALTER TABLE upload_queue ADD COLUMN driveFileId TEXT NOT NULL DEFAULT ''")
+            }
+        }
+
+        // Migration: tabela de envio ao backend SpaceVis. Só acrescenta — a fila
+        // do Drive não é tocada, e um aparelho que nunca configurar o backend
+        // segue com a tabela vazia e o comportamento de sempre.
+        val MIGRATION_2_3 = object : androidx.room.migration.Migration(2, 3) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS backend_upload (
+                        filePath        TEXT    NOT NULL PRIMARY KEY,
+                        captureClientId TEXT    NOT NULL,
+                        captureId       TEXT,
+                        linesSent       INTEGER NOT NULL DEFAULT 0,
+                        closed          INTEGER NOT NULL DEFAULT 0,
+                        driveDone       INTEGER NOT NULL DEFAULT 0,
+                        lastError       TEXT,
+                        updatedAt       INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
             }
         }
     }

@@ -28,6 +28,13 @@ class DriveMonitorService : Service() {
         DriveUploadWorker.schedulePeriodic(this)
         // Tenta subir qualquer pendência imediatamente
         DriveUploadWorker.scheduleNow(this)
+
+        // Envio ao backend SpaceVis — destino ADICIONAL, com fila e agenda
+        // próprias. O periódico aqui é o que faz o envio ACOMPANHAR uma captura
+        // longa: no modo "atualizar arquivo atual" o CSV só fecha no Parar, e
+        // sem esta agenda o servidor só receberia dias depois.
+        com.uhflogger.backend.BackendUploadWorker.schedulePeriodic(this)
+        com.uhflogger.backend.BackendUploadWorker.scheduleNow(this)
     }
 
     /**
