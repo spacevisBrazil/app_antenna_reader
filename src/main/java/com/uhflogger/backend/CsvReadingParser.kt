@@ -18,7 +18,12 @@ import java.util.TimeZone
  * arquivo (ver BackendUploadEntry).
  *
  * Formato (CsvExporter/TagRecord):
- *   EPC,RSSI,Antenna,Timestamp,Latitude,Longitude,Bearing,Temperature
+ *   EPC,RSSI,Antenna,Timestamp,Latitude,Longitude,Bearing,Temperature,
+ *   GNSS Speed,Location Timestamp,Location Provider
+ *
+ * A leitura é por ÍNDICE e tolerante a colunas extras no fim: o CSV já cresceu
+ * de 8 pra 11 colunas uma vez, e um parser que exigisse a contagem exata
+ * quebraria em silêncio na próxima adição.
  */
 object CsvReadingParser {
 
@@ -57,6 +62,12 @@ object CsvReadingParser {
                 putOrNull("longitude", parts.getOrNull(5)?.trim()?.toDoubleOrNull())
                 putOrNull("compass_bearing", parts.getOrNull(6)?.trim()?.toDoubleOrNull())
                 putOrNull("temperature", parts.getOrNull(7)?.trim()?.toDoubleOrNull())
+                // Colunas 8-10 (GNSS Speed, Location Timestamp, Location Provider)
+                // existem no CSV mas NÃO são enviadas: `antenna_reading_raw` não
+                // tem onde guardá-las hoje, e inventar um destino (concatenar em
+                // outro campo, por exemplo) corromperia a evidência bruta, que é
+                // justamente o que a tabela existe pra preservar. Ficam no CSV —
+                // que continua indo pro Drive — até o backend ganhar as colunas.
             }
         } catch (e: Exception) {
             Log.w(TAG, "Linha $lineIndex de $sourceFile ignorada: ${e.message}")
@@ -77,22 +88,30 @@ object CsvReadingParser {
 
     /**
      * Instante de início da captura, extraído do nome do arquivo
-     * (`{prefixo}_{epochMillis}.csv`, ver CsvExporter.startSession).
+     * (`{prefixo}_{yyyyMMdd_HHmmss}.csv`, ver CsvExporter.startSession).
      * Sem isso o backend não teria `started_at` — que é NOT NULL.
+     *
+     * O carimbo no nome é gravado em HORA LOCAL do aparelho e sem fuso, então é
+     * interpretado no fuso do próprio aparelho — que é onde ele foi gerado — e
+     * convertido pra UTC na saída. É o melhor que o nome permite; o instante
+     * exato de cada leitura não depende disto (vem da coluna Timestamp, que é
+     * epoch e não tem ambiguidade).
      */
-    fun startedAtFromFileName(sourceFile: String): String? {
-        val millis = sourceFile.substringAfterLast('_').substringBeforeLast('.').toLongOrNull()
-            ?: return null
-        return ISO_UTC.format(java.util.Date(millis))
-    }
+    private val FILE_STAMP = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
 
-    /** Modelo da antena, também pelo prefixo do arquivo. */
-    fun antennaModelFromFileName(sourceFile: String): String? =
-        when (sourceFile.substringBefore('_')) {
-            "winnix"  -> "winnix"
-            "jietong" -> "jietong"
-            else      -> null
+    fun startedAtFromFileName(sourceFile: String): String? {
+        // "winnix_20260804_120000.csv" -> "20260804_120000": o carimbo são os
+        // DOIS últimos trechos separados por "_", porque o próprio carimbo tem um.
+        val semExtensao = sourceFile.substringBeforeLast('.')
+        val partes = semExtensao.split('_')
+        if (partes.size < 2) return null
+        val carimbo = partes.takeLast(2).joinToString("_")
+        return try {
+            ISO_UTC.format(FILE_STAMP.parse(carimbo) ?: return null)
+        } catch (_: Exception) {
+            null
         }
+    }
 
     // JSONObject.put(String, null) grava a string "null"; ausente é o correto —
     // o backend já trata campo ausente como null.

@@ -35,6 +35,10 @@ object DeviceIdentity {
     fun readerName(context: Context): String =
         com.uhflogger.drive.DriveHelper.getDeviceName(context).take(120)
 
+    /** Modelo da antena configurada agora — ver ressalva em BackendUploadWorker. */
+    fun antennaModel(context: Context): String? =
+        SettingsManager.getAntennaType(context).takeIf { it.isNotEmpty() }
+
     fun captureConfig(context: Context): JSONObject = JSONObject().apply {
         val antennaType = SettingsManager.getAntennaType(context)
         put("antenna_type", antennaType)

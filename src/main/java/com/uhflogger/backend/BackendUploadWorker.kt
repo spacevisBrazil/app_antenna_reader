@@ -170,7 +170,12 @@ class BackendUploadWorker(
             put("source_file", file.name)
             put("reader_id", DeviceIdentity.readerId(context))
             put("reader_name", DeviceIdentity.readerName(context))
-            CsvReadingParser.antennaModelFromFileName(file.name)?.let { put("antenna_model", it) }
+            // O modelo NÃO sai mais do nome do arquivo: o prefixo passou a ser o
+            // nome do aparelho (USB) ou o MAC do leitor (BT), que é melhor pra
+            // identificar o COLETOR, mas não diz a antena. Vem da configuração,
+            // com a mesma ressalva do `transport` — é o estado atual, não o do
+            // momento da captura.
+            DeviceIdentity.antennaModel(context)?.let { put("antenna_model", it) }
             put("config", DeviceIdentity.captureConfig(context))
         }
 
