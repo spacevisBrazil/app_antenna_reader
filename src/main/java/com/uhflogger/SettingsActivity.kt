@@ -110,6 +110,16 @@ class SettingsActivity : AppCompatActivity() {
                 com.uhflogger.drive.GoogleSignInActivity::class.java))
         }
 
+        // --- SERVIDOR SPACEVIS -----------------------------------------
+        // Destino ADICIONAL ao Drive, não substituto: o aparelho pode enviar
+        // pros dois, pra um só, ou pra nenhum.
+        root.addView(spacer(16))
+        buildSectionLabel(root, "SERVIDOR SPACEVIS")
+        buildRow(root, "Envio ao servidor", backendStatusLabel(), ROW_BACKEND) {
+            startActivity(android.content.Intent(this,
+                com.uhflogger.backend.BackendSettingsActivity::class.java))
+        }
+
         buildRestoreButton(root)
     }
 
@@ -124,6 +134,13 @@ class SettingsActivity : AppCompatActivity() {
         val account = com.uhflogger.drive.DriveHelper.getSignedInAccount(this)
         val status  = if (account != null) account.email ?: "Conectado" else "Não conectado"
         root.findViewById<android.widget.TextView>(ROW_DRIVE_ACCOUNT)?.text = status
+        root.findViewById<android.widget.TextView>(ROW_BACKEND)?.text = backendStatusLabel()
+    }
+
+    private fun backendStatusLabel(): String = when {
+        com.uhflogger.backend.BackendSettings.isEnabled(this) -> "Ativado"
+        com.uhflogger.backend.BackendSettings.getAccessToken(this).isNotEmpty() -> "Desligado"
+        else -> "Não configurado"
     }
 
     // ─── Seção Winnix ───
@@ -600,5 +617,6 @@ class SettingsActivity : AppCompatActivity() {
         private const val ROW_WINNIX_WORKING  = 2007
         private const val ROW_WINNIX_INV_MODE = 2008
         private const val ROW_DRIVE_ACCOUNT   = 2009
+        private const val ROW_BACKEND         = 2011
     }
 }

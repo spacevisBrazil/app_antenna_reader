@@ -26,6 +26,10 @@ class CsvFileObserver(
 
         UploadQueueManager.enqueue(context, fullPath)
         DriveUploadWorker.scheduleNow(context)
+        // Segundo destino, independente: se estiver desligado, scheduleNow é
+        // no-op e nada muda. Os dois leem o mesmo arquivo sem se coordenar —
+        // só a exclusão dele é combinada (FileRetention).
+        com.uhflogger.backend.BackendUploadWorker.scheduleNow(context)
     }
 
     companion object {

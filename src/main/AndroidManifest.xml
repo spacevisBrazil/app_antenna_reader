@@ -61,6 +61,12 @@
             android:exported="false"
             android:parentActivityName=".MainActivity" />
 
+        <!-- Envio ao backend SpaceVis (destino adicional ao Drive) -->
+        <activity
+            android:name=".backend.BackendSettingsActivity"
+            android:exported="false"
+            android:parentActivityName=".MainActivity" />
+
         <service
             android:name=".drive.DriveMonitorService"
             android:foregroundServiceType="dataSync"

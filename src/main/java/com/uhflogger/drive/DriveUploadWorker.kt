@@ -47,15 +47,32 @@ class DriveUploadWorker(
                 UploadQueueDatabase.get(context).dao().delete(entry.id)
                 continue
             }
+            // Nunca sobe o arquivo da captura EM ANDAMENTO. A varredura de
+            // inicialização (DriveMonitorService) enfileira todo CSV da pasta,
+            // inclusive o que ainda está sendo escrito — subir agora deixaria no
+            // Drive uma versão PARCIAL da captura, que é o que sobraria lá
+            // depois do arquivo local ser apagado. Fica na fila; o CLOSE_WRITE
+            // do fim da sessão (e o periódico de 15 min) pegam ele completo.
+            if (com.uhflogger.CsvExporter.activeFilePath() == entry.filePath) {
+                Log.i(TAG, "Adiando ${file.name}: captura em andamento")
+                continue
+            }
             try {
                 val driveFileId = DriveHelper.uploadCsv(context, drive, file)
 
-                // Persiste o driveFileId antes de apagar o arquivo local —
+                // Persiste o driveFileId antes de liberar o arquivo local —
                 // garante que um crash entre os dois passos não perca o registro do upload.
                 UploadQueueDatabase.get(context).dao().setDriveFileId(entry.id, driveFileId)
 
-                file.delete()
-                Log.i(TAG, "Upload OK + local deleted: ${file.name}")
+                // Antes: file.delete() direto. Com dois destinos, apagar aqui
+                // levaria junto as leituras que o backend ainda não recebeu —
+                // e o arquivo da captura EM ANDAMENTO (que a varredura de
+                // inicialização também enfileira) sumia com a sessão ainda
+                // escrevendo nele. Quem apaga agora é FileRetention, quando os
+                // dois destinos terminaram. Com o backend desligado, o
+                // comportamento é idêntico ao de antes.
+                com.uhflogger.backend.FileRetention.onDriveDone(context, file)
+                Log.i(TAG, "Upload OK: ${file.name}")
 
                 UploadQueueDatabase.get(context).dao().delete(entry.id)
 

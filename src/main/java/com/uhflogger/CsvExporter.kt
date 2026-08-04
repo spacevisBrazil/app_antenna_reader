@@ -13,7 +13,10 @@ object CsvExporter {
 
     private var sessionWriter   : BufferedWriter? = null
     private var sessionFile     : String?         = null
-    private var sessionFilePath : String?         = null
+    // @Volatile: lido pelo worker de envio ao backend (thread do WorkManager)
+    // pra saber qual arquivo AINDA está sendo escrito — esse não pode ser
+    // fechado no servidor nem apagado do disco. Escrito pela thread de captura.
+    @Volatile private var sessionFilePath : String? = null
     // Última tag mantida em memória (ainda não serializada) — gravada com temperatura aplicada
     // ao finalizar a sessão. Guardar o TagRecord em vez da linha CSV já pronta evita depender
     // de qual coluna é "a última" (o código antigo concatenava ",$stopTemperature" no fim da
@@ -121,6 +124,13 @@ object CsvExporter {
     }
 
     fun cancelSession() = closeWriter()
+
+    /**
+     * Caminho do arquivo da sessão EM ANDAMENTO, ou null se nenhuma captura
+     * está ativa. Quem envia pro backend usa isto pra não fechar a captura no
+     * servidor (nem deixar apagar o arquivo) enquanto ainda há leitura entrando.
+     */
+    fun activeFilePath(): String? = sessionFilePath
 
     /** Retorna (e cria se necessário) a pasta onde os arquivos CSV são armazenados */
     fun getCsvFolder(context: Context): File {
