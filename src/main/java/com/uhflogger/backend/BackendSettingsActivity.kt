@@ -1,5 +1,6 @@
 package com.uhflogger.backend
 
+import android.content.Intent
 import android.os.Bundle
 import android.text.InputType
 import android.view.Gravity
@@ -22,8 +23,8 @@ import java.util.concurrent.Executors
  */
 class BackendSettingsActivity : AppCompatActivity() {
 
-    private lateinit var etBaseUrl : EditText
     private lateinit var etFarmId  : EditText
+    private lateinit var farmBox   : LinearLayout
     private lateinit var etCode    : EditText
     private lateinit var tvStatus  : TextView
     private lateinit var btnActivate: Button
@@ -45,14 +46,25 @@ class BackendSettingsActivity : AppCompatActivity() {
         scroll.addView(root)
         setContentView(scroll)
 
-        root.addView(label("Endereço do servidor"))
-        etBaseUrl = field("https://...", InputType.TYPE_TEXT_VARIATION_URI).also { root.addView(it) }
-        etBaseUrl.setText(BackendSettings.getBaseUrl(this))
+        // O servidor NÃO é mais um campo: ele é do build (flavor hml/prd), como
+        // no app de campo. Fica só a informação de para onde este aparelho manda
+        // os dados — que é o que alguém precisa conferir, não editar.
+        root.addView(label("Servidor"))
+        root.addView(hint(ambienteDoBuild()))
 
-        root.addView(label("Código da fazenda"))
-        root.addView(hint("Preenchido sozinho ao ativar — a chave já sabe a fazenda dela."))
-        etFarmId = field("Preenchido na ativação", InputType.TYPE_CLASS_NUMBER).also { root.addView(it) }
+        // Bloco da fazenda: ESCONDIDO por padrão. A chave já nasce atrelada a uma
+        // fazenda e o servidor a informa na ativação — mostrar o campo só cria
+        // uma pergunta que a pessoa não tem como responder, e um jeito a mais de
+        // errar. Só aparece se a resolução automática falhar (ver updateStatus).
+        farmBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+        }
+        farmBox.addView(label("Código da fazenda"))
+        farmBox.addView(hint("Não foi possível descobrir sozinho. Peça o número ao administrador."))
+        etFarmId = field("Ex.: 85", InputType.TYPE_CLASS_NUMBER).also { farmBox.addView(it) }
         BackendSettings.getFarmId(this).takeIf { it > 0 }?.let { etFarmId.setText(it.toString()) }
+        root.addView(farmBox)
 
         root.addView(label("Chave de ativação"))
         root.addView(hint("Peça ao administrador. A chave vale uma vez só — depois disso o aparelho fica ativado."))
@@ -112,6 +124,47 @@ class BackendSettingsActivity : AppCompatActivity() {
         })
 
         updateStatus()
+        aplicarLinkDeAtivacao(intent)
+    }
+
+    /**
+     * A tela é `singleTop`-friendly: se já estiver aberta quando o link for
+     * tocado, o Android entrega aqui em vez de recriar. Sem isto, tocar no link
+     * com a tela aberta não faria nada — e a pessoa acharia que o link não presta.
+     */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        aplicarLinkDeAtivacao(intent)
+    }
+
+    /**
+     * Preenche a tela a partir de `uhflogger://ativar?chave=XXXX-XXXX-XXXX-XXXX`
+     * (opcionalmente `&servidor=https://...`).
+     *
+     * É isto que tira a digitação do caminho: o administrador manda o link por
+     * mensagem, a pessoa toca, e só resta apertar Ativar. Digitar uma chave de
+     * 16 caracteres num celular em campo é onde a ativação falhava — e o erro
+     * ("chave inválida") não diz qual caractere saiu errado.
+     *
+     * NÃO ativa sozinho de propósito: o toque no botão é a confirmação de que
+     * a pessoa está diante do aparelho certo. A chave é de uso único; gastá-la
+     * por um link aberto sem querer seria pior que a digitação.
+     */
+    private fun aplicarLinkDeAtivacao(intent: Intent?) {
+        val data = intent?.data ?: return
+        if (!data.scheme.equals("uhflogger", ignoreCase = true)) return
+
+        // `&servidor=` é saída de emergência (apontar um aparelho pra outro
+        // ambiente sem gerar build). Fora disso, o servidor é o do flavor.
+        data.getQueryParameter("servidor")?.trim()?.takeIf { it.isNotEmpty() }?.let {
+            BackendSettings.setBaseUrl(this, it)
+        }
+        val chave = data.getQueryParameter("chave")?.trim().orEmpty()
+        if (chave.isNotEmpty()) {
+            etCode.setText(chave)
+            toast("Chave recebida. Toque em Ativar aparelho.")
+        }
     }
 
     override fun onOptionsItemSelected(item: MenuItem): Boolean {
@@ -124,17 +177,22 @@ class BackendSettingsActivity : AppCompatActivity() {
         super.onDestroy()
     }
 
+    /** Para onde ESTE build manda os dados — conferível, não editável. */
+    private fun ambienteDoBuild(): String {
+        val url = BackendSettings.getBaseUrl(this)
+        val nome = if (url == com.uhflogger.BuildConfig.API_BASE_URL) {
+            if (com.uhflogger.BuildConfig.FLAVOR == "prd") "Produção" else "Homologação"
+        } else {
+            "Servidor personalizado"
+        }
+        return "$nome\n$url"
+    }
+
     private fun onActivateClicked() {
-        val baseUrl = etBaseUrl.text.toString().trim()
         val farmId  = etFarmId.text.toString().trim().toIntOrNull() ?: 0
         val code    = etCode.text.toString().trim()
 
-        if (baseUrl.isEmpty()) { toast("Informe o endereço do servidor"); return }
-        if (code.isEmpty())    { toast("Informe a chave de ativação"); return }
-
-        // Salvo ANTES da chamada: a ativação usa a URL, e se o processo morrer
-        // no meio o aparelho pelo menos não perde o que já foi digitado.
-        BackendSettings.setBaseUrl(this, baseUrl)
+        if (code.isEmpty()) { toast("Informe a chave de ativação"); return }
         // A fazenda NÃO é mais exigida aqui: o servidor a resolve a partir da
         // própria chave (ver DeviceAuthManager.resolveFarm). Só respeita o que
         // foi digitado, como saída manual caso o servidor não consiga resolver.
@@ -159,11 +217,16 @@ class BackendSettingsActivity : AppCompatActivity() {
                             etFarmId.setText(activation.farmId.toString())
                             val nome = activation.farmName?.let { n -> " — $n" } ?: ""
                             toast("Aparelho ativado (fazenda ${activation.farmId}$nome)")
+                        } else if (activation.options.size > 1) {
+                            // Várias fazendas: a pessoa escolhe numa lista, nunca
+                            // digitando um número que ela não tem como saber.
+                            escolherFazenda(activation.options)
                         } else if (BackendSettings.getFarmId(this) <= 0) {
                             // Ativou, mas o servidor não disse a fazenda e ninguém
-                            // digitou: sem ela o envio não sai do lugar, então a
-                            // tela precisa dizer isso AGORA, e não deixar o
-                            // operador achar que terminou.
+                            // digitou: sem ela o envio não sai do lugar. Revela o
+                            // campo AGORA, em vez de deixar a pessoa achar que
+                            // terminou — e sem ter onde consertar.
+                            farmBox.visibility = View.VISIBLE
                             toast("Aparelho ativado, mas falta o código da fazenda")
                         } else {
                             toast("Aparelho ativado")
@@ -189,6 +252,28 @@ class BackendSettingsActivity : AppCompatActivity() {
             }
         }
         updateStatus()
+    }
+
+    /**
+     * Escolha de fazenda quando o aparelho tem acesso a mais de uma.
+     *
+     * Lista de nomes, não campo numérico: quem está com o aparelho na mão sabe
+     * em que fazenda está, não o id dela no banco. Mesma regra do app de campo,
+     * que só decide sozinho quando existe uma única fazenda.
+     */
+    private fun escolherFazenda(opcoes: List<DeviceAuthManager.Farm>) {
+        val nomes = opcoes.map { it.name }.toTypedArray()
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("Qual é a fazenda deste aparelho?")
+            .setCancelable(false)
+            .setItems(nomes) { _, i ->
+                val f = opcoes[i]
+                BackendSettings.setFarmId(this, f.id)
+                etFarmId.setText(f.id.toString())
+                toast("Fazenda: ${f.name}")
+                updateStatus()
+            }
+            .show()
     }
 
     /** Garante FileObserver + agenda periódica mesmo sem conta Google no aparelho. */

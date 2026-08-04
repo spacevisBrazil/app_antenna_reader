@@ -22,6 +22,35 @@ android {
         }
     }
 
+    // Ambiente é propriedade do ARTEFATO, não uma configuração de tela.
+    //
+    // Mesmo padrão do app de campo (spacevis-mobile), onde o eas.json define
+    // EXPO_PUBLIC_API_URL por perfil de build e o app não tem campo de servidor.
+    // Aqui: dois flavors, cada um com sua URL compilada. Sai um APK de
+    // homologação e um de produção, e ninguém em campo escolhe (nem erra) para
+    // onde os dados vão.
+    //
+    // applicationId IGUAL nos dois de propósito: o cliente OAuth do Google Drive
+    // é atrelado ao package + SHA-1, então um sufixo (.hml) quebraria o login do
+    // Drive no build de homologação — e o Drive é destino de primeira classe
+    // aqui. Consequência aceita: um app por vez no aparelho.
+    flavorDimensions "ambiente"
+    productFlavors {
+        hml {
+            dimension "ambiente"
+            versionNameSuffix "-hml"
+            resValue "string", "app_name", "UHF Logger HML"
+            buildConfigField "String", "API_BASE_URL",
+                '"https://backend-cattlevis-q3zndqt2pq-uc.a.run.app"'
+        }
+        prd {
+            dimension "ambiente"
+            resValue "string", "app_name", "UHF Logger"
+            buildConfigField "String", "API_BASE_URL",
+                '"https://backend-cattlevis-3p6nhqmpoa-uc.a.run.app"'
+        }
+    }
+
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_1_8
         targetCompatibility JavaVersion.VERSION_1_8
@@ -29,6 +58,9 @@ android {
 
     buildFeatures {
         viewBinding true
+        // Necessário pro BuildConfig.API_BASE_URL: a partir do AGP 8 o
+        // BuildConfig não é mais gerado por padrão.
+        buildConfig true
     }
 
     packagingOptions {

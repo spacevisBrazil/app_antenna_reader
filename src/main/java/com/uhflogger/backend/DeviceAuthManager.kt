@@ -28,7 +28,19 @@ object DeviceAuthManager {
      * Resultado da ativação. A fazenda vem do servidor quando ele consegue
      * resolvê-la sozinho — ver resolveFarm().
      */
-    data class ActivationResult(val farmId: Int?, val farmName: String?)
+    data class Farm(val id: Int, val name: String)
+
+    /**
+     * `farmId` preenchido = resolvido sozinho (o caso normal: a chave pertence a
+     * UMA fazenda). `options` com mais de uma = a conta tem acesso a várias e
+     * quem escolhe é a pessoa — mesma regra do app de campo, que só auto-seleciona
+     * quando `farms.length === 1`.
+     */
+    data class ActivationResult(
+        val farmId  : Int?,
+        val farmName: String?,
+        val options : List<Farm> = emptyList(),
+    )
 
     /**
      * Troca a chave de ativação por uma sessão. Chamado uma vez, pela tela de
@@ -91,19 +103,29 @@ object DeviceAuthManager {
         }
 
         val farms = response.json()?.optJSONArray("farms")
-        if (farms == null || farms.length() != 1) {
-            Log.i(TAG, "Fazenda não resolvida: ${farms?.length() ?: 0} vinculada(s) ao aparelho")
+        if (farms == null || farms.length() == 0) {
+            Log.i(TAG, "Nenhuma fazenda vinculada ao aparelho")
             return ActivationResult(null, null)
         }
 
-        val farm = farms.optJSONObject(0) ?: return ActivationResult(null, null)
-        val farmId = farm.optInt("id", 0)
-        if (farmId <= 0) return ActivationResult(null, null)
+        val lista = (0 until farms.length()).mapNotNull { i ->
+            val o = farms.optJSONObject(i) ?: return@mapNotNull null
+            val id = o.optInt("id", 0)
+            if (id <= 0) null else Farm(id, o.optString("name").ifEmpty { "Fazenda $id" })
+        }
+        if (lista.isEmpty()) return ActivationResult(null, null)
 
-        BackendSettings.setFarmId(context, farmId)
-        val farmName = farm.optString("name").ifEmpty { null }
-        Log.i(TAG, "Fazenda resolvida pela chave: $farmId ($farmName)")
-        return ActivationResult(farmId, farmName)
+        // Uma só: decide sozinho. Várias: quem escolhe é a pessoa — escolher por
+        // ela seria mandar leitura pra fazenda errada sem ninguém notar.
+        if (lista.size > 1) {
+            Log.i(TAG, "Aparelho tem ${lista.size} fazendas — precisa escolher")
+            return ActivationResult(null, null, lista)
+        }
+
+        val farm = lista.first()
+        BackendSettings.setFarmId(context, farm.id)
+        Log.i(TAG, "Fazenda resolvida pela chave: ${farm.id} (${farm.name})")
+        return ActivationResult(farm.id, farm.name, lista)
     }
 
     /**
