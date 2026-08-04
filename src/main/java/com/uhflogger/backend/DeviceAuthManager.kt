@@ -152,7 +152,7 @@ object DeviceAuthManager {
 
         val json = response.json()
         val accessToken = json?.optString("access_token").orEmpty()
-        if (!response.isSuccess || accessToken.isEmpty()) {
+        if (json == null || !response.isSuccess || accessToken.isEmpty()) {
             Log.w(TAG, "Refresh recusado (${response.status}) — sessão precisa ser reativada")
             BackendSettings.clearSession(context)
             return null
