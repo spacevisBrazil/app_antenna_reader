@@ -50,7 +50,8 @@ class BackendSettingsActivity : AppCompatActivity() {
         etBaseUrl.setText(BackendSettings.getBaseUrl(this))
 
         root.addView(label("Código da fazenda"))
-        etFarmId = field("Ex.: 84", InputType.TYPE_CLASS_NUMBER).also { root.addView(it) }
+        root.addView(hint("Preenchido sozinho ao ativar — a chave já sabe a fazenda dela."))
+        etFarmId = field("Preenchido na ativação", InputType.TYPE_CLASS_NUMBER).also { root.addView(it) }
         BackendSettings.getFarmId(this).takeIf { it > 0 }?.let { etFarmId.setText(it.toString()) }
 
         root.addView(label("Chave de ativação"))
@@ -129,13 +130,15 @@ class BackendSettingsActivity : AppCompatActivity() {
         val code    = etCode.text.toString().trim()
 
         if (baseUrl.isEmpty()) { toast("Informe o endereço do servidor"); return }
-        if (farmId <= 0)       { toast("Informe o código da fazenda"); return }
         if (code.isEmpty())    { toast("Informe a chave de ativação"); return }
 
         // Salvo ANTES da chamada: a ativação usa a URL, e se o processo morrer
         // no meio o aparelho pelo menos não perde o que já foi digitado.
         BackendSettings.setBaseUrl(this, baseUrl)
-        BackendSettings.setFarmId(this, farmId)
+        // A fazenda NÃO é mais exigida aqui: o servidor a resolve a partir da
+        // própria chave (ver DeviceAuthManager.resolveFarm). Só respeita o que
+        // foi digitado, como saída manual caso o servidor não consiga resolver.
+        if (farmId > 0) BackendSettings.setFarmId(this, farmId)
 
         btnActivate.isEnabled = false
         tvStatus.text = "Ativando…"
@@ -147,12 +150,24 @@ class BackendSettingsActivity : AppCompatActivity() {
                 if (isFinishing || isDestroyed) return@runOnUiThread
                 btnActivate.isEnabled = true
                 result.fold(
-                    onSuccess = {
+                    onSuccess = { activation ->
                         etCode.setText("")
                         BackendSettings.setEnabled(this, true)
                         swEnabled.isChecked = true
                         startMonitoring()
-                        toast("Aparelho ativado")
+                        if (activation.farmId != null) {
+                            etFarmId.setText(activation.farmId.toString())
+                            val nome = activation.farmName?.let { n -> " — $n" } ?: ""
+                            toast("Aparelho ativado (fazenda ${activation.farmId}$nome)")
+                        } else if (BackendSettings.getFarmId(this) <= 0) {
+                            // Ativou, mas o servidor não disse a fazenda e ninguém
+                            // digitou: sem ela o envio não sai do lugar, então a
+                            // tela precisa dizer isso AGORA, e não deixar o
+                            // operador achar que terminou.
+                            toast("Aparelho ativado, mas falta o código da fazenda")
+                        } else {
+                            toast("Aparelho ativado")
+                        }
                     },
                     onFailure = { toast(it.message ?: "Falha na ativação") },
                 )

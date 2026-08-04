@@ -25,10 +25,16 @@ object DeviceAuthManager {
     class AuthException(message: String) : Exception(message)
 
     /**
+     * Resultado da ativação. A fazenda vem do servidor quando ele consegue
+     * resolvê-la sozinho — ver resolveFarm().
+     */
+    data class ActivationResult(val farmId: Int?, val farmName: String?)
+
+    /**
      * Troca a chave de ativação por uma sessão. Chamado uma vez, pela tela de
      * configuração — nunca de forma automática, porque a chave é de uso único.
      */
-    fun activate(context: Context, code: String) {
+    fun activate(context: Context, code: String): ActivationResult {
         val baseUrl = BackendSettings.getBaseUrl(context)
         if (baseUrl.isEmpty()) throw AuthException("Configure o endereço do servidor primeiro")
 
@@ -56,6 +62,48 @@ object DeviceAuthManager {
             deviceEmail      = json.optString("device_email").ifEmpty { null },
         )
         Log.i(TAG, "Dispositivo ativado")
+
+        return resolveFarm(context, accessToken)
+    }
+
+    /**
+     * Descobre a fazenda do aparelho a partir da própria sessão.
+     *
+     * A chave de ativação JÁ NASCE atrelada a uma fazenda — pedir o número dela
+     * de novo ao operador é pedir que ele confirme algo que o servidor já sabe.
+     * E o erro é silencioso: digitar o número errado não impede a ativação (o
+     * `/activate` nem olha pra fazenda), só faz todo envio posterior falhar lá
+     * no `farmValidator`, longe da tela e sem mensagem que ajude.
+     *
+     * Best-effort de propósito: se a rede cair aqui, a ativação continua válida
+     * e o campo segue editável na tela. Só decide sozinho quando o servidor
+     * devolve UMA fazenda — com nenhuma ou várias, quem escolhe é o operador.
+     */
+    private fun resolveFarm(context: Context, token: String): ActivationResult {
+        val baseUrl = BackendSettings.getBaseUrl(context)
+        val response = BackendApi.get(
+            "$baseUrl/api/mobile/v1/session/bootstrap",
+            mapOf("Authorization" to "Bearer $token"),
+        )
+        if (!response.isSuccess) {
+            Log.w(TAG, "Não resolveu a fazenda automaticamente (${response.status})")
+            return ActivationResult(null, null)
+        }
+
+        val farms = response.json()?.optJSONArray("farms")
+        if (farms == null || farms.length() != 1) {
+            Log.i(TAG, "Fazenda não resolvida: ${farms?.length() ?: 0} vinculada(s) ao aparelho")
+            return ActivationResult(null, null)
+        }
+
+        val farm = farms.optJSONObject(0) ?: return ActivationResult(null, null)
+        val farmId = farm.optInt("id", 0)
+        if (farmId <= 0) return ActivationResult(null, null)
+
+        BackendSettings.setFarmId(context, farmId)
+        val farmName = farm.optString("name").ifEmpty { null }
+        Log.i(TAG, "Fazenda resolvida pela chave: $farmId ($farmName)")
+        return ActivationResult(farmId, farmName)
     }
 
     /**
