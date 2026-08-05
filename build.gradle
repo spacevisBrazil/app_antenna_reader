@@ -61,6 +61,9 @@ android {
         // Necessário pro BuildConfig.API_BASE_URL: a partir do AGP 8 o
         // BuildConfig não é mais gerado por padrão.
         buildConfig true
+        // Necessário pro resValue nos productFlavors: a partir do AGP 8 a
+        // geração de resource values também é opt-in.
+        resValues true
     }
 
     packagingOptions {
