@@ -20,6 +20,21 @@ object BackendSettings {
 
     private const val PREFS_NAME = "backend_prefs"
 
+    /**
+     * Servidor do AMBIENTE DESTE BUILD (flavor `hml` ou `prd`).
+     *
+     * Mesmo padrão do app de campo, onde o eas.json define EXPO_PUBLIC_API_URL
+     * por perfil e não existe campo de servidor em tela nenhuma. O endereço tem
+     * 49 caracteres e é sempre o mesmo por ambiente: pedir que alguém o digite
+     * num celular, em campo, é criar um erro que não precisa existir — e um
+     * caractere trocado falha com "sem conexão", que não diz onde foi o engano.
+     *
+     * Pior: com o endereço editável, o mesmo aparelho pode acabar mandando dado
+     * de produção pra homologação sem ninguém perceber. Sendo propriedade do
+     * artefato, o APK de homologação não tem como falar com produção.
+     */
+    val DEFAULT_BASE_URL: String get() = com.uhflogger.BuildConfig.API_BASE_URL
+
     private const val KEY_ENABLED       = "enabled"
     private const val KEY_BASE_URL      = "base_url"
     private const val KEY_FARM_ID       = "farm_id"
@@ -61,9 +76,16 @@ object BackendSettings {
     fun setEnabled(context: Context, value: Boolean) =
         prefs(context).edit().putBoolean(KEY_ENABLED, value).apply()
 
-    /** Sempre sem barra final — a montagem dos caminhos assume isso. */
-    fun getBaseUrl(context: Context): String =
-        prefs(context).getString(KEY_BASE_URL, "").orEmpty().trim().trimEnd('/')
+    /**
+     * Sempre sem barra final — a montagem dos caminhos assume isso.
+     * Sem nada salvo, devolve o servidor DESTE build. Só fica diferente disso se
+     * um link de ativação trouxer `&servidor=` explicitamente (ver
+     * BackendSettingsActivity), que é a saída para um caso excepcional.
+     */
+    fun getBaseUrl(context: Context): String {
+        val salvo = prefs(context).getString(KEY_BASE_URL, "").orEmpty().trim().trimEnd('/')
+        return salvo.ifEmpty { DEFAULT_BASE_URL }
+    }
 
     fun setBaseUrl(context: Context, value: String) =
         prefs(context).edit().putString(KEY_BASE_URL, value.trim().trimEnd('/')).apply()
