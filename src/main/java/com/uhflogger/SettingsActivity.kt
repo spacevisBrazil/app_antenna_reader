@@ -494,12 +494,25 @@ class SettingsActivity : AppCompatActivity() {
                             "A cada ${SettingsManager.DEFAULT_AUTO_SAVE_TAGS} tags")
                         updateRowValue(parent, ROW_MINUTES,
                             "A cada ${SettingsManager.DEFAULT_AUTO_SAVE_MINUTES} min")
-                        updateRowValue(parent, ROW_AUTO_SAVE_MODE, "Atualizar arquivo atual")
+                        updateRowValue(parent, ROW_AUTO_SAVE_MODE,
+                            if (SettingsManager.DEFAULT_AUTO_SAVE_MODE == SettingsManager.AUTO_SAVE_MODE_NEW_FILE)
+                                "Novo arquivo a cada auto-save" else "Atualizar arquivo atual")
                         updateRowValue(parent, ROW_LOCATION, "GNSS + Rede")
-                        updateRowValue(parent, ROW_ANTENNA_TYPE, "Jietong")
-
-                        // Esconde seção Winnix — padrão é Jietong
-                        winnixSection.visibility = View.GONE
+                        val defaultAntennaLabel = if (SettingsManager.DEFAULT_ANTENNA_TYPE == SettingsManager.ANTENNA_TYPE_WINNIX)
+                            "Winnix HYM750E" else "Jietong"
+                        updateRowValue(parent, ROW_ANTENNA_TYPE, defaultAntennaLabel)
+                        val defaultCount = SettingsManager.DEFAULT_WINNIX_ANT_COUNT
+                        updateRowValue(winnixSection, ROW_WINNIX_ANT_COUNT,
+                            "$defaultCount antena${if (defaultCount > 1) "s" else ""}")
+                        updateRowValue(winnixSection, ROW_WINNIX_POWER,
+                            "${SettingsManager.DEFAULT_WINNIX_POWER_DBM} dBm")
+                        updateRowValue(winnixSection, ROW_WINNIX_WORKING,
+                            "${SettingsManager.DEFAULT_WINNIX_WORKING_MS}ms")
+                        updateRowValue(winnixSection, ROW_WINNIX_INV_MODE,
+                            SettingsManager.winnixInventoryModeLabel(SettingsManager.DEFAULT_WINNIX_INVENTORY_MODE))
+                        winnixSection.visibility =
+                            if (SettingsManager.DEFAULT_ANTENNA_TYPE == SettingsManager.ANTENNA_TYPE_WINNIX)
+                                View.VISIBLE else View.GONE
 
                         toast("Configurações restauradas")
                     }

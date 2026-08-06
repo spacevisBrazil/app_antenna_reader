@@ -38,18 +38,18 @@ object SettingsManager {
     const val WINNIX_INV_MODE_ADAPTIVE    = 5   // Adaptive  — S0+S1, recommended default
 
     // Defaults
-    const val DEFAULT_AUTO_SAVE_TAGS         = 10_000
+    const val DEFAULT_AUTO_SAVE_TAGS         = 5_000
     const val DEFAULT_AUTO_SAVE_MINUTES      = 10
     // Auto-save mode
-    const val AUTO_SAVE_MODE_APPEND          = 0  // append to current file (default)
+    const val AUTO_SAVE_MODE_APPEND          = 0  // append to current file
     const val AUTO_SAVE_MODE_NEW_FILE        = 1  // create new file each auto-save
-    const val DEFAULT_AUTO_SAVE_MODE         = AUTO_SAVE_MODE_APPEND
+    const val DEFAULT_AUTO_SAVE_MODE         = AUTO_SAVE_MODE_NEW_FILE
     const val DEFAULT_LOCATION_MODE          = LOCATION_MODE_HYBRID
-    const val DEFAULT_ANTENNA_TYPE           = ANTENNA_TYPE_JIETONG
-    const val DEFAULT_WINNIX_ANT_COUNT       = 1
+    const val DEFAULT_ANTENNA_TYPE           = ANTENNA_TYPE_WINNIX
+    const val DEFAULT_WINNIX_ANT_COUNT       = 2
     const val DEFAULT_WINNIX_POWER_DBM       = 30
     const val DEFAULT_WINNIX_WORKING_MS      = 100
-    const val DEFAULT_WINNIX_INVENTORY_MODE  = WINNIX_INV_MODE_FAST
+    const val DEFAULT_WINNIX_INVENTORY_MODE  = WINNIX_INV_MODE_ADAPTIVE
 
     private fun prefs(context: Context): SharedPreferences =
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
