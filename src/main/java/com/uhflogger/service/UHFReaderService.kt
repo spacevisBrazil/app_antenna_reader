@@ -208,6 +208,13 @@ class UHFReaderService : Service(), SensorEventListener {
         if (!newIsGps && currentIsGps) return false
         if (!newLoc.hasAccuracy()) return false
         if (!current.hasAccuracy()) return true
+        // Mesma posição GPS → aceita independente de acurácia, só para atualizar
+        // o timestamp. Resolve o congelamento causado pelo stationary filter do
+        // chip: chip trava coordenadas quando parado mas continua variando a
+        // acurácia reportada — sem isso o cache de 30s expirava e um fix NETWORK
+        // errado entrava no lugar.
+        if (newIsGps && newLoc.latitude == current.latitude
+                     && newLoc.longitude == current.longitude) return true
         // O teto de 50m só faz sentido pra PROTEGER um fix que já é bom — se o
         // atual já é ruim (aceito por falta de opção melhor), qualquer melhora
         // serve, mesmo que continue acima do teto. Sem essa distinção, o
