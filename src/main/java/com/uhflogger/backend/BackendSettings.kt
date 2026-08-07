@@ -10,11 +10,10 @@ import android.content.SharedPreferences
  * independente: este destino é ADICIONAL, não substituto. Com o envio
  * desligado (padrão), nada aqui é lido e o app se comporta como sempre.
  *
- * SEM SEGREDO NO CÓDIGO
- * `client_id`/`client_secret` do Keycloak são configurados em runtime, não
- * compilados no APK. Ficam vazios por padrão — sem eles o app ainda ativa por
- * chave e envia normalmente; só não consegue renovar o token sozinho quando
- * ele expira (aí a tela pede a chave de novo).
+ * SEM SEGREDO NO APARELHO
+ * Não há client_id/client_secret aqui, nem compilados nem digitados: quem fala
+ * com o Keycloak é o backend, com as credenciais DELE. O aparelho carrega
+ * apenas a chave de ativação (uso único) e, depois, os tokens da conta-device.
  */
 object BackendSettings {
 
@@ -41,8 +40,6 @@ object BackendSettings {
     private const val KEY_ACCESS_TOKEN  = "access_token"
     private const val KEY_REFRESH_TOKEN = "refresh_token"
     private const val KEY_EXPIRES_AT    = "expires_at"
-    private const val KEY_CLIENT_ID     = "kc_client_id"
-    private const val KEY_CLIENT_SECRET = "kc_client_secret"
     private const val KEY_DEVICE_EMAIL  = "device_email"
 
     private fun prefs(context: Context): SharedPreferences =
@@ -140,22 +137,17 @@ object BackendSettings {
             .commit()
     }
 
-    // ── Keycloak (opcional, só pra renovar token) ─────────────────────────────
-
-    fun getClientId(context: Context): String =
-        prefs(context).getString(KEY_CLIENT_ID, "").orEmpty()
-
-    fun setClientId(context: Context, value: String) =
-        prefs(context).edit().putString(KEY_CLIENT_ID, value.trim()).apply()
-
-    fun getClientSecret(context: Context): String =
-        prefs(context).getString(KEY_CLIENT_SECRET, "").orEmpty()
-
-    fun setClientSecret(context: Context, value: String) =
-        prefs(context).edit().putString(KEY_CLIENT_SECRET, value.trim()).apply()
-
+    /**
+     * Basta o refresh token. O `POST /api/auth/token` do backend monta o
+     * client_id/client_secret a partir do PRÓPRIO ambiente dele (KC_CLIENT_ID /
+     * KC_CLIENT_SECRET) e ignora o que vier no corpo — exigir aqui credenciais
+     * que o servidor nem lê fazia o app desistir de renovar sem sequer tentar.
+     *
+     * O efeito era invisível e terminal: o access token do realm dura 5h, os
+     * campos de client são opcionais e ficam no fim da tela, ninguém em campo os
+     * preenche — então 5h depois da ativação o aparelho parava de enviar PARA
+     * SEMPRE, sem erro em log nenhum, até alguém reativar com uma chave nova.
+     */
     fun canRefresh(context: Context): Boolean =
-        getRefreshToken(context).isNotEmpty() &&
-                getClientId(context).isNotEmpty() &&
-                getClientSecret(context).isNotEmpty()
+        getRefreshToken(context).isNotEmpty()
 }

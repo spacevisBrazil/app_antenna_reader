@@ -145,22 +145,27 @@ object DeviceAuthManager {
     }
 
     /**
-     * Renova pelo refresh token. Só funciona com client_id/secret configurados —
-     * sem eles, a sessão simplesmente dura o que durar e a tela pede a chave de
-     * novo. Não hardcodamos credencial de client no APK.
+     * Renova pelo refresh token — só o refresh token, que é tudo que o
+     * `/api/auth/token` pede no grant `refresh_token`. O client_id/secret são do
+     * ambiente do BACKEND; mandá-los daqui era ruído, e EXIGI-LOS era o que
+     * matava o envio 5h depois de cada ativação (ver BackendSettings.canRefresh).
+     *
+     * Continua valendo a regra de não hardcodar credencial de client no APK: o
+     * segredo nunca esteve no aparelho, e agora não precisa estar mesmo.
+     *
+     * O refresh token é offline (`scope=offline_access` na ativação), então ele
+     * só morre por 30 dias de ociosidade — e o worker roda a cada 15 min.
      */
     @Synchronized
     fun refresh(context: Context): String? {
         if (!BackendSettings.canRefresh(context)) {
-            Log.w(TAG, "Token expirado e sem client_id/secret configurados — precisa reativar")
+            Log.w(TAG, "Sem refresh token — precisa reativar pela chave")
             return null
         }
 
         val baseUrl = BackendSettings.getBaseUrl(context)
         val body = JSONObject()
             .put("grant_type", "refresh_token")
-            .put("client_id", BackendSettings.getClientId(context))
-            .put("client_secret", BackendSettings.getClientSecret(context))
             .put("refresh_token", BackendSettings.getRefreshToken(context))
 
         val response = BackendApi.post("$baseUrl/api/auth/token", body)
