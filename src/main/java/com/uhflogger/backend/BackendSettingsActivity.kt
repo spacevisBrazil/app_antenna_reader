@@ -102,26 +102,11 @@ class BackendSettingsActivity : AppCompatActivity() {
             "dois destinos configurados terminarem."
         ))
 
-        // Renovação automática de sessão — opcional e escondida no fim de
-        // propósito: quem opera em campo não digita isto. Sem preencher, a
-        // sessão dura o que durar e a tela pede a chave de novo no vencimento.
-        root.addView(label("Renovação automática (opcional)"))
-        val etClientId = field("client_id do Keycloak", InputType.TYPE_CLASS_TEXT).also { root.addView(it) }
-        etClientId.setText(BackendSettings.getClientId(this))
-        val etClientSecret = field("client_secret", InputType.TYPE_TEXT_VARIATION_PASSWORD).also { root.addView(it) }
-        etClientSecret.setText(BackendSettings.getClientSecret(this))
-        root.addView(Button(this).apply {
-            text = "Salvar renovação"
-            setTextColor(0xFF555555.toInt())
-            setBackgroundColor(0xFFE0E0E0.toInt())
-            stateListAnimator = null
-            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(48))
-            setOnClickListener {
-                BackendSettings.setClientId(this@BackendSettingsActivity, etClientId.text.toString())
-                BackendSettings.setClientSecret(this@BackendSettingsActivity, etClientSecret.text.toString())
-                toast("Salvo")
-            }
-        })
+        // Não há mais bloco de "renovação automática": a sessão se renova sozinha
+        // com o refresh token que a ativação já deixou no aparelho. O que havia
+        // aqui eram campos de client_id/client_secret que o backend nem lê — e,
+        // por serem obrigatórios pro app tentar renovar, faziam o envio morrer
+        // 5h depois de ativar em todo aparelho onde ninguém os preencheu.
 
         updateStatus()
         aplicarLinkDeAtivacao(intent)
