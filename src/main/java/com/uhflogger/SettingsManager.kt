@@ -24,6 +24,15 @@ object SettingsManager {
     const val KEY_WAS_CAPTURING           = "was_capturing"
     const val KEY_LAST_DEVICE_NAME        = "last_device_name"
 
+    // Filtro de 3 camadas
+    const val KEY_FILTER_ENABLED          = "filter_enabled"
+    const val KEY_FILTER_L1_ENABLED       = "filter_l1_enabled"
+    const val KEY_FILTER_L1_PATTERNS      = "filter_l1_patterns"
+    const val KEY_FILTER_L2_ENABLED       = "filter_l2_enabled"
+    const val KEY_FILTER_L2_WINDOW_MIN    = "filter_l2_window_min"
+    const val KEY_FILTER_L2_SWEEP_MIN     = "filter_l2_sweep_min"
+    const val KEY_FILTER_L3_ENABLED       = "filter_l3_enabled"
+
     // Location mode values
     const val LOCATION_MODE_HYBRID        = "hybrid"
     const val LOCATION_MODE_GNSS          = "gnss"
@@ -50,6 +59,17 @@ object SettingsManager {
     const val DEFAULT_WINNIX_POWER_DBM       = 30
     const val DEFAULT_WINNIX_WORKING_MS      = 100
     const val DEFAULT_WINNIX_INVENTORY_MODE  = WINNIX_INV_MODE_ADAPTIVE
+
+    // Filtro — desligado por padrão (opt-in), igual ao envio ao backend: com o
+    // filtro desligado, nenhum comportamento muda e o app se comporta
+    // exatamente como antes. Quando ligado, as 3 camadas nascem todas ativas.
+    const val DEFAULT_FILTER_ENABLED         = false
+    const val DEFAULT_FILTER_L1_ENABLED      = true
+    const val DEFAULT_FILTER_L1_PATTERNS     = ""
+    const val DEFAULT_FILTER_L2_ENABLED      = true
+    const val DEFAULT_FILTER_L2_WINDOW_MIN   = 30
+    const val DEFAULT_FILTER_L2_SWEEP_MIN    = 5
+    const val DEFAULT_FILTER_L3_ENABLED      = true
 
     private fun prefs(context: Context): SharedPreferences =
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -134,4 +154,56 @@ object SettingsManager {
 
     fun getLastDeviceName(context: Context): String? =
         prefs(context).getString(KEY_LAST_DEVICE_NAME, null)
+
+    // -------------------------------------------------------------------
+    // Filtro de 3 camadas
+    // -------------------------------------------------------------------
+    fun isFilterEnabled(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_FILTER_ENABLED, DEFAULT_FILTER_ENABLED)
+
+    fun setFilterEnabled(context: Context, value: Boolean) =
+        prefs(context).edit().putBoolean(KEY_FILTER_ENABLED, value).apply()
+
+    fun isFilterL1Enabled(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_FILTER_L1_ENABLED, DEFAULT_FILTER_L1_ENABLED)
+
+    fun setFilterL1Enabled(context: Context, value: Boolean) =
+        prefs(context).edit().putBoolean(KEY_FILTER_L1_ENABLED, value).apply()
+
+    // Padrões separados por vírgula, ex.: "0000100000000XXX,0076000000004XXX".
+    // Posições com 'X' aceitam qualquer dígito hex; as demais precisam bater
+    // exatamente. Lista vazia = camada 1 não filtra nada (evita o risco de
+    // descartar tudo silenciosamente por falta de configuração).
+    fun getFilterL1Patterns(context: Context): String =
+        prefs(context).getString(KEY_FILTER_L1_PATTERNS, DEFAULT_FILTER_L1_PATTERNS) ?: DEFAULT_FILTER_L1_PATTERNS
+
+    fun setFilterL1Patterns(context: Context, value: String) =
+        prefs(context).edit().putString(KEY_FILTER_L1_PATTERNS, value).apply()
+
+    fun isFilterL2Enabled(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_FILTER_L2_ENABLED, DEFAULT_FILTER_L2_ENABLED)
+
+    fun setFilterL2Enabled(context: Context, value: Boolean) =
+        prefs(context).edit().putBoolean(KEY_FILTER_L2_ENABLED, value).apply()
+
+    fun getFilterL2WindowMin(context: Context): Int =
+        prefs(context).getInt(KEY_FILTER_L2_WINDOW_MIN, DEFAULT_FILTER_L2_WINDOW_MIN)
+
+    fun setFilterL2WindowMin(context: Context, value: Int) =
+        prefs(context).edit().putInt(KEY_FILTER_L2_WINDOW_MIN, value).apply()
+
+    // Intervalo do sweep periódico que expira entradas da camada 2. Precisa
+    // ser MENOR que a janela (validado em SettingsActivity) — senão entradas
+    // expiradas poderiam nunca ser detectadas antes da próxima rotação.
+    fun getFilterL2SweepMin(context: Context): Int =
+        prefs(context).getInt(KEY_FILTER_L2_SWEEP_MIN, DEFAULT_FILTER_L2_SWEEP_MIN)
+
+    fun setFilterL2SweepMin(context: Context, value: Int) =
+        prefs(context).edit().putInt(KEY_FILTER_L2_SWEEP_MIN, value).apply()
+
+    fun isFilterL3Enabled(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_FILTER_L3_ENABLED, DEFAULT_FILTER_L3_ENABLED)
+
+    fun setFilterL3Enabled(context: Context, value: Boolean) =
+        prefs(context).edit().putBoolean(KEY_FILTER_L3_ENABLED, value).apply()
 }

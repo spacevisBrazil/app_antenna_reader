@@ -34,6 +34,7 @@ import com.uhflogger.MainActivity
 import com.uhflogger.SettingsManager
 import com.uhflogger.decoder.ProtocolDecoder
 import com.uhflogger.decoder.WinnixProtocolDecoder
+import com.uhflogger.filter.TagFilterEngine
 import com.uhflogger.model.TagRecord
 import com.uhflogger.serial.BluetoothInputOutputManager
 import com.uhflogger.serial.BluetoothSerialPort
@@ -487,6 +488,27 @@ class UHFReaderService : Service(), SensorEventListener {
     // Tags acumuladas desde o último auto-save — reinicia após cada gravação
     private val tagsSinceLastSave  = AtomicInteger(0)
 
+    // =========================================================================
+    // Filtro de 3 camadas — configuração recarregada uma vez por sessão nova
+    // (igual autoSaveTagCount/autoSaveIntervalMin acima), NÃO em cada
+    // resume de reconexão BT/USB, pra não resetar a consolidação em
+    // andamento só porque a antena piscou.
+    // =========================================================================
+    private var tagFilterEngine: TagFilterEngine? = null
+    private var filterEnabled         = SettingsManager.DEFAULT_FILTER_ENABLED
+    private var filterL1Enabled       = SettingsManager.DEFAULT_FILTER_L1_ENABLED
+    private var filterL1Patterns      = SettingsManager.DEFAULT_FILTER_L1_PATTERNS
+    private var filterL2Enabled       = SettingsManager.DEFAULT_FILTER_L2_ENABLED
+    private var filterL2WindowMs      = SettingsManager.DEFAULT_FILTER_L2_WINDOW_MIN * 60_000L
+    private var filterL3Enabled       = SettingsManager.DEFAULT_FILTER_L3_ENABLED
+    private var filterSweepIntervalMs = SettingsManager.DEFAULT_FILTER_L2_SWEEP_MIN * 60_000L
+    private var filterPersistJob: ScheduledFuture<*>? = null
+    private var filterSweepJob  : ScheduledFuture<*>? = null
+    // D2: com a Camada 2 ativa, rotação por CONTAGEM de tags brutas deixa de
+    // fazer sentido (as tags são consolidadas antes de chegar no arquivo) —
+    // a rotação passa a ser só por tempo, com o mesmo intervalo da janela.
+    private val filterForcesTimeOnlyRotation get() = filterEnabled && filterL2Enabled
+
     private var appContext: Context? = null
     private var activeAntennaType : String  = SettingsManager.ANTENNA_TYPE_JIETONG
     private var activeIsBluetooth : Boolean = false  // true=BT session, false=USB session
@@ -530,6 +552,7 @@ class UHFReaderService : Service(), SensorEventListener {
     override fun onCreate() {
         super.onCreate()
         appContext = applicationContext
+        tagFilterEngine = TagFilterEngine(appContext!!)
         createNotificationChannel()
         startForegroundWithSafeType()
 
@@ -672,6 +695,28 @@ class UHFReaderService : Service(), SensorEventListener {
             autoSaveTagCount    = SettingsManager.getAutoSaveTags(ctx)
             autoSaveIntervalMin = SettingsManager.getAutoSaveMinutes(ctx)
             autoSaveMode        = SettingsManager.getAutoSaveMode(ctx)
+
+            filterEnabled         = SettingsManager.isFilterEnabled(ctx)
+            filterL1Enabled       = SettingsManager.isFilterL1Enabled(ctx)
+            filterL1Patterns      = SettingsManager.getFilterL1Patterns(ctx)
+            filterL2Enabled       = SettingsManager.isFilterL2Enabled(ctx)
+            filterL2WindowMs      = SettingsManager.getFilterL2WindowMin(ctx) * 60_000L
+            filterL3Enabled       = SettingsManager.isFilterL3Enabled(ctx)
+            filterSweepIntervalMs = SettingsManager.getFilterL2SweepMin(ctx) * 60_000L
+            if (filterForcesTimeOnlyRotation) {
+                // Mesma janela da Camada 2 — ver D2 no histórico de decisões do filtro.
+                autoSaveIntervalMin = SettingsManager.getFilterL2WindowMin(ctx).toLong()
+            }
+            tagFilterEngine?.start(
+                TagFilterEngine.Config(
+                    filterEnabled = filterEnabled,
+                    l1Enabled = filterL1Enabled,
+                    l1PatternsCsv = filterL1Patterns,
+                    l2Enabled = filterL2Enabled,
+                    l2WindowMs = filterL2WindowMs,
+                    l3Enabled = filterL3Enabled,
+                )
+            )
 
             val prefix   = buildFileIdentifier(ctx, isBluetooth = deviceName == BT_DEVICE_NAME)
             val fileName = CsvExporter.startSession(ctx, prefix)
@@ -925,6 +970,22 @@ class UHFReaderService : Service(), SensorEventListener {
                 closePort()
             }
 
+            // D1: se foi o usuário quem pediu Parar, trata tudo que ainda está
+            // pendente na Camada 2 como se a janela tivesse expirado — nada
+            // fica esperando um tempo que não vai mais passar. Numa morte de
+            // processo (userInitiated=false) NÃO fazemos isso: o estado
+            // persistido continua em disco e é recuperado no próximo start
+            // (ver TagFilterEngine.start()).
+            if (userInitiated) {
+                tagFilterEngine?.flushAllNow()?.let { expired ->
+                    if (expired.isNotEmpty()) {
+                        tagBuffer.addAll(expired)
+                        totalCount.addAndGet(expired.size)
+                        Log.i(TAG, "Filter: ${expired.size} EPC(s) pendentes forçados no Stop (D1)")
+                    }
+                }
+            }
+
             val tagCount = totalCount.get()
             val fileName = drainAndFinalize(winnixStopTemp)
             updateNotification("Captura encerrada — $tagCount tags")
@@ -949,6 +1010,12 @@ class UHFReaderService : Service(), SensorEventListener {
         usbReconnectExecutor?.shutdownNow(); usbReconnectExecutor = null
         appContext?.let { SettingsManager.setCaptureState(it, capturing = false) }
         stopExecutor.submit {
+            tagFilterEngine?.flushAllNow()?.let { expired ->
+                if (expired.isNotEmpty()) {
+                    tagBuffer.addAll(expired)
+                    totalCount.addAndGet(expired.size)
+                }
+            }
             val tagCount = totalCount.get()
             val fileName = drainAndFinalize("")
             totalCount.set(0)
@@ -976,14 +1043,17 @@ class UHFReaderService : Service(), SensorEventListener {
                 val spd  = getCurrentGnssSpeed()
                 val locTs = getCurrentLocationTimestamp()
                 val prov  = getCurrentLocationProvider()
-                val tags = jietongDecoder.feed(data, lat, lon, brg, spd, locTs, prov)
-                if (tags.isNotEmpty()) {
-                    tagBuffer.addAll(tags)
-                    totalCount.addAndGet(tags.size)
-                    val sinceLast = tagsSinceLastSave.addAndGet(tags.size)
-                    if (sinceLast >= autoSaveTagCount) {
-                        rescheduleTimerJob()
-                        autoSaveExecutor?.submit { flushBufferToDisk() }
+                val rawTags = jietongDecoder.feed(data, lat, lon, brg, spd, locTs, prov)
+                if (rawTags.isNotEmpty()) {
+                    val tags = tagFilterEngine?.process(rawTags) ?: rawTags
+                    if (tags.isNotEmpty()) {
+                        tagBuffer.addAll(tags)
+                        totalCount.addAndGet(tags.size)
+                        val sinceLast = tagsSinceLastSave.addAndGet(tags.size)
+                        if (!filterForcesTimeOnlyRotation && sinceLast >= autoSaveTagCount) {
+                            rescheduleTimerJob()
+                            autoSaveExecutor?.submit { flushBufferToDisk() }
+                        }
                     }
                 }
             }
@@ -1186,20 +1256,23 @@ class UHFReaderService : Service(), SensorEventListener {
         val spd  = getCurrentGnssSpeed()
         val locTs = getCurrentLocationTimestamp()
         val prov  = getCurrentLocationProvider()
-        val tags = winnixDecoder.feed(data, lat, lon, brg, spd, locTs, prov)
-        if (tags.isNotEmpty()) {
-            val processedTags = tags.toMutableList()
+        val rawTags = winnixDecoder.feed(data, lat, lon, brg, spd, locTs, prov)
+        if (rawTags.isNotEmpty()) {
+            val processedTags = rawTags.toMutableList()
             val temp = winnixStartTemp
             if (temp.isNotEmpty()) {
                 winnixStartTemp = ""
                 processedTags[0] = processedTags[0].copy(temperature = temp)
             }
-            tagBuffer.addAll(processedTags)
-            totalCount.addAndGet(processedTags.size)
-            val sinceLast = tagsSinceLastSave.addAndGet(processedTags.size)
-            if (sinceLast >= autoSaveTagCount) {
-                rescheduleTimerJob()
-                autoSaveExecutor?.submit { flushBufferToDisk() }
+            val tags = tagFilterEngine?.process(processedTags) ?: processedTags
+            if (tags.isNotEmpty()) {
+                tagBuffer.addAll(tags)
+                totalCount.addAndGet(tags.size)
+                val sinceLast = tagsSinceLastSave.addAndGet(tags.size)
+                if (!filterForcesTimeOnlyRotation && sinceLast >= autoSaveTagCount) {
+                    rescheduleTimerJob()
+                    autoSaveExecutor?.submit { flushBufferToDisk() }
+                }
             }
         }
     }
@@ -1633,6 +1706,42 @@ class UHFReaderService : Service(), SensorEventListener {
     private fun startAutoSaveTimer() {
         autoSaveExecutor = Executors.newSingleThreadScheduledExecutor()
         rescheduleTimerJob()
+        scheduleFilterJobs()
+    }
+
+    /**
+     * Agenda, no MESMO executor do auto-save (sem thread pool extra), os dois
+     * jobs periódicos do filtro: persistência em lote da Camada 2/3 (se L3
+     * ativa) e o sweep que expira entradas vencidas da Camada 2. Reagendado a
+     * cada (re)conexão bem-sucedida, igual startAutoSaveTimer() já fazia com
+     * rescheduleTimerJob().
+     */
+    private fun scheduleFilterJobs() {
+        filterPersistJob?.cancel(false); filterPersistJob = null
+        filterSweepJob?.cancel(false); filterSweepJob = null
+        if (!filterEnabled || !filterL2Enabled) return
+
+        if (filterL3Enabled) {
+            filterPersistJob = autoSaveExecutor?.scheduleWithFixedDelay(
+                { try { tagFilterEngine?.persistDirtyNow() } catch (e: Exception) { Log.e(TAG, "Filter persist error", e) } },
+                FILTER_PERSIST_INTERVAL_MS, FILTER_PERSIST_INTERVAL_MS, TimeUnit.MILLISECONDS
+            )
+        }
+        filterSweepJob = autoSaveExecutor?.scheduleWithFixedDelay(
+            { try { runFilterSweep() } catch (e: Exception) { Log.e(TAG, "Filter sweep error", e) } },
+            filterSweepIntervalMs, filterSweepIntervalMs, TimeUnit.MILLISECONDS
+        )
+    }
+
+    /** Camada 2: entradas expiradas viram tags normais de novo, prontas pro auto-save gravar. */
+    private fun runFilterSweep() {
+        if (!isRunning.get()) return
+        val expired = tagFilterEngine?.sweepExpired() ?: emptyList()
+        if (expired.isEmpty()) return
+        tagBuffer.addAll(expired)
+        totalCount.addAndGet(expired.size)
+        tagsSinceLastSave.addAndGet(expired.size)
+        Log.i(TAG, "Filter L2: ${expired.size} EPC(s) expiraram — enfileirados para gravação")
     }
 
     /**
@@ -1651,6 +1760,10 @@ class UHFReaderService : Service(), SensorEventListener {
     private fun stopAutoSaveTimer() {
         autoSaveTimerJob?.cancel(false)
         autoSaveTimerJob = null
+        filterPersistJob?.cancel(false)
+        filterPersistJob = null
+        filterSweepJob?.cancel(false)
+        filterSweepJob = null
         autoSaveExecutor?.shutdown()
         autoSaveExecutor = null
     }
@@ -1802,5 +1915,11 @@ class UHFReaderService : Service(), SensorEventListener {
         private const val WATCHDOG_SILENCE_THRESHOLD_MS = 30_000L
         private const val WATCHDOG_PROBE_INTERVAL_MS    = 30_000L
         private const val WATCHDOG_MAX_FAILED_PROBES    = 3
+
+        // Filtro — intervalo do batch write da Camada 2/3 (persistência do
+        // estado de consolidação em Room). Pior caso de perda num SIGKILL:
+        // as atualizações de RSSI ocorridas só nesta janela — nunca a
+        // entrada inteira, já que o batch anterior já está em disco.
+        private const val FILTER_PERSIST_INTERVAL_MS = 2_500L
     }
 }
