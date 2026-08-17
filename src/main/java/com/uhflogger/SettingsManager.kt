@@ -24,14 +24,16 @@ object SettingsManager {
     const val KEY_WAS_CAPTURING           = "was_capturing"
     const val KEY_LAST_DEVICE_NAME        = "last_device_name"
 
-    // Filtro de 3 camadas
+    // Filtro de tags. A camada 3 (persistência SIGKILL-safe) não tem chave
+    // própria — é automática sempre que a camada 2 está ativa, ver
+    // TagFilterEngine (não faz sentido o usuário desligar só a proteção
+    // contra perda de dados por crash, mantendo a consolidação ligada).
     const val KEY_FILTER_ENABLED          = "filter_enabled"
     const val KEY_FILTER_L1_ENABLED       = "filter_l1_enabled"
     const val KEY_FILTER_L1_PATTERNS      = "filter_l1_patterns"
     const val KEY_FILTER_L2_ENABLED       = "filter_l2_enabled"
     const val KEY_FILTER_L2_WINDOW_MIN    = "filter_l2_window_min"
     const val KEY_FILTER_L2_SWEEP_MIN     = "filter_l2_sweep_min"
-    const val KEY_FILTER_L3_ENABLED       = "filter_l3_enabled"
 
     // Location mode values
     const val LOCATION_MODE_HYBRID        = "hybrid"
@@ -62,14 +64,13 @@ object SettingsManager {
 
     // Filtro — desligado por padrão (opt-in), igual ao envio ao backend: com o
     // filtro desligado, nenhum comportamento muda e o app se comporta
-    // exatamente como antes. Quando ligado, as 3 camadas nascem todas ativas.
+    // exatamente como antes. Quando ligado, as camadas 1 e 2 nascem ativas.
     const val DEFAULT_FILTER_ENABLED         = false
     const val DEFAULT_FILTER_L1_ENABLED      = true
     const val DEFAULT_FILTER_L1_PATTERNS     = ""
     const val DEFAULT_FILTER_L2_ENABLED      = true
     const val DEFAULT_FILTER_L2_WINDOW_MIN   = 30
     const val DEFAULT_FILTER_L2_SWEEP_MIN    = 5
-    const val DEFAULT_FILTER_L3_ENABLED      = true
 
     private fun prefs(context: Context): SharedPreferences =
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -200,10 +201,4 @@ object SettingsManager {
 
     fun setFilterL2SweepMin(context: Context, value: Int) =
         prefs(context).edit().putInt(KEY_FILTER_L2_SWEEP_MIN, value).apply()
-
-    fun isFilterL3Enabled(context: Context): Boolean =
-        prefs(context).getBoolean(KEY_FILTER_L3_ENABLED, DEFAULT_FILTER_L3_ENABLED)
-
-    fun setFilterL3Enabled(context: Context, value: Boolean) =
-        prefs(context).edit().putBoolean(KEY_FILTER_L3_ENABLED, value).apply()
 }

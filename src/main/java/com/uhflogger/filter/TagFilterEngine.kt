@@ -6,14 +6,17 @@ import com.uhflogger.model.TagRecord
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * Núcleo do filtro de 3 camadas. Não gerencia threads/executors próprios — o
+ * Núcleo do filtro de tags. Não gerencia threads/executors próprios — o
  * Service é quem agenda persistência periódica (persistDirtyNow) e o sweep de
  * expiração (sweepExpired), reaproveitando o mesmo executor do auto-save.
  *
  * Camada 1 (família de EPC) e Camada 2 (consolidação por melhor RSSI numa
- * janela fixa a partir de first_seen) e Camada 3 (durabilidade — persiste o
- * estado aberto em Room a cada poucos segundos, pra sobreviver a SIGKILL) são
- * independentes entre si, controladas por Config.
+ * janela fixa a partir de first_seen) são controladas por Config e
+ * independentes entre si. A durabilidade contra SIGKILL (persistir o estado
+ * aberto da Camada 2 em Room a cada poucos segundos) NÃO é uma opção
+ * separada — é automática sempre que a Camada 2 está ativa: não existe
+ * cenário em que valha a pena consolidar em memória e aceitar perder esse
+ * progresso num crash, então não há por que dar essa escolha ao usuário.
  */
 class TagFilterEngine(private val context: Context) {
 
@@ -23,14 +26,13 @@ class TagFilterEngine(private val context: Context) {
         val l1PatternsCsv: String,
         val l2Enabled: Boolean,
         val l2WindowMs: Long,
-        val l3Enabled: Boolean,
     )
 
     private data class OpenEntry(val firstSeenMs: Long, @Volatile var best: TagRecord)
 
     @Volatile private var config = Config(
         filterEnabled = false, l1Enabled = true, l1PatternsCsv = "",
-        l2Enabled = true, l2WindowMs = 30 * 60_000L, l3Enabled = true,
+        l2Enabled = true, l2WindowMs = 30 * 60_000L,
     )
 
     private val openEntries = ConcurrentHashMap<String, OpenEntry>()
@@ -46,7 +48,7 @@ class TagFilterEngine(private val context: Context) {
         config = cfg
         openEntries.clear()
         dirtyEpcs.clear()
-        if (cfg.l2Enabled && cfg.l3Enabled) {
+        if (cfg.l2Enabled) {
             try {
                 FilterStateStore.loadAll(context).forEach { e ->
                     openEntries[e.epc] = OpenEntry(e.firstSeenMs, e.toTagRecord())
@@ -104,10 +106,6 @@ class TagFilterEngine(private val context: Context) {
 
     /** Grava em lote (Room) as entradas atualizadas desde a última chamada. */
     fun persistDirtyNow() {
-        if (!config.l3Enabled) {
-            dirtyEpcs.clear()
-            return
-        }
         val epcs = dirtyEpcs.toList()
         if (epcs.isEmpty()) return
         epcs.forEach { dirtyEpcs.remove(it) }
@@ -140,12 +138,10 @@ class TagFilterEngine(private val context: Context) {
         if (expiredEpcs.isEmpty()) return emptyList()
 
         expiredEpcs.forEach { openEntries.remove(it); dirtyEpcs.remove(it) }
-        if (cfg.l3Enabled) {
-            try {
-                FilterStateStore.deleteAll(context, expiredEpcs)
-            } catch (e: Exception) {
-                Log.e(TAG, "Filter: falha ao remover estado expirado", e)
-            }
+        try {
+            FilterStateStore.deleteAll(context, expiredEpcs)
+        } catch (e: Exception) {
+            Log.e(TAG, "Filter: falha ao remover estado expirado", e)
         }
         return results
     }
@@ -161,12 +157,10 @@ class TagFilterEngine(private val context: Context) {
         val results = epcs.mapNotNull { openEntries[it]?.best }
         openEntries.clear()
         dirtyEpcs.clear()
-        if (config.l3Enabled) {
-            try {
-                FilterStateStore.deleteAll(context, epcs)
-            } catch (e: Exception) {
-                Log.e(TAG, "Filter: falha ao limpar estado no flush final", e)
-            }
+        try {
+            FilterStateStore.deleteAll(context, epcs)
+        } catch (e: Exception) {
+            Log.e(TAG, "Filter: falha ao limpar estado no flush final", e)
         }
         return results
     }

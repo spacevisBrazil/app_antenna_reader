@@ -23,7 +23,7 @@ class SettingsActivity : AppCompatActivity() {
 
     private lateinit var root: LinearLayout
     private lateinit var winnixSection: LinearLayout
-    private lateinit var filterSection: LinearLayout
+    private lateinit var filterContainer: LinearLayout
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -104,19 +104,8 @@ class SettingsActivity : AppCompatActivity() {
         // e do servidor SpaceVis (que só enxergam o CSV já filtrado).
         root.addView(spacer(16))
         buildSectionLabel(root, "FILTRO DE TAGS")
-        val filterEnabledLabel = if (SettingsManager.isFilterEnabled(this)) "Ativado" else "Desativado"
-        buildRow(root, "Filtro ativo", filterEnabledLabel, ROW_FILTER_ENABLED) {
-            showToggleDialog("Filtro de tags", SettingsManager.isFilterEnabled(this)) { enabled ->
-                SettingsManager.setFilterEnabled(this, enabled)
-                updateRowValue(root, ROW_FILTER_ENABLED, if (enabled) "Ativado" else "Desativado")
-                filterSection.visibility = if (enabled) View.VISIBLE else View.GONE
-                toast("Salvo")
-            }
-        }
-        filterSection = buildFilterSection()
-        root.addView(filterSection)
-        filterSection.visibility = if (SettingsManager.isFilterEnabled(this))
-            View.VISIBLE else View.GONE
+        filterContainer = buildFilterContainer()
+        root.addView(filterContainer)
 
         // --- RESTAURAR --------------------------------------------------
         root.addView(spacer(24))
@@ -220,96 +209,86 @@ class SettingsActivity : AppCompatActivity() {
     }
 
     // ─── Seção Filtro ───
+    // Camadas 1 e 2 usam checkbox inline: marcar já revela o campo de
+    // configuração no lugar, sem diálogo — o usuário pediu explicitamente
+    // para eliminar o fluxo "clicar pra abrir diálogo, clicar de novo pra
+    // configurar". Não existe UI para a Camada 3 (persistência SIGKILL-safe):
+    // ela é automática sempre que a Camada 2 está ativa, ver TagFilterEngine —
+    // não há cenário em que o usuário queira consolidar em memória e aceitar
+    // perder esse progresso num crash de propósito.
 
-    private fun buildFilterSection(): LinearLayout {
-        val section = LinearLayout(this).apply {
+    private fun buildFilterContainer(): LinearLayout {
+        val container = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        container.addView(spacer(8))
+
+        val filterEnabled = SettingsManager.isFilterEnabled(this)
+        val configLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
+            visibility  = if (filterEnabled) View.VISIBLE else View.GONE
         }
 
-        section.addView(spacer(8))
+        buildCheckboxRow(container, "Filtro ativo", filterEnabled) { checked ->
+            SettingsManager.setFilterEnabled(this, checked)
+            configLayout.visibility = if (checked) View.VISIBLE else View.GONE
+        }
+
+        container.addView(configLayout)
+        configLayout.addView(spacer(4))
 
         // Camada 1 — família de EPC
-        val l1Label = if (SettingsManager.isFilterL1Enabled(this)) "Ativada" else "Desativada"
-        buildRow(section, "Camada 1 — Família de EPC", l1Label, ROW_FILTER_L1_ENABLED) {
-            showToggleDialog("Camada 1 — Família de EPC", SettingsManager.isFilterL1Enabled(this)) { v ->
-                SettingsManager.setFilterL1Enabled(this, v)
-                updateRowValue(section, ROW_FILTER_L1_ENABLED, if (v) "Ativada" else "Desativada")
-                toast("Salvo")
-            }
+        val l1Enabled = SettingsManager.isFilterL1Enabled(this)
+        val l1Field = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility  = if (l1Enabled) View.VISIBLE else View.GONE
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+            lp.bottomMargin = dp(8)
+            layoutParams = lp
         }
-
-        val patterns = SettingsManager.getFilterL1Patterns(this)
-        val patternsLabel = if (patterns.isBlank()) "Nenhum padrão (aceita tudo)" else patterns
-        buildRow(section, "Padrões de EPC (Camada 1)", patternsLabel, ROW_FILTER_L1_PATTERNS) {
-            showTextDialog("Padrões de EPC",
-                "Hex separado por vírgula. 'X' aceita qualquer dígito. Ex.: 0000100000000XXX,0076000000004XXX. Vazio = aceita tudo.",
-                SettingsManager.getFilterL1Patterns(this)) { v ->
-                SettingsManager.setFilterL1Patterns(this, v)
-                val label = if (v.isBlank()) "Nenhum padrão (aceita tudo)" else v
-                updateRowValue(section, ROW_FILTER_L1_PATTERNS, label)
-                toast("Salvo")
-            }
+        buildCheckboxRow(configLayout, "Camada 1 — Família de EPC", l1Enabled) { checked ->
+            SettingsManager.setFilterL1Enabled(this, checked)
+            l1Field.visibility = if (checked) View.VISIBLE else View.GONE
         }
+        configLayout.addView(l1Field)
+        buildInlineTextField(
+            l1Field,
+            "Ex.: 0000100000000XXX,0076000000004XXX ('X' = qualquer dígito). Vazio = aceita tudo.",
+            SettingsManager.getFilterL1Patterns(this)
+        ) { v -> SettingsManager.setFilterL1Patterns(this, v); toast("Salvo") }
 
-        section.addView(spacer(8))
+        configLayout.addView(spacer(4))
 
-        // Camada 2 — consolidação por EPC
-        val l2Label = if (SettingsManager.isFilterL2Enabled(this)) "Ativada" else "Desativada"
-        buildRow(section, "Camada 2 — Consolidação por EPC", l2Label, ROW_FILTER_L2_ENABLED) {
-            showToggleDialog("Camada 2 — Consolidação por EPC", SettingsManager.isFilterL2Enabled(this)) { v ->
-                SettingsManager.setFilterL2Enabled(this, v)
-                updateRowValue(section, ROW_FILTER_L2_ENABLED, if (v) "Ativada" else "Desativada")
-                toast("Salvo")
-            }
+        // Camada 2 — consolidação por melhor RSSI dentro de uma janela
+        val l2Enabled = SettingsManager.isFilterL2Enabled(this)
+        val l2Field = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility  = if (l2Enabled) View.VISIBLE else View.GONE
         }
-
-        buildRow(section, "Janela de consolidação",
-            "${SettingsManager.getFilterL2WindowMin(this)} min", ROW_FILTER_L2_WINDOW) {
-            showNumberDialog("Janela de consolidação",
-                "Entre 1 e 1440 minutos — mantém só a melhor leitura (RSSI) de cada EPC dentro da janela",
-                SettingsManager.getFilterL2WindowMin(this).toString(),
-                1, 1440) { v ->
+        buildCheckboxRow(configLayout, "Camada 2 — Consolidação por EPC (melhor RSSI)", l2Enabled) { checked ->
+            SettingsManager.setFilterL2Enabled(this, checked)
+            l2Field.visibility = if (checked) View.VISIBLE else View.GONE
+        }
+        configLayout.addView(l2Field)
+        buildInlineNumberField(
+            l2Field, "Janela de consolidação (min)",
+            getCurrent = { SettingsManager.getFilterL2WindowMin(this) },
+            min = 1, max = 1440,
+            validate = { v ->
                 val sweep = SettingsManager.getFilterL2SweepMin(this)
-                if (v <= sweep) {
-                    toast("A janela deve ser maior que o sweep ($sweep min)")
-                } else {
-                    SettingsManager.setFilterL2WindowMin(this, v)
-                    updateRowValue(section, ROW_FILTER_L2_WINDOW, "$v min")
-                    toast("Salvo")
-                }
+                if (v <= sweep) "A janela deve ser maior que o sweep ($sweep min)" else null
             }
-        }
-
-        buildRow(section, "Intervalo de sweep",
-            "${SettingsManager.getFilterL2SweepMin(this)} min", ROW_FILTER_L2_SWEEP) {
-            showNumberDialog("Intervalo de sweep",
-                "Deve ser menor que a janela de consolidação — checa periodicamente quais EPCs já expiraram",
-                SettingsManager.getFilterL2SweepMin(this).toString(),
-                1, 1440) { v ->
+        ) { v -> SettingsManager.setFilterL2WindowMin(this, v) }
+        buildInlineNumberField(
+            l2Field, "Intervalo de sweep (min)",
+            getCurrent = { SettingsManager.getFilterL2SweepMin(this) },
+            min = 1, max = 1440,
+            validate = { v ->
                 val window = SettingsManager.getFilterL2WindowMin(this)
-                if (v >= window) {
-                    toast("O sweep deve ser menor que a janela ($window min)")
-                } else {
-                    SettingsManager.setFilterL2SweepMin(this, v)
-                    updateRowValue(section, ROW_FILTER_L2_SWEEP, "$v min")
-                    toast("Salvo")
-                }
+                if (v >= window) "O sweep deve ser menor que a janela ($window min)" else null
             }
-        }
+        ) { v -> SettingsManager.setFilterL2SweepMin(this, v) }
 
-        section.addView(spacer(8))
-
-        // Camada 3 — persistência (sobrevive a SIGKILL)
-        val l3Label = if (SettingsManager.isFilterL3Enabled(this)) "Ativada" else "Desativada"
-        buildRow(section, "Camada 3 — Persistência (SIGKILL-safe)", l3Label, ROW_FILTER_L3_ENABLED) {
-            showToggleDialog("Camada 3 — Persistência", SettingsManager.isFilterL3Enabled(this)) { v ->
-                SettingsManager.setFilterL3Enabled(this, v)
-                updateRowValue(section, ROW_FILTER_L3_ENABLED, if (v) "Ativada" else "Desativada")
-                toast("Salvo")
-            }
-        }
-
-        return section
+        return container
     }
 
     // ─── Diálogos ───
@@ -490,79 +469,6 @@ class SettingsActivity : AppCompatActivity() {
             .show()
     }
 
-    private fun showToggleDialog(title: String, current: Boolean, onSave: (Boolean) -> Unit) {
-        val wrapper = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.WHITE)
-            val p = dp(20)
-            setPadding(p, dp(8), p, dp(8))
-        }
-        val radioGroup = RadioGroup(this)
-        val rbOn = RadioButton(this).apply {
-            id        = 90
-            text      = "Ativado"
-            setTextColor(TEXT)
-            textSize  = 14f
-            isChecked = current
-        }
-        val rbOff = RadioButton(this).apply {
-            id        = 91
-            text      = "Desativado"
-            setTextColor(TEXT)
-            textSize  = 14f
-            isChecked = !current
-        }
-        radioGroup.addView(rbOn)
-        radioGroup.addView(rbOff)
-        wrapper.addView(radioGroup)
-
-        AlertDialog.Builder(this, android.R.style.Theme_Material_Light_Dialog_Alert)
-            .setTitle(title)
-            .setView(wrapper)
-            .setPositiveButton("Salvar") { _, _ ->
-                onSave(radioGroup.checkedRadioButtonId == 90)
-            }
-            .setNegativeButton("Cancelar", null)
-            .show()
-    }
-
-    private fun showTextDialog(title: String, hint: String, current: String, onSave: (String) -> Unit) {
-        val wrapper = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.WHITE)
-            val p = dp(20)
-            setPadding(p, dp(8), p, 0)
-        }
-        val tvHint = TextView(this).apply {
-            text     = hint
-            textSize = 12f
-            setTextColor(MUTED)
-            val lp = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-            lp.bottomMargin = dp(12)
-            layoutParams = lp
-        }
-        val input = EditText(this).apply {
-            inputType = InputType.TYPE_CLASS_TEXT
-            setText(current)
-            textSize = 16f
-            setTextColor(TEXT)
-            setBackgroundColor(Color.WHITE)
-            selectAll()
-        }
-        wrapper.addView(tvHint)
-        wrapper.addView(input)
-
-        AlertDialog.Builder(this, android.R.style.Theme_Material_Light_Dialog_Alert)
-            .setTitle(title)
-            .setView(wrapper)
-            .setPositiveButton("Salvar") { _, _ ->
-                onSave(input.text.toString().trim())
-            }
-            .setNegativeButton("Cancelar", null)
-            .show()
-    }
-
     private fun showAutoSaveModeDialog(parent: LinearLayout) {
         val current = SettingsManager.getAutoSaveMode(this)
         val wrapper = LinearLayout(this).apply {
@@ -688,8 +594,6 @@ class SettingsActivity : AppCompatActivity() {
                             SettingsManager.DEFAULT_FILTER_L2_WINDOW_MIN)
                         SettingsManager.setFilterL2SweepMin(this@SettingsActivity,
                             SettingsManager.DEFAULT_FILTER_L2_SWEEP_MIN)
-                        SettingsManager.setFilterL3Enabled(this@SettingsActivity,
-                            SettingsManager.DEFAULT_FILTER_L3_ENABLED)
 
                         updateRowValue(parent, ROW_TAGS,
                             "A cada ${SettingsManager.DEFAULT_AUTO_SAVE_TAGS} tags")
@@ -715,21 +619,14 @@ class SettingsActivity : AppCompatActivity() {
                             if (SettingsManager.DEFAULT_ANTENNA_TYPE == SettingsManager.ANTENNA_TYPE_WINNIX)
                                 View.VISIBLE else View.GONE
 
-                        updateRowValue(parent, ROW_FILTER_ENABLED,
-                            if (SettingsManager.DEFAULT_FILTER_ENABLED) "Ativado" else "Desativado")
-                        updateRowValue(filterSection, ROW_FILTER_L1_ENABLED,
-                            if (SettingsManager.DEFAULT_FILTER_L1_ENABLED) "Ativada" else "Desativada")
-                        updateRowValue(filterSection, ROW_FILTER_L1_PATTERNS, "Nenhum padrão (aceita tudo)")
-                        updateRowValue(filterSection, ROW_FILTER_L2_ENABLED,
-                            if (SettingsManager.DEFAULT_FILTER_L2_ENABLED) "Ativada" else "Desativada")
-                        updateRowValue(filterSection, ROW_FILTER_L2_WINDOW,
-                            "${SettingsManager.DEFAULT_FILTER_L2_WINDOW_MIN} min")
-                        updateRowValue(filterSection, ROW_FILTER_L2_SWEEP,
-                            "${SettingsManager.DEFAULT_FILTER_L2_SWEEP_MIN} min")
-                        updateRowValue(filterSection, ROW_FILTER_L3_ENABLED,
-                            if (SettingsManager.DEFAULT_FILTER_L3_ENABLED) "Ativada" else "Desativada")
-                        filterSection.visibility =
-                            if (SettingsManager.DEFAULT_FILTER_ENABLED) View.VISIBLE else View.GONE
+                        // Sem IDs para patchar (checkboxes + campos inline não
+                        // têm um "valor" único como as linhas de diálogo) —
+                        // mais simples reconstruir a subárvore inteira a
+                        // partir dos defaults recém-gravados.
+                        val filterIdx = parent.indexOfChild(filterContainer)
+                        parent.removeView(filterContainer)
+                        filterContainer = buildFilterContainer()
+                        parent.addView(filterContainer, filterIdx)
 
                         toast("Configurações restauradas")
                     }
@@ -821,6 +718,153 @@ class SettingsActivity : AppCompatActivity() {
         }
     }
 
+    // Borda de input mais visível que borderDrawable() — usada nos campos
+    // inline do filtro. borderDrawable() usa um cinza claro (#E0E0E0) pensado
+    // pra separar cards num fundo #FAFAFA; num EditText branco sobre fundo
+    // branco isso ficava praticamente invisível (o problema relatado: "a
+    // caixa de texto esta da mesma cor que todo o resto, sem borda").
+    private fun fieldBorderDrawable(focused: Boolean = false): android.graphics.drawable.GradientDrawable {
+        return android.graphics.drawable.GradientDrawable().apply {
+            setColor(Color.WHITE)
+            setStroke(dp(if (focused) 2 else 1), if (focused) GREEN else Color.parseColor("#BDBDBD"))
+            cornerRadius = dp(8).toFloat()
+        }
+    }
+
+    // Linha com checkbox: toda a linha é clicável (idioma padrão do Android —
+    // o toque no checkbox consome o evento antes de chegar no listener do
+    // pai, então não dispara duas vezes). Usada pelas camadas 1/2 do filtro
+    // no lugar do antigo padrão "linha abre diálogo".
+    private fun buildCheckboxRow(
+        parent : LinearLayout,
+        title  : String,
+        checked: Boolean,
+        onToggle: (Boolean) -> Unit
+    ): CheckBox {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity     = Gravity.CENTER_VERTICAL
+            setBackgroundColor(CARD)
+            background  = borderDrawable()
+            val pad     = dp(14)
+            setPadding(pad, pad, pad, pad)
+            isClickable = true
+            isFocusable = true
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+            lp.bottomMargin = dp(8)
+            layoutParams = lp
+        }
+        val tvTitle = TextView(this).apply {
+            text     = title
+            textSize = 14f
+            setTextColor(TEXT)
+            layoutParams = LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        val checkBox = CheckBox(this).apply {
+            isChecked = checked
+            setOnCheckedChangeListener { _, isChecked -> onToggle(isChecked) }
+        }
+        row.setOnClickListener { checkBox.toggle() }
+        row.addView(tvTitle)
+        row.addView(checkBox)
+        parent.addView(row)
+        return checkBox
+    }
+
+    // Campo de texto inline (sem diálogo) — salva ao perder o foco.
+    private fun buildInlineTextField(
+        parent: LinearLayout,
+        hint  : String,
+        current: String,
+        onSave: (String) -> Unit
+    ): EditText {
+        val input = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_TEXT
+            setText(current)
+            this.hint = hint
+            textSize  = 14f
+            setTextColor(TEXT)
+            setHintTextColor(MUTED)
+            background = fieldBorderDrawable()
+            val pad = dp(12)
+            setPadding(pad, pad, pad, pad)
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+            lp.bottomMargin = dp(8)
+            layoutParams = lp
+            setOnFocusChangeListener { v, hasFocus ->
+                background = fieldBorderDrawable(focused = hasFocus)
+                if (!hasFocus) onSave((v as EditText).text.toString().trim())
+            }
+        }
+        parent.addView(input)
+        return input
+    }
+
+    // Campo numérico inline com rótulo e validação cruzada (lê o valor atual
+    // do campo irmão via getCurrent/validate, nunca uma closure velha) — usado
+    // pela janela/sweep da Camada 2, onde um depende do outro (D6).
+    private fun buildInlineNumberField(
+        parent: LinearLayout,
+        label : String,
+        getCurrent: () -> Int,
+        min: Int,
+        max: Int,
+        validate: (Int) -> String?,
+        onSave: (Int) -> Unit
+    ): EditText {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+            lp.bottomMargin = dp(8)
+            layoutParams = lp
+        }
+        val tvLabel = TextView(this).apply {
+            text     = label
+            textSize = 12f
+            setTextColor(MUTED)
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+            lp.bottomMargin = dp(4)
+            layoutParams = lp
+        }
+        val input = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setText(getCurrent().toString())
+            textSize = 14f
+            setTextColor(TEXT)
+            background = fieldBorderDrawable()
+            val pad = dp(12)
+            setPadding(pad, pad, pad, pad)
+            setOnFocusChangeListener { v, hasFocus ->
+                background = fieldBorderDrawable(focused = hasFocus)
+                if (!hasFocus) {
+                    val value = (v as EditText).text.toString().toIntOrNull()
+                    val err = when {
+                        value == null  -> "Valor inválido"
+                        value < min    -> "Mínimo: $min"
+                        value > max    -> "Máximo: $max"
+                        else           -> validate(value)
+                    }
+                    if (err != null) {
+                        toast(err)
+                        setText(getCurrent().toString())
+                    } else {
+                        onSave(value!!)
+                        toast("Salvo")
+                    }
+                }
+            }
+        }
+        row.addView(tvLabel)
+        row.addView(input)
+        parent.addView(row)
+        return input
+    }
+
     private fun updateRowValue(parent: LinearLayout, id: Int, text: String) {
         parent.findViewById<TextView>(id)?.text = text
     }
@@ -848,12 +892,5 @@ class SettingsActivity : AppCompatActivity() {
         private const val ROW_WINNIX_INV_MODE = 2008
         private const val ROW_DRIVE_ACCOUNT   = 2009
         private const val ROW_BACKEND         = 2011
-        private const val ROW_FILTER_ENABLED      = 2012
-        private const val ROW_FILTER_L1_ENABLED   = 2013
-        private const val ROW_FILTER_L1_PATTERNS  = 2014
-        private const val ROW_FILTER_L2_ENABLED   = 2015
-        private const val ROW_FILTER_L2_WINDOW    = 2016
-        private const val ROW_FILTER_L2_SWEEP     = 2017
-        private const val ROW_FILTER_L3_ENABLED   = 2018
     }
 }
