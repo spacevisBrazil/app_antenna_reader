@@ -161,22 +161,22 @@ Segundo destino de upload, independente e paralelo ao Google Drive. Com o envio 
 
 ### Tag filter pipeline (`com.uhflogger.filter`) — branch `feature/rfid-tag-filter`
 
-Reduz o volume de dados salvo no CSV e enviado ao Drive/backend, aplicado **antes** de qualquer tag chegar no `CsvExporter` — Drive e o backend SpaceVis só enxergam o que já passou pelo filtro. Desligado por padrão (opt-in): com `filter_enabled=false` o comportamento é idêntico a antes desta feature. Três camadas independentes entre si, cada uma com seu próprio toggle:
+Reduz o volume de dados salvo no CSV e enviado ao Drive/backend, aplicado **antes** de qualquer tag chegar no `CsvExporter` — Drive e o backend SpaceVis só enxergam o que já passou pelo filtro. Desligado por padrão (opt-in): com `filter_enabled=false` o comportamento é idêntico a antes desta feature. Duas camadas configuráveis pelo usuário, independentes entre si, mais uma proteção interna automática:
 
 - **Camada 1 — família de EPC** (`EpcFamilyMatcher`): lista de padrões hex do mesmo tamanho do EPC, onde `X` aceita qualquer caractere na posição e as demais posições precisam bater exatamente (ex.: `0000100000000XXX`). Lista vazia = aceita tudo. `X` não é validado como estritamente hex — decisão deliberada de manter o matcher simples, dado que EPCs reais só usam hex.
 - **Camada 2 — consolidação por EPC** (`TagFilterEngine.absorb`/`sweepExpired`): mantém só a leitura de melhor RSSI de cada EPC dentro de uma janela de tempo contada a partir do `first_seen` daquele EPC (não uma janela deslizante). Um job de sweep (`runFilterSweep`, agendado no mesmo executor do auto-save) varre periodicamente as entradas abertas e libera para o CSV as que já passaram da janela.
-- **Camada 3 — persistência SIGKILL-safe** (`FilterStateQueue`/`FilterStateStore`): grava em lote (`persistDirtyNow`) o estado aberto da Camada 2 em Room (tabela `filter_state`, `UploadQueueDatabase` v4, WAL). Ao reiniciar (`TagFilterEngine.start()`), recarrega qualquer entrada deixada aberta por uma sessão anterior que morreu sem passar pelo Stop normal — nunca perde a consolidação em andamento. Sem a Camada 3, o estado de consolidação vive só em memória (`ConcurrentHashMap`) e é perdido num SIGKILL.
+- **Persistência SIGKILL-safe** (`FilterStateQueue`/`FilterStateStore`) — **não é uma camada com toggle próprio**: é automática sempre que a Camada 2 está ativa. Grava em lote (`persistDirtyNow`) o estado aberto da Camada 2 em Room (tabela `filter_state`, `UploadQueueDatabase` v4, WAL). Ao reiniciar (`TagFilterEngine.start()`), recarrega qualquer entrada deixada aberta por uma sessão anterior que morreu sem passar pelo Stop normal — nunca perde a consolidação em andamento. Não existe cenário em que faça sentido consolidar em memória e aceitar de propósito perder esse progresso num crash, então essa proteção nunca é exposta como opção desligável.
 
 **Integração em `UHFReaderService`:**
-- Config (`filterEnabled`/`filterL1*`/`filterL2*`/`filterL3Enabled`) é lida de `SettingsManager` uma vez por sessão, dentro do bloco `if (!resuming)` de `startCapture()` — não é relida a cada reconexão, pelo mesmo motivo que os outros tunables de sessão (auto-save, antena) não são.
-- **D1**: Stop iniciado pelo usuário (`stopCapture(userInitiated=true)`) e `saveAfterError()` chamam `tagFilterEngine.flushAllNow()` incondicionalmente — força a expiração de tudo que está aberto, para que nenhuma leitura fique presa esperando uma janela que nunca vai fechar. Stop involuntário (`userInitiated=false`, process-death) **não** força flush — o estado persistido (Camada 3) é recuperado no próximo `start()`.
+- Config (`filterEnabled`/`filterL1*`/`filterL2*`) é lida de `SettingsManager` uma vez por sessão, dentro do bloco `if (!resuming)` de `startCapture()` — não é relida a cada reconexão, pelo mesmo motivo que os outros tunables de sessão (auto-save, antena) não são.
+- **D1**: Stop iniciado pelo usuário (`stopCapture(userInitiated=true)`) e `saveAfterError()` chamam `tagFilterEngine.flushAllNow()` incondicionalmente — força a expiração de tudo que está aberto, para que nenhuma leitura fique presa esperando uma janela que nunca vai fechar. Stop involuntário (`userInitiated=false`, process-death) **não** força flush — o estado persistido é recuperado no próximo `start()`.
 - **D2**: com a Camada 2 ativa (`filterForcesTimeOnlyRotation`), rotação de sessão por CONTAGEM de tags brutas deixa de fazer sentido (tags já chegam consolidadas) — a rotação passa a ser só por tempo, com o mesmo intervalo da janela da Camada 2 (`autoSaveIntervalMin` é sobrescrito por `getFilterL2WindowMin()` nesse caso).
-- `scheduleFilterJobs()` (persistência periódica + sweep) roda no mesmo `autoSaveExecutor` do auto-save, sem thread pool extra — reagendado a cada `startAutoSaveTimer()`, ou seja, em toda conexão bem-sucedida (fresh start E reconexão BT/USB), igual ao `rescheduleTimerJob()` existente.
+- `scheduleFilterJobs()` (persistência periódica + sweep, ambas incondicionais uma vez que a Camada 2 está ativa) roda no mesmo `autoSaveExecutor` do auto-save, sem thread pool extra — reagendado a cada `startAutoSaveTimer()`, ou seja, em toda conexão bem-sucedida (fresh start E reconexão BT/USB), igual ao `rescheduleTimerJob()` existente.
 - Hook aplicado tanto no caminho Jietong (`onNewData`) quanto Winnix (`winnixOnNewData`, depois de já ter carimbado a temperatura) — `tagFilterEngine.process(tags)` retorna só as tags que devem seguir direto pro pipeline normal; as absorvidas pela Camada 2 só reaparecem quando expiram via sweep.
 
-**UI** (`SettingsActivity`, seção "FILTRO DE TAGS"): toggle mestre + 3 toggles por camada + campo de texto para os padrões da Camada 1 + campos numéricos para janela/sweep da Camada 2, com validação cruzada (sweep precisa ser estritamente menor que a janela, checado nos dois campos). Segue o mesmo padrão de seção condicional (`filterSection.visibility`) já usado pela seção Winnix.
+**UI** (`SettingsActivity`, seção "FILTRO DE TAGS"): checkboxes inline, sem diálogos — marcar "Filtro ativo" revela a configuração das camadas 1/2 no lugar; marcar a Camada 1 revela direto o campo de texto de padrões de EPC (`buildInlineTextField`); marcar a Camada 2 revela os dois campos numéricos de janela/sweep (`buildInlineNumberField`), com validação cruzada (sweep precisa ser estritamente menor que a janela, checado nos dois campos, lendo o valor ao vivo do campo irmão via `SettingsManager` em vez de um valor capturado). Campos inline usam `fieldBorderDrawable()` (fundo branco + borda visível, verde quando focado) para não se confundir com o card ao redor — distinto de `borderDrawable()`, usado nos cards/linhas de checkbox. Restaurar padrões reconstrói o `filterContainer` inteiro a partir dos defaults (`root.removeView`/`buildFilterContainer()`/`root.addView`) em vez de patchar valores por ID, já que checkboxes e campos inline não têm o formato "linha com TextView de valor" das linhas de diálogo. Não existe UI para a persistência SIGKILL-safe — não há por que o usuário desligar só a proteção contra perda de dados, mantendo a consolidação ligada.
 
-**Defaults** (`SettingsManager`): filtro geral desligado (`DEFAULT_FILTER_ENABLED=false`); quando ligado, as 3 camadas nascem todas ativas; janela = 30 min, sweep = 5 min, sem padrões de EPC configurados (Camada 1 aceita tudo).
+**Defaults** (`SettingsManager`): filtro geral desligado (`DEFAULT_FILTER_ENABLED=false`); quando ligado, as camadas 1 e 2 nascem ativas; janela = 30 min, sweep = 5 min, sem padrões de EPC configurados (Camada 1 aceita tudo).
 
 ### Settings
 
@@ -232,7 +232,7 @@ Version is set in `app/build.gradle` (`versionName` + `versionCode`). **Incremen
   - `MINOR` (`x.+1.0`) — new user-visible features or significant behaviour changes.
   - `MAJOR` (`+1.0.0`) — breaking changes or major redesigns.
 
-Current version: **1.2.0** (versionCode 5). O flavor `hml` acrescenta `-hml` ao `versionName` (ex.: `1.2.0-hml`); o `versionCode` é o mesmo para os dois. Always commit the version bump together with the change that triggered it, not as a separate commit afterwards.
+Current version: **1.2.1** (versionCode 6). O flavor `hml` acrescenta `-hml` ao `versionName` (ex.: `1.2.1-hml`); o `versionCode` é o mesmo para os dois. Always commit the version bump together with the change that triggered it, not as a separate commit afterwards.
 
 Branch **`fix/csv-lazy-write`** — contém as implementações de CSV lazy creation, rotação de sessão, defaults de configuração (Winnix, 2 antenas, Adaptive, 5k tags), fix de labels no SettingsActivity, e melhorias de GNSS.
 
@@ -243,7 +243,7 @@ Branch **`bluetooth_V1_1_under_test`** — contém o módulo de envio ao backend
 - Ativação por deep link `uhflogger://ativar?chave=XXXX` — operador toca link enviado por WhatsApp.
 - Fix crítico de renovação de token: o app agora renova só com o refresh token, sem exigir `client_id/secret` (bug que matava o envio 5h após ativação em todo aparelho de campo).
 
-Current branch: **`feature/rfid-tag-filter`** (a partir de `bluetooth_V1_1_under_test`) — contém o filtro de 3 camadas descrito em "Tag filter pipeline" acima.
+Current branch: **`feature/rfid-tag-filter`** (a partir de `bluetooth_V1_1_under_test`) — contém o filtro de tags descrito em "Tag filter pipeline" acima.
 
 ### Signing / distribution
 

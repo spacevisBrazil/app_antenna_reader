@@ -11,10 +11,11 @@ import com.uhflogger.drive.UploadQueueDatabase
 import com.uhflogger.model.TagRecord
 
 /**
- * Estado persistido da Camada 2 (consolidação por EPC) — Camada 3 (durabilidade,
- * quando habilitada). Uma linha por EPC com entrada aberta: guarda a leitura de
- * melhor RSSI vista até agora dentro da janela, e o timestamp da primeira leitura
- * (first_seen), que nunca é alterado depois de criado.
+ * Estado persistido da Camada 2 (consolidação por EPC) — a durabilidade contra
+ * SIGKILL é automática sempre que a Camada 2 está ativa, sem toggle próprio.
+ * Uma linha por EPC com entrada aberta: guarda a leitura de melhor RSSI vista
+ * até agora dentro da janela, e o timestamp da primeira leitura (first_seen),
+ * que nunca é alterado depois de criado.
  *
  * Sobrevive a SIGKILL/OOM-kill: no pior caso perde-se só o que ainda não tinha
  * sido persistido no último batch (~2-3s) — nunca a entrada inteira, já que o

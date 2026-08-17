@@ -500,7 +500,6 @@ class UHFReaderService : Service(), SensorEventListener {
     private var filterL1Patterns      = SettingsManager.DEFAULT_FILTER_L1_PATTERNS
     private var filterL2Enabled       = SettingsManager.DEFAULT_FILTER_L2_ENABLED
     private var filterL2WindowMs      = SettingsManager.DEFAULT_FILTER_L2_WINDOW_MIN * 60_000L
-    private var filterL3Enabled       = SettingsManager.DEFAULT_FILTER_L3_ENABLED
     private var filterSweepIntervalMs = SettingsManager.DEFAULT_FILTER_L2_SWEEP_MIN * 60_000L
     private var filterPersistJob: ScheduledFuture<*>? = null
     private var filterSweepJob  : ScheduledFuture<*>? = null
@@ -701,7 +700,6 @@ class UHFReaderService : Service(), SensorEventListener {
             filterL1Patterns      = SettingsManager.getFilterL1Patterns(ctx)
             filterL2Enabled       = SettingsManager.isFilterL2Enabled(ctx)
             filterL2WindowMs      = SettingsManager.getFilterL2WindowMin(ctx) * 60_000L
-            filterL3Enabled       = SettingsManager.isFilterL3Enabled(ctx)
             filterSweepIntervalMs = SettingsManager.getFilterL2SweepMin(ctx) * 60_000L
             if (filterForcesTimeOnlyRotation) {
                 // Mesma janela da Camada 2 — ver D2 no histórico de decisões do filtro.
@@ -714,7 +712,6 @@ class UHFReaderService : Service(), SensorEventListener {
                     l1PatternsCsv = filterL1Patterns,
                     l2Enabled = filterL2Enabled,
                     l2WindowMs = filterL2WindowMs,
-                    l3Enabled = filterL3Enabled,
                 )
             )
 
@@ -1711,22 +1708,21 @@ class UHFReaderService : Service(), SensorEventListener {
 
     /**
      * Agenda, no MESMO executor do auto-save (sem thread pool extra), os dois
-     * jobs periódicos do filtro: persistência em lote da Camada 2/3 (se L3
-     * ativa) e o sweep que expira entradas vencidas da Camada 2. Reagendado a
-     * cada (re)conexão bem-sucedida, igual startAutoSaveTimer() já fazia com
-     * rescheduleTimerJob().
+     * jobs periódicos do filtro: persistência em lote do estado da Camada 2
+     * (durabilidade contra SIGKILL, sempre ativa junto com a Camada 2 — ver
+     * TagFilterEngine) e o sweep que expira entradas vencidas da Camada 2.
+     * Reagendado a cada (re)conexão bem-sucedida, igual startAutoSaveTimer()
+     * já fazia com rescheduleTimerJob().
      */
     private fun scheduleFilterJobs() {
         filterPersistJob?.cancel(false); filterPersistJob = null
         filterSweepJob?.cancel(false); filterSweepJob = null
         if (!filterEnabled || !filterL2Enabled) return
 
-        if (filterL3Enabled) {
-            filterPersistJob = autoSaveExecutor?.scheduleWithFixedDelay(
-                { try { tagFilterEngine?.persistDirtyNow() } catch (e: Exception) { Log.e(TAG, "Filter persist error", e) } },
-                FILTER_PERSIST_INTERVAL_MS, FILTER_PERSIST_INTERVAL_MS, TimeUnit.MILLISECONDS
-            )
-        }
+        filterPersistJob = autoSaveExecutor?.scheduleWithFixedDelay(
+            { try { tagFilterEngine?.persistDirtyNow() } catch (e: Exception) { Log.e(TAG, "Filter persist error", e) } },
+            FILTER_PERSIST_INTERVAL_MS, FILTER_PERSIST_INTERVAL_MS, TimeUnit.MILLISECONDS
+        )
         filterSweepJob = autoSaveExecutor?.scheduleWithFixedDelay(
             { try { runFilterSweep() } catch (e: Exception) { Log.e(TAG, "Filter sweep error", e) } },
             filterSweepIntervalMs, filterSweepIntervalMs, TimeUnit.MILLISECONDS
