@@ -10,7 +10,6 @@ object SettingsManager {
     // Keys
     const val KEY_AUTO_SAVE_TAGS          = "auto_save_tags"
     const val KEY_AUTO_SAVE_MINUTES       = "auto_save_minutes"
-    const val KEY_AUTO_SAVE_MODE          = "auto_save_mode"
     const val KEY_LOCATION_MODE           = "location_mode"
     const val KEY_ANTENNA_TYPE            = "antenna_type"
     const val KEY_WINNIX_ANT_COUNT        = "winnix_ant_count"
@@ -51,10 +50,10 @@ object SettingsManager {
     // Defaults
     const val DEFAULT_AUTO_SAVE_TAGS         = 5_000
     const val DEFAULT_AUTO_SAVE_MINUTES      = 10
-    // Auto-save mode
-    const val AUTO_SAVE_MODE_APPEND          = 0  // append to current file
-    const val AUTO_SAVE_MODE_NEW_FILE        = 1  // create new file each auto-save
-    const val DEFAULT_AUTO_SAVE_MODE         = AUTO_SAVE_MODE_NEW_FILE
+    // Único modo de auto-save suportado: sempre abre um novo arquivo. Mantido
+    // como constante (não mais uma preferência configurável) porque o valor é
+    // enviado ao backend em DeviceIdentity.captureConfig().
+    const val AUTO_SAVE_MODE_NEW_FILE        = 1
     const val DEFAULT_LOCATION_MODE          = LOCATION_MODE_HYBRID
     const val DEFAULT_ANTENNA_TYPE           = ANTENNA_TYPE_WINNIX
     const val DEFAULT_WINNIX_ANT_COUNT       = 2
@@ -62,12 +61,11 @@ object SettingsManager {
     const val DEFAULT_WINNIX_WORKING_MS      = 100
     const val DEFAULT_WINNIX_INVENTORY_MODE  = WINNIX_INV_MODE_ADAPTIVE
 
-    // Filtro — desligado por padrão (opt-in), igual ao envio ao backend: com o
-    // filtro desligado, nenhum comportamento muda e o app se comporta
-    // exatamente como antes. Quando ligado, as camadas 1 e 2 nascem ativas.
-    const val DEFAULT_FILTER_ENABLED         = false
+    // Filtro — ligado por padrão, com as camadas 1 e 2 ativas e a camada 1 já
+    // com os padrões de EPC conhecidos das antenas em uso.
+    const val DEFAULT_FILTER_ENABLED         = true
     const val DEFAULT_FILTER_L1_ENABLED      = true
-    const val DEFAULT_FILTER_L1_PATTERNS     = ""
+    const val DEFAULT_FILTER_L1_PATTERNS     = "00001000000XXXXX,0000000000000000000XXXXX,00760000000XXXXX"
     const val DEFAULT_FILTER_L2_ENABLED      = true
     const val DEFAULT_FILTER_L2_WINDOW_MIN   = 30
     const val DEFAULT_FILTER_L2_SWEEP_MIN    = 5
@@ -86,12 +84,6 @@ object SettingsManager {
 
     fun setAutoSaveMinutes(context: Context, value: Int) =
         prefs(context).edit().putInt(KEY_AUTO_SAVE_MINUTES, value).apply()
-
-    fun getAutoSaveMode(context: Context): Int =
-        prefs(context).getInt(KEY_AUTO_SAVE_MODE, DEFAULT_AUTO_SAVE_MODE)
-
-    fun setAutoSaveMode(context: Context, value: Int) =
-        prefs(context).edit().putInt(KEY_AUTO_SAVE_MODE, value).apply()
 
     fun getLocationMode(context: Context): String =
         prefs(context).getString(KEY_LOCATION_MODE, DEFAULT_LOCATION_MODE) ?: DEFAULT_LOCATION_MODE

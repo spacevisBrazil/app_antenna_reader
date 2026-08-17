@@ -55,6 +55,14 @@ class WinnixProtocolDecoder {
 
             val packet = ByteArray(length) { accumulator.removeFirst() }
 
+            // 0xA5 0x5A pode aparecer por acaso dentro dos bytes de payload de
+            // um EPC/RSSI (são valores livres, não reservados) — um "cabeçalho"
+            // falso-positivo produz um length curto demais para conter cmd(1)+
+            // check(1)+CRLF(2). Sem essa checagem, packet[4] abaixo lança
+            // IndexOutOfBoundsException, que (sem try/catch no chamador) mata a
+            // thread de leitura silenciosamente — ver winnixOnNewData().
+            if (packet.size < 5) continue
+
             // Processa apenas respostas de inventário (0x83)
             if (packet[4].toInt() and 0xFF != 0x83) continue
 
