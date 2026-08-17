@@ -53,15 +53,22 @@ class Converters {
 // propósito: os dois destinos falam do MESMO arquivo local, e é a exclusão dele
 // que precisa ser coordenada entre eles (ver FileRetention). Bancos separados
 // tornariam essa coordenação uma transação distribuída sem necessidade nenhuma.
+// v4 acrescenta `filter_state` (Camada 2/3 do filtro de tags) — mesma lógica:
+// é só mais um estado local que sobrevive a SIGKILL, sem motivo pra banco à parte.
 @Database(
-    entities = [UploadEntry::class, com.uhflogger.backend.BackendUploadEntry::class],
-    version = 3,
+    entities = [
+        UploadEntry::class,
+        com.uhflogger.backend.BackendUploadEntry::class,
+        com.uhflogger.filter.FilterStateEntry::class,
+    ],
+    version = 4,
     exportSchema = false,
 )
 @TypeConverters(Converters::class)
 abstract class UploadQueueDatabase : RoomDatabase() {
     abstract fun dao(): UploadQueueDao
     abstract fun backendDao(): com.uhflogger.backend.BackendUploadDao
+    abstract fun filterStateDao(): com.uhflogger.filter.FilterStateDao
 
     companion object {
         @Volatile private var INSTANCE: UploadQueueDatabase? = null
@@ -73,7 +80,11 @@ abstract class UploadQueueDatabase : RoomDatabase() {
                     UploadQueueDatabase::class.java,
                     "upload_queue.db"
                 )
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+                    // WAL: leituras não bloqueiam escritas — importante pro filtro,
+                    // que grava em lote a cada poucos segundos enquanto outros
+                    // workers podem estar lendo a fila de upload ao mesmo tempo.
+                    .setJournalMode(RoomDatabase.JournalMode.WRITE_AHEAD_LOGGING)
                     // fallbackToDestructiveMigration removido intencionalmente.
                     // Se a migração falhar, preferimos crash a perder a fila silenciosamente.
                     // O scan de inicialização em DriveMonitorService recupera arquivos órfãos.
@@ -103,6 +114,32 @@ abstract class UploadQueueDatabase : RoomDatabase() {
                         driveDone       INTEGER NOT NULL DEFAULT 0,
                         lastError       TEXT,
                         updatedAt       INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+            }
+        }
+
+        // Migration: tabela de estado do filtro (Camada 2 — consolidação por EPC).
+        // Só acrescenta — sem o filtro ativado nas configurações, a tabela fica
+        // vazia e o comportamento é idêntico ao de antes.
+        val MIGRATION_3_4 = object : androidx.room.migration.Migration(3, 4) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS filter_state (
+                        epc               TEXT    NOT NULL PRIMARY KEY,
+                        firstSeenMs       INTEGER NOT NULL,
+                        bestRssi          INTEGER NOT NULL,
+                        antenna           INTEGER NOT NULL,
+                        androidTs         INTEGER NOT NULL,
+                        latitude          TEXT    NOT NULL DEFAULT '',
+                        longitude         TEXT    NOT NULL DEFAULT '',
+                        bearing           TEXT    NOT NULL DEFAULT '',
+                        temperature       TEXT    NOT NULL DEFAULT '',
+                        gnssSpeed         TEXT    NOT NULL DEFAULT '',
+                        locationTimestamp TEXT    NOT NULL DEFAULT '',
+                        locationProvider  TEXT    NOT NULL DEFAULT ''
                     )
                     """.trimIndent()
                 )

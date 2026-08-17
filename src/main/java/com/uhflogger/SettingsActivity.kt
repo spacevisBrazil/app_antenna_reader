@@ -23,6 +23,7 @@ class SettingsActivity : AppCompatActivity() {
 
     private lateinit var root: LinearLayout
     private lateinit var winnixSection: LinearLayout
+    private lateinit var filterSection: LinearLayout
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -95,6 +96,26 @@ class SettingsActivity : AppCompatActivity() {
         winnixSection = buildWinnixSection()
         root.addView(winnixSection)
         winnixSection.visibility = if (currentType == SettingsManager.ANTENNA_TYPE_WINNIX)
+            View.VISIBLE else View.GONE
+
+        // --- FILTRO -------------------------------------------------------
+        // Reduz o volume salvo/enviado antes mesmo dos dados chegarem no CSV
+        // — por isso vem logo após a configuração de captura, antes do Drive
+        // e do servidor SpaceVis (que só enxergam o CSV já filtrado).
+        root.addView(spacer(16))
+        buildSectionLabel(root, "FILTRO DE TAGS")
+        val filterEnabledLabel = if (SettingsManager.isFilterEnabled(this)) "Ativado" else "Desativado"
+        buildRow(root, "Filtro ativo", filterEnabledLabel, ROW_FILTER_ENABLED) {
+            showToggleDialog("Filtro de tags", SettingsManager.isFilterEnabled(this)) { enabled ->
+                SettingsManager.setFilterEnabled(this, enabled)
+                updateRowValue(root, ROW_FILTER_ENABLED, if (enabled) "Ativado" else "Desativado")
+                filterSection.visibility = if (enabled) View.VISIBLE else View.GONE
+                toast("Salvo")
+            }
+        }
+        filterSection = buildFilterSection()
+        root.addView(filterSection)
+        filterSection.visibility = if (SettingsManager.isFilterEnabled(this))
             View.VISIBLE else View.GONE
 
         // --- RESTAURAR --------------------------------------------------
@@ -193,6 +214,99 @@ class SettingsActivity : AppCompatActivity() {
             SettingsManager.winnixInventoryModeLabel(invMode),
             ROW_WINNIX_INV_MODE) {
             showWinnixInventoryModeDialog(section)
+        }
+
+        return section
+    }
+
+    // ─── Seção Filtro ───
+
+    private fun buildFilterSection(): LinearLayout {
+        val section = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+
+        section.addView(spacer(8))
+
+        // Camada 1 — família de EPC
+        val l1Label = if (SettingsManager.isFilterL1Enabled(this)) "Ativada" else "Desativada"
+        buildRow(section, "Camada 1 — Família de EPC", l1Label, ROW_FILTER_L1_ENABLED) {
+            showToggleDialog("Camada 1 — Família de EPC", SettingsManager.isFilterL1Enabled(this)) { v ->
+                SettingsManager.setFilterL1Enabled(this, v)
+                updateRowValue(section, ROW_FILTER_L1_ENABLED, if (v) "Ativada" else "Desativada")
+                toast("Salvo")
+            }
+        }
+
+        val patterns = SettingsManager.getFilterL1Patterns(this)
+        val patternsLabel = if (patterns.isBlank()) "Nenhum padrão (aceita tudo)" else patterns
+        buildRow(section, "Padrões de EPC (Camada 1)", patternsLabel, ROW_FILTER_L1_PATTERNS) {
+            showTextDialog("Padrões de EPC",
+                "Hex separado por vírgula. 'X' aceita qualquer dígito. Ex.: 0000100000000XXX,0076000000004XXX. Vazio = aceita tudo.",
+                SettingsManager.getFilterL1Patterns(this)) { v ->
+                SettingsManager.setFilterL1Patterns(this, v)
+                val label = if (v.isBlank()) "Nenhum padrão (aceita tudo)" else v
+                updateRowValue(section, ROW_FILTER_L1_PATTERNS, label)
+                toast("Salvo")
+            }
+        }
+
+        section.addView(spacer(8))
+
+        // Camada 2 — consolidação por EPC
+        val l2Label = if (SettingsManager.isFilterL2Enabled(this)) "Ativada" else "Desativada"
+        buildRow(section, "Camada 2 — Consolidação por EPC", l2Label, ROW_FILTER_L2_ENABLED) {
+            showToggleDialog("Camada 2 — Consolidação por EPC", SettingsManager.isFilterL2Enabled(this)) { v ->
+                SettingsManager.setFilterL2Enabled(this, v)
+                updateRowValue(section, ROW_FILTER_L2_ENABLED, if (v) "Ativada" else "Desativada")
+                toast("Salvo")
+            }
+        }
+
+        buildRow(section, "Janela de consolidação",
+            "${SettingsManager.getFilterL2WindowMin(this)} min", ROW_FILTER_L2_WINDOW) {
+            showNumberDialog("Janela de consolidação",
+                "Entre 1 e 1440 minutos — mantém só a melhor leitura (RSSI) de cada EPC dentro da janela",
+                SettingsManager.getFilterL2WindowMin(this).toString(),
+                1, 1440) { v ->
+                val sweep = SettingsManager.getFilterL2SweepMin(this)
+                if (v <= sweep) {
+                    toast("A janela deve ser maior que o sweep ($sweep min)")
+                } else {
+                    SettingsManager.setFilterL2WindowMin(this, v)
+                    updateRowValue(section, ROW_FILTER_L2_WINDOW, "$v min")
+                    toast("Salvo")
+                }
+            }
+        }
+
+        buildRow(section, "Intervalo de sweep",
+            "${SettingsManager.getFilterL2SweepMin(this)} min", ROW_FILTER_L2_SWEEP) {
+            showNumberDialog("Intervalo de sweep",
+                "Deve ser menor que a janela de consolidação — checa periodicamente quais EPCs já expiraram",
+                SettingsManager.getFilterL2SweepMin(this).toString(),
+                1, 1440) { v ->
+                val window = SettingsManager.getFilterL2WindowMin(this)
+                if (v >= window) {
+                    toast("O sweep deve ser menor que a janela ($window min)")
+                } else {
+                    SettingsManager.setFilterL2SweepMin(this, v)
+                    updateRowValue(section, ROW_FILTER_L2_SWEEP, "$v min")
+                    toast("Salvo")
+                }
+            }
+        }
+
+        section.addView(spacer(8))
+
+        // Camada 3 — persistência (sobrevive a SIGKILL)
+        val l3Label = if (SettingsManager.isFilterL3Enabled(this)) "Ativada" else "Desativada"
+        buildRow(section, "Camada 3 — Persistência (SIGKILL-safe)", l3Label, ROW_FILTER_L3_ENABLED) {
+            showToggleDialog("Camada 3 — Persistência", SettingsManager.isFilterL3Enabled(this)) { v ->
+                SettingsManager.setFilterL3Enabled(this, v)
+                updateRowValue(section, ROW_FILTER_L3_ENABLED, if (v) "Ativada" else "Desativada")
+                toast("Salvo")
+            }
         }
 
         return section
@@ -376,6 +490,79 @@ class SettingsActivity : AppCompatActivity() {
             .show()
     }
 
+    private fun showToggleDialog(title: String, current: Boolean, onSave: (Boolean) -> Unit) {
+        val wrapper = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.WHITE)
+            val p = dp(20)
+            setPadding(p, dp(8), p, dp(8))
+        }
+        val radioGroup = RadioGroup(this)
+        val rbOn = RadioButton(this).apply {
+            id        = 90
+            text      = "Ativado"
+            setTextColor(TEXT)
+            textSize  = 14f
+            isChecked = current
+        }
+        val rbOff = RadioButton(this).apply {
+            id        = 91
+            text      = "Desativado"
+            setTextColor(TEXT)
+            textSize  = 14f
+            isChecked = !current
+        }
+        radioGroup.addView(rbOn)
+        radioGroup.addView(rbOff)
+        wrapper.addView(radioGroup)
+
+        AlertDialog.Builder(this, android.R.style.Theme_Material_Light_Dialog_Alert)
+            .setTitle(title)
+            .setView(wrapper)
+            .setPositiveButton("Salvar") { _, _ ->
+                onSave(radioGroup.checkedRadioButtonId == 90)
+            }
+            .setNegativeButton("Cancelar", null)
+            .show()
+    }
+
+    private fun showTextDialog(title: String, hint: String, current: String, onSave: (String) -> Unit) {
+        val wrapper = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.WHITE)
+            val p = dp(20)
+            setPadding(p, dp(8), p, 0)
+        }
+        val tvHint = TextView(this).apply {
+            text     = hint
+            textSize = 12f
+            setTextColor(MUTED)
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+            lp.bottomMargin = dp(12)
+            layoutParams = lp
+        }
+        val input = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_TEXT
+            setText(current)
+            textSize = 16f
+            setTextColor(TEXT)
+            setBackgroundColor(Color.WHITE)
+            selectAll()
+        }
+        wrapper.addView(tvHint)
+        wrapper.addView(input)
+
+        AlertDialog.Builder(this, android.R.style.Theme_Material_Light_Dialog_Alert)
+            .setTitle(title)
+            .setView(wrapper)
+            .setPositiveButton("Salvar") { _, _ ->
+                onSave(input.text.toString().trim())
+            }
+            .setNegativeButton("Cancelar", null)
+            .show()
+    }
+
     private fun showAutoSaveModeDialog(parent: LinearLayout) {
         val current = SettingsManager.getAutoSaveMode(this)
         val wrapper = LinearLayout(this).apply {
@@ -489,6 +676,20 @@ class SettingsActivity : AppCompatActivity() {
                             SettingsManager.DEFAULT_WINNIX_WORKING_MS)
                         SettingsManager.setWinnixInventoryMode(this@SettingsActivity,
                             SettingsManager.DEFAULT_WINNIX_INVENTORY_MODE)
+                        SettingsManager.setFilterEnabled(this@SettingsActivity,
+                            SettingsManager.DEFAULT_FILTER_ENABLED)
+                        SettingsManager.setFilterL1Enabled(this@SettingsActivity,
+                            SettingsManager.DEFAULT_FILTER_L1_ENABLED)
+                        SettingsManager.setFilterL1Patterns(this@SettingsActivity,
+                            SettingsManager.DEFAULT_FILTER_L1_PATTERNS)
+                        SettingsManager.setFilterL2Enabled(this@SettingsActivity,
+                            SettingsManager.DEFAULT_FILTER_L2_ENABLED)
+                        SettingsManager.setFilterL2WindowMin(this@SettingsActivity,
+                            SettingsManager.DEFAULT_FILTER_L2_WINDOW_MIN)
+                        SettingsManager.setFilterL2SweepMin(this@SettingsActivity,
+                            SettingsManager.DEFAULT_FILTER_L2_SWEEP_MIN)
+                        SettingsManager.setFilterL3Enabled(this@SettingsActivity,
+                            SettingsManager.DEFAULT_FILTER_L3_ENABLED)
 
                         updateRowValue(parent, ROW_TAGS,
                             "A cada ${SettingsManager.DEFAULT_AUTO_SAVE_TAGS} tags")
@@ -513,6 +714,22 @@ class SettingsActivity : AppCompatActivity() {
                         winnixSection.visibility =
                             if (SettingsManager.DEFAULT_ANTENNA_TYPE == SettingsManager.ANTENNA_TYPE_WINNIX)
                                 View.VISIBLE else View.GONE
+
+                        updateRowValue(parent, ROW_FILTER_ENABLED,
+                            if (SettingsManager.DEFAULT_FILTER_ENABLED) "Ativado" else "Desativado")
+                        updateRowValue(filterSection, ROW_FILTER_L1_ENABLED,
+                            if (SettingsManager.DEFAULT_FILTER_L1_ENABLED) "Ativada" else "Desativada")
+                        updateRowValue(filterSection, ROW_FILTER_L1_PATTERNS, "Nenhum padrão (aceita tudo)")
+                        updateRowValue(filterSection, ROW_FILTER_L2_ENABLED,
+                            if (SettingsManager.DEFAULT_FILTER_L2_ENABLED) "Ativada" else "Desativada")
+                        updateRowValue(filterSection, ROW_FILTER_L2_WINDOW,
+                            "${SettingsManager.DEFAULT_FILTER_L2_WINDOW_MIN} min")
+                        updateRowValue(filterSection, ROW_FILTER_L2_SWEEP,
+                            "${SettingsManager.DEFAULT_FILTER_L2_SWEEP_MIN} min")
+                        updateRowValue(filterSection, ROW_FILTER_L3_ENABLED,
+                            if (SettingsManager.DEFAULT_FILTER_L3_ENABLED) "Ativada" else "Desativada")
+                        filterSection.visibility =
+                            if (SettingsManager.DEFAULT_FILTER_ENABLED) View.VISIBLE else View.GONE
 
                         toast("Configurações restauradas")
                     }
@@ -631,5 +848,12 @@ class SettingsActivity : AppCompatActivity() {
         private const val ROW_WINNIX_INV_MODE = 2008
         private const val ROW_DRIVE_ACCOUNT   = 2009
         private const val ROW_BACKEND         = 2011
+        private const val ROW_FILTER_ENABLED      = 2012
+        private const val ROW_FILTER_L1_ENABLED   = 2013
+        private const val ROW_FILTER_L1_PATTERNS  = 2014
+        private const val ROW_FILTER_L2_ENABLED   = 2015
+        private const val ROW_FILTER_L2_WINDOW    = 2016
+        private const val ROW_FILTER_L2_SWEEP     = 2017
+        private const val ROW_FILTER_L3_ENABLED   = 2018
     }
 }
