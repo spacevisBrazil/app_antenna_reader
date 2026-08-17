@@ -1,1 +1,3 @@
 /build
+graphify-out/
+release/*.apk
