@@ -43,7 +43,8 @@ object DeviceIdentity {
         val antennaType = SettingsManager.getAntennaType(context)
         put("antenna_type", antennaType)
         put("location_mode", SettingsManager.getLocationMode(context))
-        put("auto_save_mode", SettingsManager.getAutoSaveMode(context))
+        // Não é mais configurável pelo usuário — único modo suportado.
+        put("auto_save_mode", SettingsManager.AUTO_SAVE_MODE_NEW_FILE)
         // Os parâmetros de rádio existem só no Winnix; no Jietong não há o que
         // congelar, e mandar valor de outra antena seria mentira no registro.
         if (antennaType == SettingsManager.ANTENNA_TYPE_WINNIX) {

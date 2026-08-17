@@ -51,7 +51,19 @@ class BluetoothInputOutputManager(
                     break
                 }
                 if (n > 0) {
-                    listener.onNewData(buf.copyOf(n))
+                    // Segunda camada de defesa: o listener (winnixOnNewData/
+                    // onNewData) já se protege internamente, mas se algo escapar
+                    // mesmo assim, não pode matar esta thread — sem isso o loop
+                    // morre em silêncio (Runnable submetido a um Executor sem
+                    // ninguém chamar .get() no Future), isRunning fica travado em
+                    // true, e nem o watchdog nem forceReconnectDueToSilence()
+                    // detectam a queda (não há leitura bloqueada pra estourar
+                    // IOException). Vira zumbi permanente sem esse catch.
+                    try {
+                        listener.onNewData(buf.copyOf(n))
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Listener error on new data — descartado, leitura CONTINUA: ${e.message}", e)
+                    }
                 } else if (n < 0) {
                     // stream.read() retorna -1 no fim do stream (desconexão limpa)
                     Log.w(TAG, "BT stream ended (read returned -1)")

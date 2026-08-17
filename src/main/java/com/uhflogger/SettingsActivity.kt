@@ -67,12 +67,6 @@ class SettingsActivity : AppCompatActivity() {
             }
         }
 
-        val modeLabel = if (SettingsManager.getAutoSaveMode(this) == SettingsManager.AUTO_SAVE_MODE_NEW_FILE)
-            "Novo arquivo a cada auto-save" else "Atualizar arquivo atual"
-        buildRow(root, "Modo de auto-save", modeLabel, ROW_AUTO_SAVE_MODE) {
-            showAutoSaveModeDialog(root)
-        }
-
         // --- LOCALIZAÇÃO ------------------------------------------------
         root.addView(spacer(16))
         buildSectionLabel(root, "LOCALIZAÇÃO")
@@ -252,7 +246,7 @@ class SettingsActivity : AppCompatActivity() {
         configLayout.addView(l1Field)
         buildInlineTextField(
             l1Field,
-            "Ex.: 0000100000000XXX,0076000000004XXX ('X' = qualquer dígito). Vazio = aceita tudo.",
+            "Padrões de EPC — Ex.: 0000100000000XXX,0076000000004XXX ('X' = qualquer dígito). Vazio = aceita tudo.",
             SettingsManager.getFilterL1Patterns(this)
         ) { v -> SettingsManager.setFilterL1Patterns(this, v); toast("Salvo") }
 
@@ -469,41 +463,6 @@ class SettingsActivity : AppCompatActivity() {
             .show()
     }
 
-    private fun showAutoSaveModeDialog(parent: LinearLayout) {
-        val current = SettingsManager.getAutoSaveMode(this)
-        val wrapper = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.WHITE)
-            val p = dp(20); setPadding(p, dp(8), p, dp(8))
-        }
-        val radioGroup = RadioGroup(this)
-        val rbAppend = RadioButton(this).apply {
-            id = 50; text = "Atualizar arquivo atual — um único CSV por sessão"
-            setTextColor(TEXT); textSize = 13f
-            isChecked = current == SettingsManager.AUTO_SAVE_MODE_APPEND
-        }
-        val rbNew = RadioButton(this).apply {
-            id = 51; text = "Novo arquivo a cada auto-save — múltiplos CSVs por sessão"
-            setTextColor(TEXT); textSize = 13f
-            isChecked = current == SettingsManager.AUTO_SAVE_MODE_NEW_FILE
-        }
-        radioGroup.addView(rbAppend); radioGroup.addView(rbNew)
-        wrapper.addView(radioGroup)
-        AlertDialog.Builder(this, android.R.style.Theme_Material_Light_Dialog_Alert)
-            .setTitle("Modo de auto-save")
-            .setView(wrapper)
-            .setPositiveButton("Salvar") { _, _ ->
-                val mode = if (radioGroup.checkedRadioButtonId == 51)
-                    SettingsManager.AUTO_SAVE_MODE_NEW_FILE else SettingsManager.AUTO_SAVE_MODE_APPEND
-                SettingsManager.setAutoSaveMode(this, mode)
-                val label = if (mode == SettingsManager.AUTO_SAVE_MODE_NEW_FILE)
-                    "Novo arquivo a cada auto-save" else "Atualizar arquivo atual"
-                updateRowValue(parent, ROW_AUTO_SAVE_MODE, label)
-                toast("Salvo")
-            }
-            .setNegativeButton("Cancelar", null).show()
-    }
-
     private fun showLocationDialog(parent: LinearLayout) {
         val current = SettingsManager.getLocationMode(this)
 
@@ -568,8 +527,6 @@ class SettingsActivity : AppCompatActivity() {
                             SettingsManager.DEFAULT_AUTO_SAVE_TAGS)
                         SettingsManager.setAutoSaveMinutes(this@SettingsActivity,
                             SettingsManager.DEFAULT_AUTO_SAVE_MINUTES)
-                        SettingsManager.setAutoSaveMode(this@SettingsActivity,
-                            SettingsManager.DEFAULT_AUTO_SAVE_MODE)
                         SettingsManager.setLocationMode(this@SettingsActivity,
                             SettingsManager.DEFAULT_LOCATION_MODE)
                         SettingsManager.setAntennaType(this@SettingsActivity,
@@ -599,9 +556,6 @@ class SettingsActivity : AppCompatActivity() {
                             "A cada ${SettingsManager.DEFAULT_AUTO_SAVE_TAGS} tags")
                         updateRowValue(parent, ROW_MINUTES,
                             "A cada ${SettingsManager.DEFAULT_AUTO_SAVE_MINUTES} min")
-                        updateRowValue(parent, ROW_AUTO_SAVE_MODE,
-                            if (SettingsManager.DEFAULT_AUTO_SAVE_MODE == SettingsManager.AUTO_SAVE_MODE_NEW_FILE)
-                                "Novo arquivo a cada auto-save" else "Atualizar arquivo atual")
                         updateRowValue(parent, ROW_LOCATION, "GNSS + Rede")
                         val defaultAntennaLabel = if (SettingsManager.DEFAULT_ANTENNA_TYPE == SettingsManager.ANTENNA_TYPE_WINNIX)
                             "Winnix HYM750E" else "Jietong"
@@ -773,33 +727,60 @@ class SettingsActivity : AppCompatActivity() {
         return checkBox
     }
 
-    // Campo de texto inline (sem diálogo) — salva ao perder o foco.
+    // Campo de texto inline (sem diálogo), com rótulo FORA da caixa — mesmo
+    // padrão do buildInlineNumberField abaixo. Antes a explicação/exemplo
+    // ficava dentro da caixa como `hint` do EditText, que só aparece quando o
+    // campo está vazio e some assim que o usuário digita algo — ruim de ler e
+    // some no primeiro toque. Salva ao perder o foco OU ao apertar Enter/Done
+    // no teclado (setOnEditorActionListener): sem isso, o último campo focável
+    // da tela não tem pra onde mover o foco ao apertar Enter, então o
+    // setOnFocusChangeListener nunca dispara e o valor nunca é salvo.
     private fun buildInlineTextField(
         parent: LinearLayout,
-        hint  : String,
+        label : String,
         current: String,
         onSave: (String) -> Unit
     ): EditText {
-        val input = EditText(this).apply {
-            inputType = InputType.TYPE_CLASS_TEXT
-            setText(current)
-            this.hint = hint
-            textSize  = 14f
-            setTextColor(TEXT)
-            setHintTextColor(MUTED)
-            background = fieldBorderDrawable()
-            val pad = dp(12)
-            setPadding(pad, pad, pad, pad)
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
             val lp = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
             lp.bottomMargin = dp(8)
             layoutParams = lp
+        }
+        val tvLabel = TextView(this).apply {
+            text     = label
+            textSize = 12f
+            setTextColor(MUTED)
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+            lp.bottomMargin = dp(4)
+            layoutParams = lp
+        }
+        val input = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_TEXT
+            setText(current)
+            textSize  = 14f
+            setTextColor(TEXT)
+            background = fieldBorderDrawable()
+            imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_DONE
+            val pad = dp(12)
+            setPadding(pad, pad, pad, pad)
             setOnFocusChangeListener { v, hasFocus ->
                 background = fieldBorderDrawable(focused = hasFocus)
                 if (!hasFocus) onSave((v as EditText).text.toString().trim())
             }
+            setOnEditorActionListener { v, actionId, _ ->
+                if (actionId == android.view.inputmethod.EditorInfo.IME_ACTION_DONE) {
+                    v.clearFocus()
+                    hideKeyboard(v)
+                    true
+                } else false
+            }
         }
-        parent.addView(input)
+        row.addView(tvLabel)
+        row.addView(input)
+        parent.addView(row)
         return input
     }
 
@@ -837,6 +818,7 @@ class SettingsActivity : AppCompatActivity() {
             textSize = 14f
             setTextColor(TEXT)
             background = fieldBorderDrawable()
+            imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_DONE
             val pad = dp(12)
             setPadding(pad, pad, pad, pad)
             setOnFocusChangeListener { v, hasFocus ->
@@ -858,11 +840,28 @@ class SettingsActivity : AppCompatActivity() {
                     }
                 }
             }
+            // Sem isso, o último campo focável da tela ("Intervalo de sweep")
+            // não tem pra onde mover o foco ao apertar Enter, e o
+            // setOnFocusChangeListener acima nunca dispara — só salvava se o
+            // usuário tocasse manualmente num campo anterior depois.
+            setOnEditorActionListener { v, actionId, _ ->
+                if (actionId == android.view.inputmethod.EditorInfo.IME_ACTION_DONE) {
+                    v.clearFocus()
+                    hideKeyboard(v)
+                    true
+                } else false
+            }
         }
         row.addView(tvLabel)
         row.addView(input)
         parent.addView(row)
         return input
+    }
+
+    private fun hideKeyboard(view: View) {
+        val imm = getSystemService(android.content.Context.INPUT_METHOD_SERVICE)
+            as android.view.inputmethod.InputMethodManager
+        imm.hideSoftInputFromWindow(view.windowToken, 0)
     }
 
     private fun updateRowValue(parent: LinearLayout, id: Int, text: String) {
@@ -883,7 +882,6 @@ class SettingsActivity : AppCompatActivity() {
     companion object {
         private const val ROW_TAGS            = 2001
         private const val ROW_MINUTES         = 2002
-        private const val ROW_AUTO_SAVE_MODE  = 2010
         private const val ROW_LOCATION        = 2003
         private const val ROW_ANTENNA_TYPE    = 2004
         private const val ROW_WINNIX_ANT_COUNT= 2005

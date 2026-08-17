@@ -40,7 +40,6 @@ import com.uhflogger.serial.BluetoothInputOutputManager
 import com.uhflogger.serial.BluetoothSerialPort
 import com.uhflogger.serial.ISerialPort
 import com.uhflogger.serial.UsbSerialPortWrapper
-import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
 import com.uhflogger.drive.DriveHelper
 import java.util.concurrent.ScheduledExecutorService
@@ -442,7 +441,6 @@ class UHFReaderService : Service(), SensorEventListener {
     // =========================================================================
     private val jietongDecoder = ProtocolDecoder()
     private val winnixDecoder  = WinnixProtocolDecoder()
-    private val tagBuffer      = ConcurrentLinkedQueue<TagRecord>()
     private val totalCount     = AtomicInteger(0)
     private val isRunning      = AtomicBoolean(false)
     private val isPausedState  = AtomicBoolean(false)
@@ -482,14 +480,13 @@ class UHFReaderService : Service(), SensorEventListener {
     // Auto-save
     private var autoSaveTagCount   : Int  = SettingsManager.DEFAULT_AUTO_SAVE_TAGS
     private var autoSaveIntervalMin: Long = SettingsManager.DEFAULT_AUTO_SAVE_MINUTES.toLong()
-    private var autoSaveMode       : Int  = SettingsManager.DEFAULT_AUTO_SAVE_MODE
     private var autoSaveExecutor   : ScheduledExecutorService? = null
     private var autoSaveTimerJob   : ScheduledFuture<*>? = null
     // Tags acumuladas desde o último auto-save — reinicia após cada gravação
     private val tagsSinceLastSave  = AtomicInteger(0)
 
     // =========================================================================
-    // Filtro de 3 camadas — configuração recarregada uma vez por sessão nova
+    // Filtro de tags — configuração recarregada uma vez por sessão nova
     // (igual autoSaveTagCount/autoSaveIntervalMin acima), NÃO em cada
     // resume de reconexão BT/USB, pra não resetar a consolidação em
     // andamento só porque a antena piscou.
@@ -693,7 +690,6 @@ class UHFReaderService : Service(), SensorEventListener {
             tagsSinceLastSave.set(0)
             autoSaveTagCount    = SettingsManager.getAutoSaveTags(ctx)
             autoSaveIntervalMin = SettingsManager.getAutoSaveMinutes(ctx)
-            autoSaveMode        = SettingsManager.getAutoSaveMode(ctx)
 
             filterEnabled         = SettingsManager.isFilterEnabled(ctx)
             filterL1Enabled       = SettingsManager.isFilterL1Enabled(ctx)
@@ -927,7 +923,11 @@ class UHFReaderService : Service(), SensorEventListener {
         btReconnectExecutor?.shutdownNow(); btReconnectExecutor = null
         usbReconnectActive.set(false)
         usbReconnectExecutor?.shutdownNow(); usbReconnectExecutor = null
-        stopAutoSaveTimer()
+        // Captura o executor antigo pra esperar ele esvaziar antes de finalizar
+        // a sessão (ver await abaixo) — sem isso, uma escrita de writeTagsNow()
+        // ainda em voo (submetida um instante antes do Stop) poderia terminar
+        // DEPOIS do finalizeSession(), corrompendo/perdendo a última linha.
+        val oldAutoSaveExecutor = stopAutoSaveTimer()
 
         // Só marca "não capturando" se for parada REAL/intencional. Se for
         // onDestroy() sendo chamado porque o Android está derrubando o processo
@@ -967,24 +967,29 @@ class UHFReaderService : Service(), SensorEventListener {
                 closePort()
             }
 
+            // Espera qualquer writeTagsNow() já submetido terminar de ir pro
+            // disco antes de finalizar a sessão — ver comentário no oldAutoSaveExecutor acima.
+            try {
+                oldAutoSaveExecutor?.awaitTermination(10, TimeUnit.SECONDS)
+            } catch (_: InterruptedException) {}
+
             // D1: se foi o usuário quem pediu Parar, trata tudo que ainda está
             // pendente na Camada 2 como se a janela tivesse expirado — nada
             // fica esperando um tempo que não vai mais passar. Numa morte de
             // processo (userInitiated=false) NÃO fazemos isso: o estado
             // persistido continua em disco e é recuperado no próximo start
             // (ver TagFilterEngine.start()).
-            if (userInitiated) {
-                tagFilterEngine?.flushAllNow()?.let { expired ->
+            val d1Expired = if (userInitiated) {
+                (tagFilterEngine?.flushAllNow() ?: emptyList()).also { expired ->
                     if (expired.isNotEmpty()) {
-                        tagBuffer.addAll(expired)
                         totalCount.addAndGet(expired.size)
                         Log.i(TAG, "Filter: ${expired.size} EPC(s) pendentes forçados no Stop (D1)")
                     }
                 }
-            }
+            } else emptyList()
 
             val tagCount = totalCount.get()
-            val fileName = drainAndFinalize(winnixStopTemp)
+            val fileName = drainAndFinalize(d1Expired, winnixStopTemp)
             updateNotification("Captura encerrada — $tagCount tags")
             totalCount.set(0)
 
@@ -1006,15 +1011,16 @@ class UHFReaderService : Service(), SensorEventListener {
         usbReconnectActive.set(false)
         usbReconnectExecutor?.shutdownNow(); usbReconnectExecutor = null
         appContext?.let { SettingsManager.setCaptureState(it, capturing = false) }
+        val oldAutoSaveExecutor = stopAutoSaveTimer()
         stopExecutor.submit {
-            tagFilterEngine?.flushAllNow()?.let { expired ->
-                if (expired.isNotEmpty()) {
-                    tagBuffer.addAll(expired)
-                    totalCount.addAndGet(expired.size)
-                }
-            }
+            try {
+                oldAutoSaveExecutor?.awaitTermination(10, TimeUnit.SECONDS)
+            } catch (_: InterruptedException) {}
+
+            val expired = tagFilterEngine?.flushAllNow() ?: emptyList()
+            if (expired.isNotEmpty()) totalCount.addAndGet(expired.size)
             val tagCount = totalCount.get()
-            val fileName = drainAndFinalize("")
+            val fileName = drainAndFinalize(expired, "")
             totalCount.set(0)
             // GPS/bússola/wakelock continuam ativos — ver onCreate/onDestroy.
             Log.i(TAG, "Saved after error. Total: $tagCount, file: $fileName")
@@ -1033,25 +1039,23 @@ class UHFReaderService : Service(), SensorEventListener {
     private fun startJietongCapture(wrapper: UsbSerialPortWrapper) {
         ioManager = SerialInputOutputManager(wrapper.rawPort(), object : SerialInputOutputManager.Listener {
             override fun onNewData(data: ByteArray) {
-                lastDataReceivedAt = System.currentTimeMillis()
-                val lat  = getCurrentLatitude()
-                val lon  = getCurrentLongitude()
-                val brg  = getCurrentBearing()
-                val spd  = getCurrentGnssSpeed()
-                val locTs = getCurrentLocationTimestamp()
-                val prov  = getCurrentLocationProvider()
-                val rawTags = jietongDecoder.feed(data, lat, lon, brg, spd, locTs, prov)
-                if (rawTags.isNotEmpty()) {
-                    val tags = tagFilterEngine?.process(rawTags) ?: rawTags
-                    if (tags.isNotEmpty()) {
-                        tagBuffer.addAll(tags)
-                        totalCount.addAndGet(tags.size)
-                        val sinceLast = tagsSinceLastSave.addAndGet(tags.size)
-                        if (!filterForcesTimeOnlyRotation && sinceLast >= autoSaveTagCount) {
-                            rescheduleTimerJob()
-                            autoSaveExecutor?.submit { flushBufferToDisk() }
-                        }
+                // Ver comentário em winnixOnNewData(): uma exceção não capturada
+                // aqui mata a thread de leitura silenciosamente pra sempre.
+                try {
+                    lastDataReceivedAt = System.currentTimeMillis()
+                    val lat  = getCurrentLatitude()
+                    val lon  = getCurrentLongitude()
+                    val brg  = getCurrentBearing()
+                    val spd  = getCurrentGnssSpeed()
+                    val locTs = getCurrentLocationTimestamp()
+                    val prov  = getCurrentLocationProvider()
+                    val rawTags = jietongDecoder.feed(data, lat, lon, brg, spd, locTs, prov)
+                    if (rawTags.isNotEmpty()) {
+                        val tags = tagFilterEngine?.process(rawTags) ?: rawTags
+                        if (tags.isNotEmpty()) writeTagsNow(tags)
                     }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Jietong onNewData: erro ao processar frame — descartado, leitura CONTINUA: ${e.message}", e)
                 }
             }
             override fun onRunError(e: Exception) = handleRunError(e)
@@ -1210,6 +1214,23 @@ class UHFReaderService : Service(), SensorEventListener {
     }
 
     private fun winnixOnNewData(data: ByteArray) {
+        // try/catch envolvendo TUDO: essencial. onNewData roda na thread de
+        // leitura serial (USB via SerialInputOutputManager ou BT via
+        // BluetoothInputOutputManager, ambos chamando esta mesma função). Uma
+        // exceção não capturada aqui (ex.: frame corrompido/BT ruidoso) mata
+        // essa thread silenciosamente pra sempre: isRunning fica travado em
+        // true, e como ninguém mais lê, forceReconnectDueToSilence() também
+        // não ajuda — não há leitura bloqueada pra receber a IOException do
+        // close(). Vira um "zumbi" permanente que só um restart manual resolve.
+        // Mesmo padrão de proteção já usado nos loops de reconexão BT/USB.
+        try {
+            winnixOnNewDataInner(data)
+        } catch (e: Exception) {
+            Log.e(TAG, "winnixOnNewData: erro ao processar frame — descartado, leitura CONTINUA: ${e.message}", e)
+        }
+    }
+
+    private fun winnixOnNewDataInner(data: ByteArray) {
         lastDataReceivedAt = System.currentTimeMillis()
         // Acumula bytes — o BT pode fragmentar frames em múltiplas chamadas onNewData
         winnixRingAppend(data)
@@ -1262,15 +1283,7 @@ class UHFReaderService : Service(), SensorEventListener {
                 processedTags[0] = processedTags[0].copy(temperature = temp)
             }
             val tags = tagFilterEngine?.process(processedTags) ?: processedTags
-            if (tags.isNotEmpty()) {
-                tagBuffer.addAll(tags)
-                totalCount.addAndGet(tags.size)
-                val sinceLast = tagsSinceLastSave.addAndGet(tags.size)
-                if (!filterForcesTimeOnlyRotation && sinceLast >= autoSaveTagCount) {
-                    rescheduleTimerJob()
-                    autoSaveExecutor?.submit { flushBufferToDisk() }
-                }
-            }
+            if (tags.isNotEmpty()) writeTagsNow(tags)
         }
     }
 
@@ -1729,15 +1742,37 @@ class UHFReaderService : Service(), SensorEventListener {
         )
     }
 
-    /** Camada 2: entradas expiradas viram tags normais de novo, prontas pro auto-save gravar. */
+    /** Camada 2: entradas expiradas viram tags normais de novo — gravadas na hora. */
     private fun runFilterSweep() {
         if (!isRunning.get()) return
         val expired = tagFilterEngine?.sweepExpired() ?: emptyList()
         if (expired.isEmpty()) return
-        tagBuffer.addAll(expired)
-        totalCount.addAndGet(expired.size)
-        tagsSinceLastSave.addAndGet(expired.size)
-        Log.i(TAG, "Filter L2: ${expired.size} EPC(s) expiraram — enfileirados para gravação")
+        Log.i(TAG, "Filter L2: ${expired.size} EPC(s) expiraram — gravando")
+        writeTagsNow(expired)
+    }
+
+    /**
+     * Ponto único de escrita: chamado a cada lote que chega (Jietong/Winnix) e a
+     * cada expiração da Camada 2 do filtro (runFilterSweep). Sem buffer em RAM —
+     * a tag vai para o autoSaveExecutor (thread única, mesma que já serializava
+     * o auto-save antigo) imediatamente, então uma morte de processo perde no
+     * máximo o lote que ainda não terminou de ir para o disco.
+     *
+     * autoSaveTagCount/tagsSinceLastSave continuam existindo, mas agora só
+     * decidem ROTAÇÃO de arquivo (modo NEW_FILE) — a durabilidade não depende
+     * mais deles.
+     */
+    private fun writeTagsNow(tags: List<TagRecord>) {
+        if (tags.isEmpty()) return
+        totalCount.addAndGet(tags.size)
+        autoSaveExecutor?.submit {
+            if (!CsvExporter.appendTags(tags)) Log.e(TAG, "Failed to write ${tags.size} tag(s)")
+        }
+        val sinceLast = tagsSinceLastSave.addAndGet(tags.size)
+        if (!filterForcesTimeOnlyRotation && sinceLast >= autoSaveTagCount) {
+            rescheduleTimerJob()
+            autoSaveExecutor?.submit { onAutoSaveTrigger() }
+        }
     }
 
     /**
@@ -1748,76 +1783,58 @@ class UHFReaderService : Service(), SensorEventListener {
     private fun rescheduleTimerJob() {
         autoSaveTimerJob?.cancel(false)
         autoSaveTimerJob = autoSaveExecutor?.scheduleWithFixedDelay(
-            { if (isRunning.get()) flushBufferToDisk() },
+            // Só dispara se algo novo chegou desde o último trigger — sem isso,
+            // um intervalo ocioso (antena sem leitura por horas) rotacionaria
+            // pra um arquivo vazio no modo NEW_FILE (bug já corrigido antes, ver
+            // CLAUDE.md #16/#17).
+            { if (isRunning.get() && tagsSinceLastSave.get() > 0) onAutoSaveTrigger() },
             autoSaveIntervalMin, autoSaveIntervalMin, TimeUnit.MINUTES
         )
     }
 
-    private fun stopAutoSaveTimer() {
+    /** Retorna o executor antigo (já em shutdown, ainda podendo ter tasks em voo) pra quem chama aguardar. */
+    private fun stopAutoSaveTimer(): ScheduledExecutorService? {
         autoSaveTimerJob?.cancel(false)
         autoSaveTimerJob = null
         filterPersistJob?.cancel(false)
         filterPersistJob = null
         filterSweepJob?.cancel(false)
         filterSweepJob = null
-        autoSaveExecutor?.shutdown()
+        val executor = autoSaveExecutor
         autoSaveExecutor = null
+        executor?.shutdown()
+        return executor
     }
 
-    private fun flushBufferToDisk() {
+    /**
+     * Disparado por tempo ou por contagem de tags (writeTagsNow). Já não carrega
+     * lote nenhum — os dados já estão no disco (ou a caminho, mesmo executor,
+     * FIFO). Aqui só troca de arquivo e atualiza a notificação/callback.
+     */
+    private fun onAutoSaveTrigger() {
         if (!isRunning.get()) return
-
-        val batch = mutableListOf<TagRecord>()
-        while (tagBuffer.isNotEmpty()) tagBuffer.poll()?.let { batch.add(it) }
-
-        // Sem tags novas a gravar
-        if (batch.isEmpty()) {
-            Log.d(TAG, "Auto-save skipped — no new tags")
-            return
-        }
-
-        // Reinicia o contador de tags por intervalo
         tagsSinceLastSave.set(0)
 
         val ctx = appContext ?: return
+        val fileName = CsvExporter.finalizeSession(emptyList())
+        Log.i(TAG, "Auto-save (new file): $fileName")
+        val prefix  = buildFileIdentifier(ctx, isBluetooth = activeIsBluetooth)
+        val newFile = CsvExporter.startSession(ctx, prefix)
+        Log.i(TAG, "New session started: $newFile")
 
-        if (autoSaveMode == SettingsManager.AUTO_SAVE_MODE_NEW_FILE) {
-            // Modo arquivo novo: encerra a sessão atual e abre uma nova
-            val fileName = CsvExporter.finalizeSession(batch)
-            Log.i(TAG, "Auto-save (new file): $fileName — ${batch.size} tags")
-            // Abre nova sessão para o próximo lote
-            val prefix   = buildFileIdentifier(ctx, isBluetooth = activeIsBluetooth)
-            val newFile  = CsvExporter.startSession(ctx, prefix)
-            Log.i(TAG, "New session started: $newFile")
-            updateNotification("Capturando… (${totalCount.get()} tags)")
-            onAutoSaved?.invoke(totalCount.get())
-        } else {
-            // Modo append: acrescenta ao arquivo corrente (padrão)
-            val ok = CsvExporter.appendTags(batch)
-            if (ok) {
-                Log.i(TAG, "Auto-save (append): ${batch.size} tags, total: ${totalCount.get()}")
-                updateNotification("Capturando… (${totalCount.get()} tags)")
-                onAutoSaved?.invoke(totalCount.get())
-            } else {
-                Log.e(TAG, "Auto-save failed — reinserting ${batch.size} tags")
-                tagBuffer.addAll(batch)
-                tagsSinceLastSave.addAndGet(batch.size)  // restore counter on failure
-            }
-        }
+        updateNotification("Capturando… (${totalCount.get()} tags)")
+        onAutoSaved?.invoke(totalCount.get())
     }
 
-    private fun drainAndFinalize(winnixStopTemp: String = ""): String? {
-        val lastBatch = mutableListOf<TagRecord>()
-        while (tagBuffer.isNotEmpty()) tagBuffer.poll()?.let { lastBatch.add(it) }
-
+    private fun drainAndFinalize(finalBatch: List<TagRecord> = emptyList(), winnixStopTemp: String = ""): String? {
         // Nenhuma tag lida — cancela sem criar CSV vazio
-        if (totalCount.get() == 0 && lastBatch.isEmpty()) {
+        if (totalCount.get() == 0) {
             Log.i(TAG, "Session cancelled — no tags read")
             CsvExporter.cancelSession()
             return null
         }
 
-        return CsvExporter.finalizeSession(lastBatch, winnixStopTemp)
+        return CsvExporter.finalizeSession(finalBatch, winnixStopTemp)
     }
 
     // =========================================================================
