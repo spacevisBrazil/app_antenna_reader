@@ -159,9 +159,28 @@ Segundo destino de upload, independente e paralelo ao Google Drive. Com o envio 
 - `CsvExporter`: adicionou `activeFilePath()` — retorna caminho do arquivo ativo; usado pelo worker e pelo `FileRetention`.
 - `UploadQueueDatabase`: bumped para v3, adicionou `BackendUploadEntry` como entidade com migração SQL.
 
+### Tag filter pipeline (`com.uhflogger.filter`) — branch `feature/rfid-tag-filter`
+
+Reduz o volume de dados salvo no CSV e enviado ao Drive/backend, aplicado **antes** de qualquer tag chegar no `CsvExporter` — Drive e o backend SpaceVis só enxergam o que já passou pelo filtro. Desligado por padrão (opt-in): com `filter_enabled=false` o comportamento é idêntico a antes desta feature. Três camadas independentes entre si, cada uma com seu próprio toggle:
+
+- **Camada 1 — família de EPC** (`EpcFamilyMatcher`): lista de padrões hex do mesmo tamanho do EPC, onde `X` aceita qualquer caractere na posição e as demais posições precisam bater exatamente (ex.: `0000100000000XXX`). Lista vazia = aceita tudo. `X` não é validado como estritamente hex — decisão deliberada de manter o matcher simples, dado que EPCs reais só usam hex.
+- **Camada 2 — consolidação por EPC** (`TagFilterEngine.absorb`/`sweepExpired`): mantém só a leitura de melhor RSSI de cada EPC dentro de uma janela de tempo contada a partir do `first_seen` daquele EPC (não uma janela deslizante). Um job de sweep (`runFilterSweep`, agendado no mesmo executor do auto-save) varre periodicamente as entradas abertas e libera para o CSV as que já passaram da janela.
+- **Camada 3 — persistência SIGKILL-safe** (`FilterStateQueue`/`FilterStateStore`): grava em lote (`persistDirtyNow`) o estado aberto da Camada 2 em Room (tabela `filter_state`, `UploadQueueDatabase` v4, WAL). Ao reiniciar (`TagFilterEngine.start()`), recarrega qualquer entrada deixada aberta por uma sessão anterior que morreu sem passar pelo Stop normal — nunca perde a consolidação em andamento. Sem a Camada 3, o estado de consolidação vive só em memória (`ConcurrentHashMap`) e é perdido num SIGKILL.
+
+**Integração em `UHFReaderService`:**
+- Config (`filterEnabled`/`filterL1*`/`filterL2*`/`filterL3Enabled`) é lida de `SettingsManager` uma vez por sessão, dentro do bloco `if (!resuming)` de `startCapture()` — não é relida a cada reconexão, pelo mesmo motivo que os outros tunables de sessão (auto-save, antena) não são.
+- **D1**: Stop iniciado pelo usuário (`stopCapture(userInitiated=true)`) e `saveAfterError()` chamam `tagFilterEngine.flushAllNow()` incondicionalmente — força a expiração de tudo que está aberto, para que nenhuma leitura fique presa esperando uma janela que nunca vai fechar. Stop involuntário (`userInitiated=false`, process-death) **não** força flush — o estado persistido (Camada 3) é recuperado no próximo `start()`.
+- **D2**: com a Camada 2 ativa (`filterForcesTimeOnlyRotation`), rotação de sessão por CONTAGEM de tags brutas deixa de fazer sentido (tags já chegam consolidadas) — a rotação passa a ser só por tempo, com o mesmo intervalo da janela da Camada 2 (`autoSaveIntervalMin` é sobrescrito por `getFilterL2WindowMin()` nesse caso).
+- `scheduleFilterJobs()` (persistência periódica + sweep) roda no mesmo `autoSaveExecutor` do auto-save, sem thread pool extra — reagendado a cada `startAutoSaveTimer()`, ou seja, em toda conexão bem-sucedida (fresh start E reconexão BT/USB), igual ao `rescheduleTimerJob()` existente.
+- Hook aplicado tanto no caminho Jietong (`onNewData`) quanto Winnix (`winnixOnNewData`, depois de já ter carimbado a temperatura) — `tagFilterEngine.process(tags)` retorna só as tags que devem seguir direto pro pipeline normal; as absorvidas pela Camada 2 só reaparecem quando expiram via sweep.
+
+**UI** (`SettingsActivity`, seção "FILTRO DE TAGS"): toggle mestre + 3 toggles por camada + campo de texto para os padrões da Camada 1 + campos numéricos para janela/sweep da Camada 2, com validação cruzada (sweep precisa ser estritamente menor que a janela, checado nos dois campos). Segue o mesmo padrão de seção condicional (`filterSection.visibility`) já usado pela seção Winnix.
+
+**Defaults** (`SettingsManager`): filtro geral desligado (`DEFAULT_FILTER_ENABLED=false`); quando ligado, as 3 camadas nascem todas ativas; janela = 30 min, sweep = 5 min, sem padrões de EPC configurados (Camada 1 aceita tudo).
+
 ### Settings
 
-`SettingsManager` is a plain `SharedPreferences` wrapper (object, static-style API) — all tunables (antenna type, Winnix antenna count/power/working time/inventory mode, auto-save thresholds, location mode) live here with `DEFAULT_*` constants. It also persists capture state (`was_capturing`, `last_device_name`) used for auto-resume after process death.
+`SettingsManager` is a plain `SharedPreferences` wrapper (object, static-style API) — all tunables (antenna type, Winnix antenna count/power/working time/inventory mode, auto-save thresholds, location mode, tag filter — see above) live here with `DEFAULT_*` constants. It also persists capture state (`was_capturing`, `last_device_name`) used for auto-resume after process death.
 
 ## Project history — bugs already found and fixed
 
@@ -213,16 +232,18 @@ Version is set in `app/build.gradle` (`versionName` + `versionCode`). **Incremen
   - `MINOR` (`x.+1.0`) — new user-visible features or significant behaviour changes.
   - `MAJOR` (`+1.0.0`) — breaking changes or major redesigns.
 
-Current version: **1.1.2** (versionCode 4). O flavor `hml` acrescenta `-hml` ao `versionName` (ex.: `1.1.2-hml`); o `versionCode` é o mesmo para os dois. Always commit the version bump together with the change that triggered it, not as a separate commit afterwards.
+Current version: **1.2.0** (versionCode 5). O flavor `hml` acrescenta `-hml` ao `versionName` (ex.: `1.2.0-hml`); o `versionCode` é o mesmo para os dois. Always commit the version bump together with the change that triggered it, not as a separate commit afterwards.
 
 Branch **`fix/csv-lazy-write`** — contém as implementações de CSV lazy creation, rotação de sessão, defaults de configuração (Winnix, 2 antenas, Adaptive, 5k tags), fix de labels no SettingsActivity, e melhorias de GNSS.
 
-Current branch: **`bluetooth_V1_1_under_test`** — contém o módulo de envio ao backend SpaceVis (`com.uhflogger.backend`). Destaques acumulados na branch:
+Branch **`bluetooth_V1_1_under_test`** — contém o módulo de envio ao backend SpaceVis (`com.uhflogger.backend`). Destaques acumulados na branch:
 - Autenticação por chave de ativação única; upload incremental em lotes de 500; coordenação de retenção de arquivo entre Drive e backend.
 - Envio de dados GPS por leitura (colunas 8–10 do CSV: `gnss_speed`, `location_captured_at`, `location_provider`).
 - Product flavors `hml`/`prd` com `API_BASE_URL` compilado no artefato (sem campo de servidor em tela).
 - Ativação por deep link `uhflogger://ativar?chave=XXXX` — operador toca link enviado por WhatsApp.
 - Fix crítico de renovação de token: o app agora renova só com o refresh token, sem exigir `client_id/secret` (bug que matava o envio 5h após ativação em todo aparelho de campo).
+
+Current branch: **`feature/rfid-tag-filter`** (a partir de `bluetooth_V1_1_under_test`) — contém o filtro de 3 camadas descrito em "Tag filter pipeline" acima.
 
 ### Signing / distribution
 
