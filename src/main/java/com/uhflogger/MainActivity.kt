@@ -63,8 +63,11 @@ class MainActivity : AppCompatActivity() {
     private val uiHandler = Handler(Looper.getMainLooper())
     private val tagCountUpdater = object : Runnable {
         override fun run() {
-            val count = readerService?.tagCount() ?: 0
+            val service = readerService
+            val count = service?.displayTagCount() ?: 0
             binding.tvTagCount.text = "%,d".format(count)
+            binding.tvTagCountLabel.text =
+                if (service?.isFilterActive() == true) "TAGS FILTRADAS" else "TAGS CAPTURADAS"
             uiHandler.postDelayed(this, 1000L)
         }
     }

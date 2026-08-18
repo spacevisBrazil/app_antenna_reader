@@ -711,13 +711,9 @@ class UHFReaderService : Service(), SensorEventListener {
                 )
             )
 
-            val prefix   = buildFileIdentifier(ctx, isBluetooth = deviceName == BT_DEVICE_NAME)
-            val fileName = CsvExporter.startSession(ctx, prefix)
-            if (fileName == null) {
-                Log.e(TAG, "Failed to create CSV session")
-                return
-            }
-            Log.i(TAG, "Session: $fileName ($activeAntennaType)")
+            val prefix = buildFileIdentifier(ctx, isBluetooth = deviceName == BT_DEVICE_NAME)
+            CsvExporter.startSession(ctx, prefix)
+            Log.i(TAG, "Session prepared: prefix=$prefix ($activeAntennaType)")
         } else {
             Log.i(TAG, "Resuming session — ${totalCount.get()} tags so far ($activeAntennaType)")
         }
@@ -992,6 +988,7 @@ class UHFReaderService : Service(), SensorEventListener {
             val fileName = drainAndFinalize(d1Expired, winnixStopTemp)
             updateNotification("Captura encerrada — $tagCount tags")
             totalCount.set(0)
+            tagFilterEngine?.resetNewEntriesSeen()
 
             // GPS/bússola/wakelock NÃO são mais desligados aqui — continuam
             // ativos enquanto o serviço existir (ver onCreate), pra não
@@ -1022,6 +1019,7 @@ class UHFReaderService : Service(), SensorEventListener {
             val tagCount = totalCount.get()
             val fileName = drainAndFinalize(expired, "")
             totalCount.set(0)
+            tagFilterEngine?.resetNewEntriesSeen()
             // GPS/bússola/wakelock continuam ativos — ver onCreate/onDestroy.
             Log.i(TAG, "Saved after error. Total: $tagCount, file: $fileName")
             onStopComplete?.invoke(fileName, tagCount)
@@ -1032,6 +1030,22 @@ class UHFReaderService : Service(), SensorEventListener {
     fun isPaused()   : Boolean = isPausedState.get()
     fun tagCount()   : Int     = totalCount.get()
     fun flushTags(): List<TagRecord> = emptyList()
+
+    // Indicador ao vivo pra UI (MainActivity), separado de tagCount()/totalCount
+    // porque este último precisa continuar sendo a contagem REAL de linhas
+    // gravadas no CSV (usado no toast do Stop, notificação, checagem de
+    // "sessão sem tags" em drainAndFinalize). Com a Camada 2 ativa, totalCount
+    // só sobe quando a janela expira (até ~30min depois da leitura), o que
+    // deixa o contador da tela parado por muito tempo mesmo com a antena lendo
+    // — displayTagCount() usa TagFilterEngine.newEntriesSeen() nesse caso, que
+    // sobe assim que uma tag NOVA é aceita pela Camada 1/2, sem esperar a
+    // janela fechar. Sem Camada 2 (filtro off, ou só Camada 1), writeTagsNow()
+    // já escreve na hora, então totalCount já é "ao vivo" por conta própria.
+    fun displayTagCount(): Int =
+        if (filterEnabled && filterL2Enabled) tagFilterEngine?.newEntriesSeen() ?: 0
+        else totalCount.get()
+
+    fun isFilterActive(): Boolean = filterEnabled
 
     // =========================================================================
     // Jietong capture (USB only)
@@ -1818,9 +1832,9 @@ class UHFReaderService : Service(), SensorEventListener {
         val ctx = appContext ?: return
         val fileName = CsvExporter.finalizeSession(emptyList())
         Log.i(TAG, "Auto-save (new file): $fileName")
-        val prefix  = buildFileIdentifier(ctx, isBluetooth = activeIsBluetooth)
-        val newFile = CsvExporter.startSession(ctx, prefix)
-        Log.i(TAG, "New session started: $newFile")
+        val prefix = buildFileIdentifier(ctx, isBluetooth = activeIsBluetooth)
+        CsvExporter.startSession(ctx, prefix)
+        Log.i(TAG, "New session prepared: prefix=$prefix")
 
         updateNotification("Capturando… (${totalCount.get()} tags)")
         onAutoSaved?.invoke(totalCount.get())

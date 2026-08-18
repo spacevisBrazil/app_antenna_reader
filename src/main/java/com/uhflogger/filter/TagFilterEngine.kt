@@ -4,6 +4,7 @@ import android.content.Context
 import android.util.Log
 import com.uhflogger.model.TagRecord
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Núcleo do filtro de tags. Não gerencia threads/executors próprios — o
@@ -38,6 +39,21 @@ class TagFilterEngine(private val context: Context) {
     private val openEntries = ConcurrentHashMap<String, OpenEntry>()
     private val dirtyEpcs   = ConcurrentHashMap.newKeySet<String>()
 
+    // Contador só pra UI (indicador "ao vivo" enquanto a Camada 2 segura as
+    // tags em RAM esperando a janela expirar). Sobe só quando um EPC abre uma
+    // entrada NOVA (primeira vez, ou reaberta depois de expirar) — releituras
+    // da mesma tag dentro da janela já aberta não incrementam, ver absorb().
+    // Não é persistido: entradas recuperadas do Room em start() (crash
+    // recovery) não passam por absorb(), então não incrementam este contador
+    // — ele pode subestimar um pouco logo após um restart por SIGKILL, mas
+    // totalCount (linhas realmente gravadas) continua correto.
+    private val newEntriesSeen = AtomicInteger(0)
+
+    fun newEntriesSeen(): Int = newEntriesSeen.get()
+
+    /** Zera o contador "ao vivo" da UI — chamado no Parar/Salvar, junto com totalCount. */
+    fun resetNewEntriesSeen() = newEntriesSeen.set(0)
+
     /**
      * (Re)inicia o motor para uma nova sessão de captura. Carrega do Room
      * qualquer entrada deixada aberta por uma sessão anterior que morreu sem
@@ -48,6 +64,7 @@ class TagFilterEngine(private val context: Context) {
         config = cfg
         openEntries.clear()
         dirtyEpcs.clear()
+        newEntriesSeen.set(0)
         if (cfg.l2Enabled) {
             try {
                 FilterStateStore.loadAll(context).forEach { e ->
@@ -92,6 +109,7 @@ class TagFilterEngine(private val context: Context) {
             when {
                 existing == null -> {
                     dirtyEpcs.add(tag.epc)
+                    newEntriesSeen.incrementAndGet()
                     OpenEntry(now, tag)
                 }
                 tag.rssi > existing.best.rssi -> {
