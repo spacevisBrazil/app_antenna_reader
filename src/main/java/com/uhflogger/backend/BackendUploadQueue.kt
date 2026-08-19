@@ -73,6 +73,12 @@ interface BackendUploadDao {
 
     @Query("SELECT COUNT(*) FROM backend_upload WHERE closed = 0")
     fun openCount(): Int
+
+    // Erro mais recente entre os arquivos que ainda não terminaram. `setLinesSent`
+    // limpa o campo quando um lote passa, então o que sobra aqui é sempre uma
+    // falha ATUAL — nunca a lembrança de uma que já se resolveu.
+    @Query("SELECT lastError FROM backend_upload WHERE closed = 0 AND lastError IS NOT NULL ORDER BY updatedAt DESC LIMIT 1")
+    fun lastError(): String?
 }
 
 /**
@@ -98,6 +104,9 @@ object BackendUploadStore {
 
     /** Arquivos que ainda não terminaram de subir — o que a tela mostra. */
     fun openCount(context: Context): Int = dao(context).openCount()
+
+    /** Por que o envio está parado, se estiver. Ver BackendUploadDao.lastError. */
+    fun lastError(context: Context): String? = dao(context).lastError()
 
     fun setCaptureId(context: Context, filePath: String, captureId: String) =
         dao(context).setCaptureId(filePath, captureId, now())

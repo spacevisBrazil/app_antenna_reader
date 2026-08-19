@@ -27,18 +27,27 @@ object FileRetention {
 
     private const val TAG = "FileRetention"
 
-    /** O Drive terminou de subir este arquivo. */
+    /**
+     * O Drive terminou de subir este arquivo.
+     *
+     * O Drive SOZINHO nunca apaga. Antes havia um atalho aqui: com o envio ao
+     * backend desligado, o Drive voltava a apagar na hora — e era por ele que se
+     * perdia dado de verdade. O aparelho que ainda não foi ativado é
+     * indistinguível do que nunca vai ser, então "backend desligado" era lido
+     * como "ninguém mais quer este arquivo"; quem capturava antes de ativar (a
+     * ordem natural: testar a leitura primeiro, ativar depois) via as leituras
+     * daquele período sumirem sem aviso nenhum.
+     *
+     * A regra agora é uma só: o CSV local morre quando o SERVIDOR confirmou —
+     * nunca antes. O Drive é destino paralelo, não substituto: ter uma cópia lá
+     * não prova que a leitura chegou ao backend, e é o backend que a transforma
+     * em passagem de animal.
+     *
+     * Consequência aceita: um aparelho que nunca for ativado acumula CSV até
+     * encher. É o lado certo pra errar — disco cheio é visível e reversível,
+     * leitura apagada não volta.
+     */
     fun onDriveDone(context: Context, file: File) {
-        // `isConfigured`, não `isEnabled`: o segundo exige sessão válida, e um
-        // token expirado (ou refresh recusado, que limpa a sessão) faria o app
-        // concluir "não uso backend" e apagar leituras que nunca chegaram ao
-        // servidor. A retenção segue a INTENÇÃO do operador, não o estado
-        // momentâneo da sessão.
-        if (!BackendSettings.isConfigured(context)) {
-            deleteIfIdle(context, file, "Drive (backend desligado)")
-            return
-        }
-
         // Cria a linha se o worker do backend ainda nem viu este arquivo —
         // senão a marcação se perderia e o arquivo ficaria preso pra sempre.
         BackendUploadStore.ensure(
@@ -47,9 +56,9 @@ object FileRetention {
         BackendUploadStore.markDriveDone(context, file.absolutePath)
 
         if (BackendUploadStore.get(context, file.absolutePath)?.closed == true) {
-            deleteIfIdle(context, file, "Drive (backend já havia terminado)")
+            deleteIfIdle(context, file, "Drive (backend já havia confirmado)")
         } else {
-            Log.i(TAG, "${file.name} mantido: backend ainda não terminou")
+            Log.i(TAG, "${file.name} mantido: o servidor ainda não confirmou")
         }
     }
 
