@@ -36,8 +36,13 @@ import com.uhflogger.drive.DriveMonitorService
 class MainActivity : AppCompatActivity() {
 
     companion object {
-        private const val REQ_LOCATION            = 101
-        private const val REQ_BT_PERMISSION       = 102
+        // Uma única chamada com todas as permissões principais (notificação,
+        // localização, BT). Android exibe um diálogo por grupo em sequência e
+        // dispara onRequestPermissionsResult uma única vez no final — sem risco
+        // de interferência entre chamadas separadas ou com o diálogo de bateria.
+        private const val REQ_ALL_PERMISSIONS     = 100
+        // ACCESS_BACKGROUND_LOCATION deve ser pedida SEPARADAMENTE das demais
+        // permissões de localização — Android rejeita se vierem juntas.
         private const val REQ_BACKGROUND_LOCATION = 103
         // Bem acima do pior caso observado de conexão (BT connect() ~12s) —
         // só reabilita o botão se a captura genuinamente não tiver começado.
@@ -195,14 +200,18 @@ class MainActivity : AppCompatActivity() {
                     val device = intent.getParcelableExtra<android.bluetooth.BluetoothDevice>(
                         android.bluetooth.BluetoothDevice.EXTRA_DEVICE
                     )
-                    val deviceName = try { device?.name } catch (_: SecurityException) { null }
-                    if (deviceName == UHFReaderService.BT_DEVICE_NAME &&
-                        readerService?.isPaused() == true) {
+                    val connectedName = try { device?.name } catch (_: SecurityException) { null }
+                    // Só retoma se: (1) nome é aceito, (2) sessão está pausada,
+                    // (3) é exatamente o dispositivo da sessão que caiu.
+                    if (connectedName != null &&
+                        UHFReaderService.isBtDeviceAllowed(connectedName) &&
+                        readerService?.isPaused() == true &&
+                        readerService?.getActiveDeviceName() == connectedName) {
                         android.os.Handler(mainLooper).postDelayed({
                             if (readerService?.isPaused() == true) {
                                 stoppedByError = false
-                                readerService?.startCapture(UHFReaderService.BT_DEVICE_NAME)
-                                toast("Winnix_BT reconectado — retomando leitura")
+                                readerService?.startCapture(connectedName)
+                                toast("$connectedName reconectado — retomando leitura")
                             }
                         }, 2000)
                     }
@@ -216,10 +225,7 @@ class MainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        requestNotificationPermission()
-        requestLocationPermission()
-        requestBluetoothPermission()
-        ensureBatteryOptimizationExemption()
+        checkAndRequestPermissions()
         registerUsbReceiver()
         bindToService()
         setupButtons()
@@ -249,48 +255,55 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun requestBluetoothPermission() {
-        // BLUETOOTH_CONNECT required on Android 12+ to access paired device names
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
-            if (checkSelfPermission(android.Manifest.permission.BLUETOOTH_CONNECT)
-                != android.content.pm.PackageManager.PERMISSION_GRANTED) {
-                requestPermissions(
-                    arrayOf(
-                        android.Manifest.permission.BLUETOOTH_CONNECT,
-                        android.Manifest.permission.BLUETOOTH_SCAN
-                    ),
-                    REQ_BT_PERMISSION
-                )
-            }
-        }
-    }
-
     /**
-     * Pede ACCESS_FINE_LOCATION/COARSE (necessária pro Service usar GPS) e, no
-     * Android 10+, também ACCESS_BACKGROUND_LOCATION em uma segunda etapa — o
-     * sistema exige que ela seja pedida separadamente, depois da foreground.
+     * Coleta todas as permissões ainda não concedidas e pede numa única chamada.
+     * Android exibe os diálogos em sequência (um por grupo de permissão) e
+     * dispara onRequestPermissionsResult uma única vez com todos os resultados —
+     * evita corrida entre chamadas separadas e garante que o diálogo de bateria
+     * só aparece depois que todas as permissões foram respondidas.
      */
-    private fun requestLocationPermission() {
-        val perms = arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)
-        val missing = perms.filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
-        if (missing.isNotEmpty()) {
-            ActivityCompat.requestPermissions(this, missing.toTypedArray(), REQ_LOCATION)
+    private fun checkAndRequestPermissions() {
+        val needed = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED)
+            needed.add(Manifest.permission.POST_NOTIFICATIONS)
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+                != PackageManager.PERMISSION_GRANTED)
+            needed.add(Manifest.permission.ACCESS_FINE_LOCATION)
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION)
+                != PackageManager.PERMISSION_GRANTED)
+            needed.add(Manifest.permission.ACCESS_COARSE_LOCATION)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.BLUETOOTH_CONNECT)
+                    != PackageManager.PERMISSION_GRANTED)
+                needed.add(android.Manifest.permission.BLUETOOTH_CONNECT)
+            if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.BLUETOOTH_SCAN)
+                    != PackageManager.PERMISSION_GRANTED)
+                needed.add(android.Manifest.permission.BLUETOOTH_SCAN)
+        }
+
+        if (needed.isNotEmpty()) {
+            ActivityCompat.requestPermissions(this, needed.toTypedArray(), REQ_ALL_PERMISSIONS)
         } else {
+            // Já tudo concedido (segundo abrir ou mais) — avança direto na cadeia.
             requestBackgroundLocationIfNeeded()
         }
     }
 
     private fun requestBackgroundLocationIfNeeded() {
+        // ACCESS_BACKGROUND_LOCATION deve ser pedida SEPARADAMENTE e só faz
+        // sentido se a localização em foreground já foi concedida.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_BACKGROUND_LOCATION)
-            != PackageManager.PERMISSION_GRANTED) {
-            // REQ_BACKGROUND_LOCATION — código diferente de REQ_LOCATION para
-            // evitar recursão infinita: onRequestPermissionsResult chama
-            // requestBackgroundLocationIfNeeded() só para REQ_LOCATION, então
-            // o resultado desta requisição não gera nova chamada em loop.
+                != PackageManager.PERMISSION_GRANTED &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+                == PackageManager.PERMISSION_GRANTED) {
             ActivityCompat.requestPermissions(
                 this, arrayOf(Manifest.permission.ACCESS_BACKGROUND_LOCATION), REQ_BACKGROUND_LOCATION
             )
+        } else {
+            ensureBatteryOptimizationExemption()
         }
     }
 
@@ -331,8 +344,15 @@ class MainActivity : AppCompatActivity() {
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == REQ_LOCATION)      requestBackgroundLocationIfNeeded()
-        if (requestCode == REQ_BT_PERMISSION) refreshDeviceList()  // show Winnix_BT if now paired
+        when (requestCode) {
+            REQ_ALL_PERMISSIONS -> {
+                refreshDeviceList()              // exibe dispositivo BT se BLUETOOTH_CONNECT foi concedido
+                requestBackgroundLocationIfNeeded()
+            }
+            REQ_BACKGROUND_LOCATION -> {
+                ensureBatteryOptimizationExemption()  // último passo da cadeia
+            }
+        }
     }
 
     private fun setupButtons() {
@@ -380,7 +400,7 @@ class MainActivity : AppCompatActivity() {
         }, START_BUTTON_SAFETY_TIMEOUT_MS)
 
         // Bluetooth device — no USB permission needed, connect directly
-        if (deviceName == UHFReaderService.BT_DEVICE_NAME) {
+        if (UHFReaderService.isBtDeviceAllowed(deviceName)) {
             startReaderService(deviceName)
             return
         }
@@ -439,20 +459,19 @@ class MainActivity : AppCompatActivity() {
             labels.add("USB — VID:$vid / PID:$pid — $mfr")
         }
 
-        // Bluetooth — check if Winnix_BT is paired
+        // Bluetooth — exibe TODOS os dispositivos pareados com nome aceito
         try {
             val btManager = getSystemService(BLUETOOTH_SERVICE) as? android.bluetooth.BluetoothManager
             val adapter   = btManager?.adapter
             @Suppress("DEPRECATION")
-            val btDevice  = adapter?.bondedDevices?.firstOrNull {
-                it.name == UHFReaderService.BT_DEVICE_NAME
-            }
-            if (btDevice != null) {
-                deviceNames.add(UHFReaderService.BT_DEVICE_NAME)
-                labels.add("BT — ${UHFReaderService.BT_DEVICE_NAME} (${btDevice.address})")
-            }
+            adapter?.bondedDevices
+                ?.filter { UHFReaderService.isBtDeviceAllowed(it.name ?: "") }
+                ?.forEach { btDevice ->
+                    deviceNames.add(btDevice.name)
+                    labels.add("BT — ${btDevice.name} (${btDevice.address})")
+                }
         } catch (_: SecurityException) {
-            // BLUETOOTH_CONNECT permission not granted yet — BT device won't appear
+            // BLUETOOTH_CONNECT permission not granted yet — BT devices won't appear
         } catch (_: Exception) {}
 
         if (deviceNames.isEmpty()) {
@@ -538,15 +557,6 @@ class MainActivity : AppCompatActivity() {
         binding.btnStop.backgroundTintList = android.content.res.ColorStateList.valueOf(
             if (binding.btnStop.isEnabled) 0xFFC62828.toInt() else 0xFFEF9A9A.toInt()
         )
-    }
-
-    private fun requestNotificationPermission() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
-                != PackageManager.PERMISSION_GRANTED) {
-                ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 100)
-            }
-        }
     }
 
     private fun toast(msg: String) {
