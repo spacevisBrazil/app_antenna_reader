@@ -94,7 +94,7 @@ The serial transport is abstracted behind `serial/ISerialPort` (`UsbSerialPortWr
 
 ### `UHFReaderService` is the real core of the app
 
-`service/UHFReaderService.kt` (~1800 lines) owns almost everything: serial connection lifecycle, both decoders, GPS/compass sensor fusion, CSV session lifecycle, auto-save scheduling, and Drive upload triggering. `MainActivity` is intentionally thin — UI/permissions only, bound to the service via `LocalBinder`, driven by callbacks (`onStatusChanged`, `onCaptureError`, `onWrongAntennaType`, `onAutoSaved`, `onStopComplete`).
+`service/UHFReaderService.kt` (~2000 lines) owns almost everything: serial connection lifecycle, both decoders, GPS/compass sensor fusion, CSV session lifecycle, auto-save scheduling, and Drive upload triggering. `MainActivity` is intentionally thin — UI/permissions only, bound to the service via `LocalBinder`, driven by callbacks (`onStatusChanged`, `onCaptureError`, `onWrongAntennaType`, `onAutoSaved`, `onStopComplete`).
 
 Key invariants encoded in comments in that file (read them before touching related code — several encode fixes for real field bugs):
 
@@ -159,9 +159,9 @@ Segundo destino de upload, independente e paralelo ao Google Drive. Com o envio 
 - `CsvExporter`: adicionou `activeFilePath()` — retorna caminho do arquivo ativo; usado pelo worker e pelo `FileRetention`.
 - `UploadQueueDatabase`: bumped para v3, adicionou `BackendUploadEntry` como entidade com migração SQL.
 
-### Tag filter pipeline (`com.uhflogger.filter`) — branch `feature/rfid-tag-filter`
+### Tag filter pipeline (`com.uhflogger.filter`) — branch `bluetooth_V1_2_filtro_tags`
 
-Reduz o volume de dados salvo no CSV e enviado ao Drive/backend, aplicado **antes** de qualquer tag chegar no `CsvExporter` — Drive e o backend SpaceVis só enxergam o que já passou pelo filtro. Desligado por padrão (opt-in): com `filter_enabled=false` o comportamento é idêntico a antes desta feature. Duas camadas configuráveis pelo usuário, independentes entre si, mais uma proteção interna automática:
+Reduz o volume de dados salvo no CSV e enviado ao Drive/backend, aplicado **antes** de qualquer tag chegar no `CsvExporter` — Drive e o backend SpaceVis só enxergam o que já passou pelo filtro. Ligado por padrão: com `filter_enabled=false` o comportamento é idêntico a antes desta feature. Duas camadas configuráveis pelo usuário, independentes entre si, mais uma proteção interna automática:
 
 - **Camada 1 — família de EPC** (`EpcFamilyMatcher`): lista de padrões hex do mesmo tamanho do EPC, onde `X` aceita qualquer caractere na posição e as demais posições precisam bater exatamente (ex.: `0000100000000XXX`). Lista vazia = aceita tudo. `X` não é validado como estritamente hex — decisão deliberada de manter o matcher simples, dado que EPCs reais só usam hex.
 - **Camada 2 — consolidação por EPC** (`TagFilterEngine.absorb`/`sweepExpired`): mantém só a leitura de melhor RSSI de cada EPC dentro de uma janela de tempo contada a partir do `first_seen` daquele EPC (não uma janela deslizante). Um job de sweep (`runFilterSweep`, agendado no mesmo executor do auto-save) varre periodicamente as entradas abertas e libera para o CSV as que já passaram da janela.
@@ -176,7 +176,7 @@ Reduz o volume de dados salvo no CSV e enviado ao Drive/backend, aplicado **ante
 
 **UI** (`SettingsActivity`, seção "FILTRO DE TAGS"): checkboxes inline, sem diálogos — marcar "Filtro ativo" revela a configuração das camadas 1/2 no lugar; marcar a Camada 1 revela direto o campo de texto de padrões de EPC (`buildInlineTextField`); marcar a Camada 2 revela os dois campos numéricos de janela/sweep (`buildInlineNumberField`), com validação cruzada (sweep precisa ser estritamente menor que a janela, checado nos dois campos, lendo o valor ao vivo do campo irmão via `SettingsManager` em vez de um valor capturado). Campos inline usam `fieldBorderDrawable()` (fundo branco + borda visível, verde quando focado) para não se confundir com o card ao redor — distinto de `borderDrawable()`, usado nos cards/linhas de checkbox. Restaurar padrões reconstrói o `filterContainer` inteiro a partir dos defaults (`root.removeView`/`buildFilterContainer()`/`root.addView`) em vez de patchar valores por ID, já que checkboxes e campos inline não têm o formato "linha com TextView de valor" das linhas de diálogo. Não existe UI para a persistência SIGKILL-safe — não há por que o usuário desligar só a proteção contra perda de dados, mantendo a consolidação ligada.
 
-**Defaults** (`SettingsManager`): filtro geral desligado (`DEFAULT_FILTER_ENABLED=false`); quando ligado, as camadas 1 e 2 nascem ativas; janela = 30 min, sweep = 5 min, sem padrões de EPC configurados (Camada 1 aceita tudo).
+**Defaults** (`SettingsManager`): filtro geral ligado (`DEFAULT_FILTER_ENABLED=true`); camadas 1 e 2 ativas; janela = 30 min, sweep = 5 min; Camada 1 pré-configurada com 3 padrões (`"00001000000XXXXX,0000000000000000000XXXXX,00760000000XXXXX"`) — lista vazia aceita tudo.
 
 ### Settings
 
@@ -225,6 +225,7 @@ Filenames: `<identifier>_<yyyyMMdd>_<HHmmss>.csv`, where `<identifier>` is the p
   - Solução proposta (não implementada): em `BootReceiver`, checar `SettingsManager.wasCapturing(context)` **antes** de decidir iniciar o `UHFReaderService` — só chamar `startForegroundService(Intent(context, UHFReaderService::class.java))` se `true` (mesma condição que `onCreate()` já usa). Não checar dentro do `onCreate()` sem gate no receiver, senão o serviço liga GPS/WakeLock/notificação à toa quando não havia captura ativa. Reusa 100% da lógica de retomada já existente e testada (mesmo caminho do OOM-kill) — sem estado novo. `BOOT_COMPLETED` é isento das restrições de background-start do Android 12+ pra subir foreground service, mesma exceção que `DriveMonitorService` já usa.
 - **Dois pontos onde a cor do botão Start fica dessincronizada** (clicável mas com tint "desabilitado"): [MainActivity.kt:144-146](app/src/main/java/com/uhflogger/MainActivity.kt#L144-L146) (permissão USB negada) e [MainActivity.kt:391](app/src/main/java/com/uhflogger/MainActivity.kt#L391) (dispositivo USB não encontrado) fazem `btnStart.isEnabled = true` sem chamar `updateButtonColors()` depois, diferente dos outros pontos corretos (linha 378, 99). Fix trivial: adicionar a chamada nesses dois lugares.
 - **GPS waypoint logging during capture** — while a session is active and the antenna is connected, a periodic timer inserts "waypoint" rows into the CSV to record the route even between RFID reads. Each waypoint row has EPC `"marcador"`, empty RSSI and Antenna fields, and all location fields filled (Latitude, Longitude, Bearing, GNSS Speed, Location Timestamp, Provider). The timer only logs when `hasSpeed()` is true and speed exceeds a threshold; once movement is detected, logging continues even if the vehicle stops briefly, suspending only after a configurable stop-timeout (hysteresis, same pattern as `BEARING_SPEED_HIGH_MS`/`BEARING_SPEED_LOW_MS`). Open decisions before implementing: (1) timer interval — fixed or UI-configurable, default value; (2) stop-timeout duration — fixed or UI-configurable; (3) speed threshold — reuse `BEARING_SPEED_LOW_MS` (0.5 m/s) or expose separately; (4) whether waypoints count toward session rotation thresholds; (5) whether waypoints should trigger lazy CSV file creation (i.e. before the first real RFID tag); (6) exact EPC marker string (`"marcador"`, `"WAYPOINT"`, etc.).
+- **Suporte a múltiplos nomes de dispositivo BT** — hoje o app aceita apenas o nome exato `"Winnix_BT"` (hardcoded como `BT_DEVICE_NAME` em `UHFReaderService`), usado tanto como filtro de dispositivos pareados quanto como identificador de sessão. A mudança planejada é suportar também o padrão `"spacevis_RFID_XXXX"` (onde `XXXX` são os últimos 4 chars hex do MAC do módulo), mantendo o legado. Approach decidido: substituir o match exato por uma função `isBtDeviceAllowed(name)` que aceita `name == "Winnix_BT"` OU `name.startsWith("spacevis_RFID_") && name.length == comprimento_fixo`; não usar wildcards genéricos. O identificador de sessão já é dinâmico (`activeDeviceName`, `SettingsManager.getLastDeviceName()`) — a reconexão já sabe buscar o nome real, não a constante. O `ACTION_ACL_CONNECTED` receiver em `MainActivity` também precisa usar a mesma função em vez de `== BT_DEVICE_NAME`. Se dois dispositivos pareados passarem no filtro ao mesmo tempo, ambos aparecem na lista e o usuário escolhe; a reconexão automática busca pelo nome exato da sessão ativa.
 
 ### Versioning
 
@@ -247,7 +248,7 @@ Branch **`bluetooth_V1_1_under_test`** — contém o módulo de envio ao backend
 - Ativação por deep link `uhflogger://ativar?chave=XXXX` — operador toca link enviado por WhatsApp.
 - Fix crítico de renovação de token: o app agora renova só com o refresh token, sem exigir `client_id/secret` (bug que matava o envio 5h após ativação em todo aparelho de campo).
 
-Current branch: **`feature/rfid-tag-filter`** (a partir de `bluetooth_V1_1_under_test`) — contém o filtro de tags descrito em "Tag filter pipeline" acima.
+Current branch: **`bluetooth_V1_2_filtro_tags`** (a partir de `bluetooth_V1_1_under_test`) — contém o filtro de tags descrito em "Tag filter pipeline" acima.
 
 ### Signing / distribution
 
