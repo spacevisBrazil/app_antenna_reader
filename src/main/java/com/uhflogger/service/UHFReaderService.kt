@@ -711,7 +711,7 @@ class UHFReaderService : Service(), SensorEventListener {
                 )
             )
 
-            val prefix = buildFileIdentifier(ctx, isBluetooth = deviceName == BT_DEVICE_NAME)
+            val prefix = buildFileIdentifier(ctx, btDeviceName = if (isBtDeviceAllowed(deviceName)) deviceName else null)
             CsvExporter.startSession(ctx, prefix)
             Log.i(TAG, "Session prepared: prefix=$prefix ($activeAntennaType)")
         } else {
@@ -721,10 +721,10 @@ class UHFReaderService : Service(), SensorEventListener {
         jietongDecoder.reset()
         winnixDecoder.reset()
 
-        activeIsBluetooth = (deviceName == BT_DEVICE_NAME)
+        activeIsBluetooth = isBtDeviceAllowed(deviceName)
         winnixRingClear()  // descarta bytes residuais da sessão anterior
 
-        if (deviceName == BT_DEVICE_NAME) {
+        if (isBtDeviceAllowed(deviceName)) {
             startBtConnection(deviceName, resuming)
         } else {
             startUsbConnection(deviceName, resuming)
@@ -739,11 +739,11 @@ class UHFReaderService : Service(), SensorEventListener {
      * DriveHelper, usado pra organizar as pastas do Drive) quando é USB.
      * A estrutura de pastas do Drive não muda — só o nome do arquivo em si.
      */
-    private fun buildFileIdentifier(ctx: Context, isBluetooth: Boolean): String {
-        if (!isBluetooth) return DriveHelper.getDeviceName(ctx)
+    private fun buildFileIdentifier(ctx: Context, btDeviceName: String?): String {
+        if (btDeviceName == null) return DriveHelper.getDeviceName(ctx)
         return try {
             val adapter = (ctx.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
-            val mac = adapter?.bondedDevices?.firstOrNull { it.name == BT_DEVICE_NAME }?.address
+            val mac = adapter?.bondedDevices?.firstOrNull { it.name == btDeviceName }?.address
             mac?.replace(":", "") ?: "BT"
         } catch (se: SecurityException) {
             Log.w(TAG, "buildFileIdentifier: sem permissão pra ler MAC do BT (${se.message})")
@@ -828,17 +828,17 @@ class UHFReaderService : Service(), SensorEventListener {
                 val adapter   = btManager.adapter
                     ?: run { Log.e(TAG, "BT_CONNECT: Bluetooth not available"); if (!resuming) CsvExporter.cancelSession(); isPausedState.set(resuming); return@submit }
 
-                Log.i(TAG, "BT_CONNECT: searching for paired device '$BT_DEVICE_NAME'")
+                Log.i(TAG, "BT_CONNECT: searching for paired device '$deviceName'")
                 @Suppress("DEPRECATION")
                 val btDevice = try {
-                    adapter.bondedDevices?.firstOrNull { it.name == BT_DEVICE_NAME }
+                    adapter.bondedDevices?.firstOrNull { it.name == deviceName }
                 } catch (se: SecurityException) {
                     Log.e(TAG, "BT_CONNECT: SecurityException on bondedDevices: ${se.message}")
                     if (!resuming) CsvExporter.cancelSession()
                     isPausedState.set(resuming)
                     return@submit
                 } ?: run {
-                    Log.e(TAG, "BT_CONNECT: device '$BT_DEVICE_NAME' not found in paired devices")
+                    Log.e(TAG, "BT_CONNECT: device '$deviceName' not found in paired devices")
                     if (!resuming) CsvExporter.cancelSession()
                     isPausedState.set(resuming)
                     return@submit
@@ -858,7 +858,7 @@ class UHFReaderService : Service(), SensorEventListener {
                     btPort.close()
                     if (!resuming) CsvExporter.cancelSession()
                     isPausedState.set(resuming)
-                    onWrongAntennaType?.invoke("Winnix_BT: falha ao conectar")
+                    onWrongAntennaType?.invoke("$deviceName: falha ao conectar")
                     return@submit
                 }
 
@@ -877,7 +877,7 @@ class UHFReaderService : Service(), SensorEventListener {
                     } else {
                         isRunning.set(false)
                         if (resuming) isPausedState.set(true)
-                        onWrongAntennaType?.invoke("Winnix_BT: módulo não respondeu.")
+                        onWrongAntennaType?.invoke("$deviceName: módulo não respondeu.")
                     }
                     return@submit
                 }
@@ -891,7 +891,7 @@ class UHFReaderService : Service(), SensorEventListener {
                 startAutoSaveTimer()
                 updateNotification("Capturando via BT…")
                 onStatusChanged?.invoke(true)
-                Log.i(TAG, "BT_CONNECT: capture started successfully on $BT_DEVICE_NAME")
+                Log.i(TAG, "BT_CONNECT: capture started successfully on $deviceName")
 
             } catch (e: Exception) {
                 Log.e(TAG, "BT_CONNECT: unexpected error: ${e.message}", e)
@@ -1026,8 +1026,9 @@ class UHFReaderService : Service(), SensorEventListener {
         }
     }
 
-    fun isCapturing(): Boolean = isRunning.get()
-    fun isPaused()   : Boolean = isPausedState.get()
+    fun isCapturing()      : Boolean = isRunning.get()
+    fun isPaused()         : Boolean = isPausedState.get()
+    fun getActiveDeviceName(): String? = activeDeviceName
     fun tagCount()   : Int     = totalCount.get()
     fun flushTags(): List<TagRecord> = emptyList()
 
@@ -1658,7 +1659,10 @@ class UHFReaderService : Service(), SensorEventListener {
     }
 
     /**
-     * Loop de reconexão BT — chama startCapture() periodicamente com BT_DEVICE_NAME.
+     * Loop de reconexão BT — chama startCapture() periodicamente com o nome do
+     * dispositivo da sessão ativa (activeDeviceName), que pode ser "Winnix_BT" ou
+     * "spacevis_RFID_XXXX". Nunca usa a constante diretamente — o dispositivo já
+     * foi escolhido pelo usuário no início da sessão.
      * Continua rodando enquanto:
      *   - isPausedState == true  (não parado pelo usuário)
      *   - isRunning == false     (ainda não capturando)
@@ -1702,7 +1706,7 @@ class UHFReaderService : Service(), SensorEventListener {
                 // parando de tentar reconectar. Foi exatamente isso que
                 // aconteceu num teste real de 12h+ sem supervisão.
                 try {
-                    startCapture(BT_DEVICE_NAME)
+                    startCapture(activeDeviceName ?: BT_DEVICE_NAME)
 
                     // Polling em pequenos incrementos — sai assim que isRunning se tornar true,
                     // sem esperar o tempo máximo no caso comum (reconexão rápida).
@@ -1832,7 +1836,7 @@ class UHFReaderService : Service(), SensorEventListener {
         val ctx = appContext ?: return
         val fileName = CsvExporter.finalizeSession(emptyList())
         Log.i(TAG, "Auto-save (new file): $fileName")
-        val prefix = buildFileIdentifier(ctx, isBluetooth = activeIsBluetooth)
+        val prefix = buildFileIdentifier(ctx, btDeviceName = if (activeIsBluetooth) activeDeviceName else null)
         CsvExporter.startSession(ctx, prefix)
         Log.i(TAG, "New session prepared: prefix=$prefix")
 
@@ -1886,6 +1890,15 @@ class UHFReaderService : Service(), SensorEventListener {
         const val ACTION_STOP       = "com.uhflogger.STOP"
         const val EXTRA_DEVICE_NAME = "device_name"
         const val BT_DEVICE_NAME    = "Winnix_BT"
+
+        /**
+         * Retorna true se o nome do dispositivo BT é aceito pelo app.
+         * "Winnix_BT" — legado (nome fixo de hardware antigo).
+         * "spacevis_RFID_XXXX" — módulos novos: prefixo fixo + 4 chars hex do MAC.
+         */
+        fun isBtDeviceAllowed(name: String): Boolean =
+            name == BT_DEVICE_NAME ||
+            (name.startsWith("spacevis_RFID_") && name.length == 18)
         private const val BT_RETRY_DELAY_MS       = 2000L  // delay before the single probe retry
         private const val BT_RECONNECT_INTERVAL_MS= 5000L  // retry interval when session is paused
         // Deve superar o pior caso: timeout do BluetoothSocket.connect() (~12s) é um

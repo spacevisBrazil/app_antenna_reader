@@ -195,14 +195,18 @@ class MainActivity : AppCompatActivity() {
                     val device = intent.getParcelableExtra<android.bluetooth.BluetoothDevice>(
                         android.bluetooth.BluetoothDevice.EXTRA_DEVICE
                     )
-                    val deviceName = try { device?.name } catch (_: SecurityException) { null }
-                    if (deviceName == UHFReaderService.BT_DEVICE_NAME &&
-                        readerService?.isPaused() == true) {
+                    val connectedName = try { device?.name } catch (_: SecurityException) { null }
+                    // Só retoma se: (1) nome é aceito, (2) sessão está pausada,
+                    // (3) é exatamente o dispositivo da sessão que caiu.
+                    if (connectedName != null &&
+                        UHFReaderService.isBtDeviceAllowed(connectedName) &&
+                        readerService?.isPaused() == true &&
+                        readerService?.getActiveDeviceName() == connectedName) {
                         android.os.Handler(mainLooper).postDelayed({
                             if (readerService?.isPaused() == true) {
                                 stoppedByError = false
-                                readerService?.startCapture(UHFReaderService.BT_DEVICE_NAME)
-                                toast("Winnix_BT reconectado — retomando leitura")
+                                readerService?.startCapture(connectedName)
+                                toast("$connectedName reconectado — retomando leitura")
                             }
                         }, 2000)
                     }
@@ -380,7 +384,7 @@ class MainActivity : AppCompatActivity() {
         }, START_BUTTON_SAFETY_TIMEOUT_MS)
 
         // Bluetooth device — no USB permission needed, connect directly
-        if (deviceName == UHFReaderService.BT_DEVICE_NAME) {
+        if (UHFReaderService.isBtDeviceAllowed(deviceName)) {
             startReaderService(deviceName)
             return
         }
@@ -439,20 +443,19 @@ class MainActivity : AppCompatActivity() {
             labels.add("USB — VID:$vid / PID:$pid — $mfr")
         }
 
-        // Bluetooth — check if Winnix_BT is paired
+        // Bluetooth — exibe TODOS os dispositivos pareados com nome aceito
         try {
             val btManager = getSystemService(BLUETOOTH_SERVICE) as? android.bluetooth.BluetoothManager
             val adapter   = btManager?.adapter
             @Suppress("DEPRECATION")
-            val btDevice  = adapter?.bondedDevices?.firstOrNull {
-                it.name == UHFReaderService.BT_DEVICE_NAME
-            }
-            if (btDevice != null) {
-                deviceNames.add(UHFReaderService.BT_DEVICE_NAME)
-                labels.add("BT — ${UHFReaderService.BT_DEVICE_NAME} (${btDevice.address})")
-            }
+            adapter?.bondedDevices
+                ?.filter { UHFReaderService.isBtDeviceAllowed(it.name ?: "") }
+                ?.forEach { btDevice ->
+                    deviceNames.add(btDevice.name)
+                    labels.add("BT — ${btDevice.name} (${btDevice.address})")
+                }
         } catch (_: SecurityException) {
-            // BLUETOOTH_CONNECT permission not granted yet — BT device won't appear
+            // BLUETOOTH_CONNECT permission not granted yet — BT devices won't appear
         } catch (_: Exception) {}
 
         if (deviceNames.isEmpty()) {
