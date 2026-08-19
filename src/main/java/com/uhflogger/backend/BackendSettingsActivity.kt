@@ -296,9 +296,19 @@ class BackendSettingsActivity : AppCompatActivity() {
         runCatching {
             io.submit {
                 val pendentes = runCatching { BackendUploadStore.openCount(this) }.getOrNull()
+                // O motivo da parada, quando há um. Saber que há 12 arquivos na
+                // fila não diz NADA sobre o que fazer; "lote grande demais (413)"
+                // diz. Sem esta linha, todo diagnóstico começava com alguém
+                // abrindo log de servidor — e em campo isso não acontece.
+                val erro = runCatching { BackendUploadStore.lastError(this) }.getOrNull()
                 runOnUiThread {
-                    if (pendentes != null && pendentes > 0 && !isFinishing && !isDestroyed) {
+                    if (isFinishing || isDestroyed) return@runOnUiThread
+                    if (pendentes != null && pendentes > 0) {
                         tvStatus.append("\n$pendentes arquivo(s) aguardando envio")
+                    }
+                    if (!erro.isNullOrEmpty()) {
+                        tvStatus.append("\nÚltima falha: $erro")
+                        tvStatus.setTextColor(0xFFEF6C00.toInt())
                     }
                 }
             }
