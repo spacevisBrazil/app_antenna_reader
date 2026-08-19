@@ -108,17 +108,25 @@ class BackendUploadWorker(
         var confirmed    = startFrom
         var failed       = false
         val batch = ArrayList<JSONObject>(MAX_BATCH)
+        // Tamanho do que já está no lote. Medido ao somar, e não no fim, pra
+        // fechar o lote ANTES de passar do teto — depois de montado seria tarde:
+        // ou o envio falha, ou a leitura teria que voltar pro lote seguinte.
+        var batchBytes = 0
 
         file.bufferedReader().use { reader ->
             for ((index, line) in reader.lineSequence().withIndex()) {
                 if (index == 0 || index <= startFrom) continue  // índice 0 = cabeçalho
                 pendingIndex = index
                 if (line.isNotBlank()) {
-                    CsvReadingParser.parseLine(file.name, index, line)?.let { batch.add(it) }
+                    CsvReadingParser.parseLine(file.name, index, line)?.let {
+                        batch.add(it)
+                        batchBytes += it.toString().length + 1   // +1 pela vírgula do array
+                    }
                 }
-                if (batch.size >= MAX_BATCH) {
-                    if (!sendBatch(captureId, batch, token)) { failed = true; break }
+                if (batch.size >= MAX_BATCH || batchBytes >= MAX_BATCH_BYTES) {
+                    if (!sendBatch(captureId, batch, token, path)) { failed = true; break }
                     batch.clear()
+                    batchBytes = 0
                     confirmed = index
                     BackendUploadStore.setLinesSent(context, path, confirmed)
                 }
@@ -127,7 +135,7 @@ class BackendUploadWorker(
         if (failed) return false
 
         if (batch.isNotEmpty()) {
-            if (!sendBatch(captureId, batch, token)) return false
+            if (!sendBatch(captureId, batch, token, path)) return false
             confirmed = pendingIndex
             BackendUploadStore.setLinesSent(context, path, confirmed)
         } else if (pendingIndex > confirmed) {
@@ -151,10 +159,20 @@ class BackendUploadWorker(
     private fun openCapture(file: File, entry: BackendUploadEntry, token: String): String? {
         val startedAt = CsvReadingParser.startedAtFromFileName(file.name)
         if (startedAt == null) {
-            // Sem instante de início não há captura válida a abrir (o backend
-            // exige started_at). Arquivo com nome fora do padrão não é nosso.
-            Log.w(TAG, "Ignorando ${file.name}: nome fora do padrão {prefixo}_{millis}.csv")
-            BackendUploadStore.markClosed(context, file.absolutePath)
+            // Sem instante de início não há captura a abrir — o backend exige
+            // started_at.
+            //
+            // Antes isto marcava o arquivo como `closed`, e aí o FileRetention
+            // via "backend terminou" e deixava o Drive apagá-lo: um CSV cujo
+            // nome não casasse com o padrão era descartado sem NUNCA ter sido
+            // enviado, em silêncio. O arquivo agora fica onde está, com o motivo
+            // à vista na tela, e alguém decide o que fazer com ele. Ficar preso
+            // é recuperável; apagado não é.
+            Log.w(TAG, "Sem started_at em ${file.name}: nome fora do padrão {prefixo}_{yyyyMMdd_HHmmss}.csv")
+            BackendUploadStore.setError(
+                context, file.absolutePath,
+                "nome fora do padrão — o servidor não aceita captura sem data de início",
+            )
             return null
         }
 
@@ -190,14 +208,33 @@ class BackendUploadWorker(
         return response.json()?.optString("id")?.ifEmpty { null }
     }
 
-    private fun sendBatch(captureId: String, batch: List<JSONObject>, token: String): Boolean {
+    /**
+     * O `path` entra aqui só pra gravar o MOTIVO de uma recusa. Sem isso o lote
+     * recusado morria num Log.w que ninguém em campo lê: a tela seguia dizendo
+     * "Ativado e enviando" com o envio parado havia dias, e descobrir o porquê
+     * exigia ir atrás de log de servidor. Lote recusado é a falha mais provável
+     * do módulo — tem que dar pra ver no aparelho.
+     */
+    private fun sendBatch(
+        captureId: String,
+        batch    : List<JSONObject>,
+        token    : String,
+        path     : String,
+    ): Boolean {
         val body = JSONObject().put("readings", JSONArray(batch))
         val url = "${BackendSettings.getBaseUrl(context)}/api/antenna/v1/farms/" +
                 "${BackendSettings.getFarmId(context)}/captures/$captureId/readings/batch"
 
         val response = BackendApi.post(url, body, DeviceAuthManager.authHeaders(context, token))
         if (!response.isSuccess) {
-            Log.w(TAG, "Lote de ${batch.size} leituras recusado (${response.status})")
+            val motivo = when (response.status) {
+                0    -> "sem conexão"
+                401  -> "sessão recusada (401)"
+                413  -> "lote grande demais para o servidor (413)"
+                else -> "recusado pelo servidor (${response.status})"
+            }
+            Log.w(TAG, "Lote de ${batch.size} leituras recusado: $motivo")
+            BackendUploadStore.setError(context, path, "${batch.size} leituras: $motivo")
             return false
         }
         Log.i(TAG, "Lote enviado: ${batch.size} leituras → captura $captureId")
@@ -218,6 +255,19 @@ class BackendUploadWorker(
     companion object {
         private const val TAG = "BackendUploadWorker"
         private const val MAX_BATCH = 500   // mesmo teto do endpoint
+
+        // Teto por TAMANHO, que é por onde o envio realmente quebrava: o
+        // endpoint aceita 500 leituras, mas o `bodyParser.json()` do backend
+        // corta o corpo em 100 kb, e um lote cheio dá ~125 kb. O 413 vinha do
+        // middleware, ANTES do handler — então o teto anunciado nunca era
+        // alcançado e nenhuma captura grande subia.
+        //
+        // Contar item não protege disso; contar byte sim. Com 64 kb o lote cabe
+        // com folga em qualquer limite plausível do servidor, inclusive no
+        // default de 100 kb — ou seja, o aparelho volta a enviar sem depender de
+        // deploy nenhum do lado de lá. O que vier primeiro (itens ou bytes)
+        // fecha o lote.
+        private const val MAX_BATCH_BYTES = 64 * 1024
 
         const val WORK_NAME          = "backend_upload_serial"
         private const val WORK_NAME_PERIODIC = "backend_upload_periodic"
