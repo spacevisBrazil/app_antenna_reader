@@ -1661,7 +1661,7 @@ class UHFReaderService : Service(), SensorEventListener {
     /**
      * Loop de reconexão BT — chama startCapture() periodicamente com o nome do
      * dispositivo da sessão ativa (activeDeviceName), que pode ser "Winnix_BT" ou
-     * "spacevis_RFID_XXXX". Nunca usa a constante diretamente — o dispositivo já
+     * "SPACEVIS_RFID_XXXX". Nunca usa a constante diretamente — o dispositivo já
      * foi escolhido pelo usuário no início da sessão.
      * Continua rodando enquanto:
      *   - isPausedState == true  (não parado pelo usuário)
@@ -1894,11 +1894,11 @@ class UHFReaderService : Service(), SensorEventListener {
         /**
          * Retorna true se o nome do dispositivo BT é aceito pelo app.
          * "Winnix_BT" — legado (nome fixo de hardware antigo).
-         * "spacevis_RFID_XXXX" — módulos novos: prefixo fixo + 4 chars hex do MAC.
+         * "SPACEVIS_RFID_XXXX" — módulos novos: prefixo fixo + 4 chars hex do MAC.
          */
         fun isBtDeviceAllowed(name: String): Boolean =
             name == BT_DEVICE_NAME ||
-            (name.startsWith("spacevis_RFID_") && name.length == 18)
+            (name.startsWith("SPACEVIS_RFID_") && name.length == 18)
         private const val BT_RETRY_DELAY_MS       = 2000L  // delay before the single probe retry
         private const val BT_RECONNECT_INTERVAL_MS= 5000L  // retry interval when session is paused
         // Deve superar o pior caso: timeout do BluetoothSocket.connect() (~12s) é um
