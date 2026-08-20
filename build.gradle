@@ -3,6 +3,49 @@ plugins {
     alias(libs.plugins.ksp)
 }
 
+// ASSINATURA DO RELEASE
+//
+// Sem isto, `assemblePrdRelease` produzia `app-prd-release-unsigned.apk` — um
+// arquivo que o Android recusa instalar. A pegadinha é que o build NÃO falha:
+// sai um APK aparentemente pronto que só revela o problema no aparelho, no
+// momento de instalar, longe de quem buildou.
+//
+// A credencial nunca entra no repositório. Vem de `keystore.properties` (na raiz
+// do módulo, ignorado pelo git) ou de variáveis de ambiente, para o mesmo
+// build.gradle servir à máquina de quem desenvolve e a um runner de CI sem
+// mudar uma linha. Ver keystore.properties.example.
+def keystoreProps = new Properties()
+def keystorePropsFile = file('keystore.properties')
+if (keystorePropsFile.exists()) {
+    keystorePropsFile.withInputStream { keystoreProps.load(it) }
+}
+
+// Propriedade do arquivo > -P na linha de comando > variável de ambiente.
+def signingValue = { String key, String env ->
+    keystoreProps.getProperty(key) ?: project.findProperty(key) ?: System.getenv(env)
+}
+
+def storeFilePath  = signingValue('storeFile',     'UHFLOGGER_STORE_FILE')?.toString()
+def storePasswordV = signingValue('storePassword', 'UHFLOGGER_STORE_PASSWORD')?.toString()
+def keyAliasV      = signingValue('keyAlias',      'UHFLOGGER_KEY_ALIAS')?.toString()
+def keyPasswordV   = signingValue('keyPassword',   'UHFLOGGER_KEY_PASSWORD')?.toString()
+
+// Só assina quando TUDO está presente e o keystore existe de fato. Configuração
+// pela metade produziria um erro de Gradle obscuro no meio do build; aqui a
+// ausência é um caminho previsto, com aviso, e o APK de debug segue funcionando
+// para quem só quer rodar no aparelho.
+def canSignRelease = storeFilePath != null && !storeFilePath.trim().isEmpty() &&
+        file(storeFilePath).exists() &&
+        storePasswordV != null && keyAliasV != null && keyPasswordV != null
+
+if (!canSignRelease) {
+    logger.warn(
+        "[uhflogger] Sem credenciais de assinatura — os APKs de RELEASE sairao " +
+        "UNSIGNED e nao instalam. Para assinar, crie keystore.properties " +
+        "(veja keystore.properties.example). Builds de DEBUG nao sao afetados."
+    )
+}
+
 android {
     namespace 'com.uhflogger'
     compileSdk 34
@@ -15,10 +58,33 @@ android {
         versionName "1.3.1"
     }
 
+    signingConfigs {
+        release {
+            if (canSignRelease) {
+                storeFile     file(storeFilePath)
+                storePassword storePasswordV
+                keyAlias      keyAliasV
+                keyPassword   keyPasswordV
+                // v1 continua ligado por causa do minSdk 26: o esquema v2/v3
+                // sozinho basta a partir do Android 7, mas manter v1 não custa
+                // nada e evita surpresa em aparelho antigo de campo.
+                enableV1Signing true
+                enableV2Signing true
+            }
+        }
+    }
+
     buildTypes {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            // Sem credencial, simplesmente não se atribui: o release sai
+            // unsigned como antes, com o aviso emitido lá em cima explicando por
+            // quê. Atribuir `null` daria no mesmo, mas depende de dispatch que
+            // já mudou entre versões do AGP.
+            if (canSignRelease) {
+                signingConfig signingConfigs.release
+            }
         }
     }
 
