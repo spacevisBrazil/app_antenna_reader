@@ -61,7 +61,7 @@ class Converters {
         com.uhflogger.backend.BackendUploadEntry::class,
         com.uhflogger.filter.FilterStateEntry::class,
     ],
-    version = 4,
+    version = 5,
     exportSchema = false,
 )
 @TypeConverters(Converters::class)
@@ -80,7 +80,7 @@ abstract class UploadQueueDatabase : RoomDatabase() {
                     UploadQueueDatabase::class.java,
                     "upload_queue.db"
                 )
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
                     // WAL: leituras não bloqueiam escritas — importante pro filtro,
                     // que grava em lote a cada poucos segundos enquanto outros
                     // workers podem estar lendo a fila de upload ao mesmo tempo.
@@ -90,6 +90,18 @@ abstract class UploadQueueDatabase : RoomDatabase() {
                     // O scan de inicialização em DriveMonitorService recupera arquivos órfãos.
                     .build().also { INSTANCE = it }
             }
+
+        // Migração: a fazenda passa a ser propriedade do ARQUIVO, não do app.
+        //
+        // Sem ela, trocar de fazenda no seletor com envio pendente mandaria as
+        // leituras da fazenda anterior para a nova. DEFAULT 0 marca as linhas
+        // que já existiam: o worker adota a fazenda atual nelas e grava, o que
+        // preserva o comportamento de antes para quem já tinha fila.
+        val MIGRATION_4_5 = object : androidx.room.migration.Migration(4, 5) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE backend_upload ADD COLUMN farmId INTEGER NOT NULL DEFAULT 0")
+            }
+        }
 
         // Migração: adiciona coluna driveFileId
         val MIGRATION_1_2 = object : androidx.room.migration.Migration(1, 2) {

@@ -89,11 +89,23 @@ class BackendUploadWorker(
     private fun processFile(file: File, token: String): Boolean {
         val path = file.absolutePath
         val entry = BackendUploadStore.ensure(
-            context, path, CsvReadingParser.captureClientId(file.name)
+            context, path, CsvReadingParser.captureClientId(file.name),
+            BackendSettings.getFarmId(context),
         ) ?: return false
 
+        // Fazenda DESTE arquivo. Linha antiga (criada antes da coluna existir)
+        // adota a fazenda atual uma única vez e fica com ela — a partir daí o
+        // seletor pode mudar à vontade sem desviar o que já foi capturado.
+        val farmId = if (entry.farmId > 0) entry.farmId else BackendSettings.getFarmId(context)
+        if (entry.farmId <= 0 && farmId > 0) BackendUploadStore.setFarmId(context, path, farmId)
+        if (farmId <= 0) {
+            Log.w(TAG, "Sem fazenda definida — ${file.name} espera o seletor")
+            BackendUploadStore.setError(context, path, "escolha a fazenda para enviar")
+            return false
+        }
+
         // 1. Captura aberta no servidor.
-        val captureId = entry.captureId ?: openCapture(file, entry, token) ?: return false
+        val captureId = entry.captureId ?: openCapture(file, entry, token, farmId) ?: return false
         if (entry.captureId == null) BackendUploadStore.setCaptureId(context, path, captureId)
 
         // 2/3. Envia o que falta, em lotes.
@@ -124,7 +136,7 @@ class BackendUploadWorker(
                     }
                 }
                 if (batch.size >= MAX_BATCH || batchBytes >= MAX_BATCH_BYTES) {
-                    if (!sendBatch(captureId, batch, token, path)) { failed = true; break }
+                    if (!sendBatch(captureId, batch, token, path, farmId)) { failed = true; break }
                     batch.clear()
                     batchBytes = 0
                     confirmed = index
@@ -135,7 +147,7 @@ class BackendUploadWorker(
         if (failed) return false
 
         if (batch.isNotEmpty()) {
-            if (!sendBatch(captureId, batch, token, path)) return false
+            if (!sendBatch(captureId, batch, token, path, farmId)) return false
             confirmed = pendingIndex
             BackendUploadStore.setLinesSent(context, path, confirmed)
         } else if (pendingIndex > confirmed) {
@@ -148,7 +160,7 @@ class BackendUploadWorker(
         // 4. Fecha — só quando a captura acabou de verdade.
         val isActive = CsvExporter.activeFilePath() == path
         if (!isActive) {
-            if (!closeCapture(captureId, token)) return false
+            if (!closeCapture(captureId, token, farmId)) return false
             BackendUploadStore.markClosed(context, path)
             Log.i(TAG, "Captura de ${file.name} fechada no servidor")
             FileRetention.onBackendDone(context, file)
@@ -156,7 +168,12 @@ class BackendUploadWorker(
         return true
     }
 
-    private fun openCapture(file: File, entry: BackendUploadEntry, token: String): String? {
+    private fun openCapture(
+        file : File,
+        entry: BackendUploadEntry,
+        token: String,
+        farmId: Int,
+    ): String? {
         val startedAt = CsvReadingParser.startedAtFromFileName(file.name)
         if (startedAt == null) {
             // Sem instante de início não há captura a abrir — o backend exige
@@ -198,8 +215,8 @@ class BackendUploadWorker(
         }
 
         val url = "${BackendSettings.getBaseUrl(context)}/api/antenna/v1/farms/" +
-                "${BackendSettings.getFarmId(context)}/captures"
-        val response = BackendApi.post(url, body, DeviceAuthManager.authHeaders(context, token))
+                "$farmId/captures"
+        val response = BackendApi.post(url, body, DeviceAuthManager.authHeaders(token, farmId))
 
         if (!response.isSuccess) {
             Log.w(TAG, "Não abriu captura de ${file.name} (${response.status})")
@@ -220,12 +237,13 @@ class BackendUploadWorker(
         batch    : List<JSONObject>,
         token    : String,
         path     : String,
+        farmId   : Int,
     ): Boolean {
         val body = JSONObject().put("readings", JSONArray(batch))
         val url = "${BackendSettings.getBaseUrl(context)}/api/antenna/v1/farms/" +
-                "${BackendSettings.getFarmId(context)}/captures/$captureId/readings/batch"
+                "$farmId/captures/$captureId/readings/batch"
 
-        val response = BackendApi.post(url, body, DeviceAuthManager.authHeaders(context, token))
+        val response = BackendApi.post(url, body, DeviceAuthManager.authHeaders(token, farmId))
         if (!response.isSuccess) {
             val motivo = when (response.status) {
                 0    -> "sem conexão"
@@ -241,10 +259,10 @@ class BackendUploadWorker(
         return true
     }
 
-    private fun closeCapture(captureId: String, token: String): Boolean {
+    private fun closeCapture(captureId: String, token: String, farmId: Int): Boolean {
         val url = "${BackendSettings.getBaseUrl(context)}/api/antenna/v1/farms/" +
-                "${BackendSettings.getFarmId(context)}/captures/$captureId/close"
-        val response = BackendApi.post(url, JSONObject(), DeviceAuthManager.authHeaders(context, token))
+                "$farmId/captures/$captureId/close"
+        val response = BackendApi.post(url, JSONObject(), DeviceAuthManager.authHeaders(token, farmId))
         if (!response.isSuccess) {
             Log.w(TAG, "Não fechou a captura $captureId (${response.status})")
             return false

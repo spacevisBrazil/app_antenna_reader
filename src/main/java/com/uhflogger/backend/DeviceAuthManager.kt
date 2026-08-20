@@ -92,27 +92,7 @@ object DeviceAuthManager {
      * devolve UMA fazenda — com nenhuma ou várias, quem escolhe é o operador.
      */
     private fun resolveFarm(context: Context, token: String): ActivationResult {
-        val baseUrl = BackendSettings.getBaseUrl(context)
-        val response = BackendApi.get(
-            "$baseUrl/api/mobile/v1/session/bootstrap",
-            mapOf("Authorization" to "Bearer $token"),
-        )
-        if (!response.isSuccess) {
-            Log.w(TAG, "Não resolveu a fazenda automaticamente (${response.status})")
-            return ActivationResult(null, null)
-        }
-
-        val farms = response.json()?.optJSONArray("farms")
-        if (farms == null || farms.length() == 0) {
-            Log.i(TAG, "Nenhuma fazenda vinculada ao aparelho")
-            return ActivationResult(null, null)
-        }
-
-        val lista = (0 until farms.length()).mapNotNull { i ->
-            val o = farms.optJSONObject(i) ?: return@mapNotNull null
-            val id = o.optInt("id", 0)
-            if (id <= 0) null else Farm(id, o.optString("name").ifEmpty { "Fazenda $id" })
-        }
+        val lista = fetchFarms(context, token) ?: return ActivationResult(null, null)
         if (lista.isEmpty()) return ActivationResult(null, null)
 
         // Uma só: decide sozinho. Várias: quem escolhe é a pessoa — escolher por
@@ -123,9 +103,53 @@ object DeviceAuthManager {
         }
 
         val farm = lista.first()
-        BackendSettings.setFarmId(context, farm.id)
+        BackendSettings.setFarm(context, farm.id, farm.name)
         Log.i(TAG, "Fazenda resolvida pela chave: ${farm.id} (${farm.name})")
         return ActivationResult(farm.id, farm.name, lista)
+    }
+
+    /**
+     * Fazendas do aparelho, direto do servidor, e já persistidas.
+     *
+     * Existe separado da ativação porque a lista MUDA depois dela: a conta-device
+     * pode ganhar acesso a outra fazenda semanas depois, e um seletor que só
+     * soubesse do que veio na ativação nunca mostraria a nova. É chamado ao abrir
+     * a tela de configuração, não só uma vez na vida do aparelho.
+     *
+     * @return `null` quando não deu pra falar com o servidor (a lista em disco
+     *         continua valendo); lista vazia quando o servidor respondeu que não
+     *         há fazenda nenhuma.
+     */
+    fun fetchFarms(context: Context, token: String): List<Farm>? {
+        val baseUrl = BackendSettings.getBaseUrl(context)
+        val response = BackendApi.get(
+            "$baseUrl/api/mobile/v1/session/bootstrap",
+            mapOf("Authorization" to "Bearer $token"),
+        )
+        if (!response.isSuccess) {
+            Log.w(TAG, "Não listou as fazendas (${response.status})")
+            return null
+        }
+
+        val farms = response.json()?.optJSONArray("farms")
+        if (farms == null || farms.length() == 0) {
+            Log.i(TAG, "Nenhuma fazenda vinculada ao aparelho")
+            return emptyList()
+        }
+
+        val lista = (0 until farms.length()).mapNotNull { i ->
+            val o = farms.optJSONObject(i) ?: return@mapNotNull null
+            val id = o.optInt("id", 0)
+            if (id <= 0) null else Farm(id, o.optString("name").ifEmpty { "Fazenda $id" })
+        }
+        BackendSettings.setFarms(context, lista.map { it.id to it.name })
+
+        // Renomear a fazenda no cadastro não pode deixar a tela mentindo com o
+        // nome antigo. O id é a âncora; o nome é o que se corrige.
+        val atual = BackendSettings.getFarmId(context)
+        lista.firstOrNull { it.id == atual }?.let { BackendSettings.setFarm(context, it.id, it.name) }
+
+        return lista
     }
 
     /**
@@ -195,9 +219,17 @@ object DeviceAuthManager {
         return accessToken
     }
 
-    /** Cabeçalhos de toda chamada autenticada do módulo. */
-    fun authHeaders(context: Context, token: String): Map<String, String> = mapOf(
+    /**
+     * Cabeçalhos de toda chamada autenticada do módulo.
+     *
+     * A fazenda vem por PARÂMETRO, não do estado global: quem envia um arquivo
+     * usa a fazenda em que aquele arquivo foi capturado (BackendUploadEntry.farmId),
+     * e não a que estiver selecionada no momento do envio. Ler o global aqui
+     * reabriria, num único ponto escondido, o desvio que o farmId por arquivo
+     * existe pra impedir.
+     */
+    fun authHeaders(token: String, farmId: Int): Map<String, String> = mapOf(
         "Authorization" to "Bearer $token",
-        "farmid" to BackendSettings.getFarmId(context).toString(),
+        "farmid" to farmId.toString(),
     )
 }

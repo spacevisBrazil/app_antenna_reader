@@ -36,6 +36,17 @@ data class BackendUploadEntry(
     val driveDone  : Boolean  = false,
     val lastError  : String?  = null,
     val updatedAt  : Long     = System.currentTimeMillis(),
+    // Fazenda deste arquivo, congelada quando ele entrou na fila.
+    //
+    // NÃO se lê a fazenda "atual" na hora de enviar: o operador pode trocar de
+    // fazenda no seletor com CSVs ainda pendentes, e aí leitura feita na Santa
+    // Martha entraria como se fosse da Demonstração — sem erro, sem aviso, e
+    // impossível de descobrir depois olhando o banco. O arquivo carrega a
+    // fazenda em que foi capturado, do começo ao fim.
+    //
+    // 0 = linha criada antes desta coluna existir; o worker adota a fazenda
+    // atual na primeira passada e grava (ver processFile).
+    val farmId     : Int      = 0,
 )
 
 /**
@@ -68,6 +79,9 @@ interface BackendUploadDao {
     @Query("UPDATE backend_upload SET lastError = :error, updatedAt = :now WHERE filePath = :filePath")
     fun setError(filePath: String, error: String?, now: Long)
 
+    @Query("UPDATE backend_upload SET farmId = :farmId, updatedAt = :now WHERE filePath = :filePath")
+    fun setFarmId(filePath: String, farmId: Int, now: Long)
+
     @Query("DELETE FROM backend_upload WHERE filePath = :filePath")
     fun delete(filePath: String)
 
@@ -95,10 +109,24 @@ object BackendUploadStore {
 
     private fun now() = System.currentTimeMillis()
 
-    fun ensure(context: Context, filePath: String, captureClientId: String): BackendUploadEntry? {
-        dao(context).insertIfAbsent(BackendUploadEntry(filePath = filePath, captureClientId = captureClientId))
+    /**
+     * @param farmId fazenda em que este arquivo foi capturado — gravada na
+     *        criação da linha e nunca mais relida do estado global.
+     */
+    fun ensure(
+        context: Context,
+        filePath: String,
+        captureClientId: String,
+        farmId: Int,
+    ): BackendUploadEntry? {
+        dao(context).insertIfAbsent(
+            BackendUploadEntry(filePath = filePath, captureClientId = captureClientId, farmId = farmId)
+        )
         return dao(context).get(filePath)
     }
+
+    fun setFarmId(context: Context, filePath: String, farmId: Int) =
+        dao(context).setFarmId(filePath, farmId, now())
 
     fun get(context: Context, filePath: String): BackendUploadEntry? = dao(context).get(filePath)
 
