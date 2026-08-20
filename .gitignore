@@ -2,3 +2,9 @@
 graphify-out/
 release/*.apk
 CLAUDE.md
+
+# Credenciais de assinatura — nunca versionar.
+# Quem tem o keystore consegue publicar atualização em nome da SpaceVis.
+keystore.properties
+*.jks
+*.keystore
