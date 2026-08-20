@@ -1,4 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+    `app_name` NÃO fica aqui: ele é gerado por flavor (resValue no build.gradle),
+    pra o build de homologação se chamar "UHF Logger HML" na gaveta e ninguém
+    confundir os dois aparelhos. Declarar aqui também causaria recurso duplicado.
+-->
 <resources>
-    <string name="app_name">UHF Logger</string>
 </resources>

@@ -20,20 +20,26 @@ class DriveMonitorService : Service() {
         fileObserver = CsvFileObserver(this, folder).also { it.startWatching() }
         Log.i(TAG, "Monitoring: ${folder.absolutePath}")
 
-        // Scan folder for any CSV files that exist but were never enqueued.
-        // This handles: DB migration wipe, FileObserver miss, crash after write.
-        // Uses IGNORE conflict strategy so already-queued files are not duplicated.
+        // Varre a pasta em busca de CSVs que existam mas nunca foram enfileirados.
+        // Cobre: migração de BD, miss do FileObserver, crash após gravação.
+        // Usa estratégia IGNORE no conflito, então arquivos já na fila não são duplicados.
         scanAndEnqueueExistingFiles(folder)
 
-        // Schedule periodic background check
         DriveUploadWorker.schedulePeriodic(this)
-        // Try to upload anything pending immediately
+        // Tenta subir qualquer pendência imediatamente
         DriveUploadWorker.scheduleNow(this)
+
+        // Envio ao backend SpaceVis — destino ADICIONAL, com fila e agenda
+        // próprias. O periódico aqui é o que faz o envio ACOMPANHAR uma captura
+        // longa: no modo "atualizar arquivo atual" o CSV só fecha no Parar, e
+        // sem esta agenda o servidor só receberia dias depois.
+        com.uhflogger.backend.BackendUploadWorker.schedulePeriodic(this)
+        com.uhflogger.backend.BackendUploadWorker.scheduleNow(this)
     }
 
     /**
-     * Scans the CSV folder and enqueues any file not already in the upload queue.
-     * Safe to call on every startup — insert uses IGNORE on conflict.
+     * Varre a pasta de CSV e enfileira qualquer arquivo ainda não na fila de upload.
+     * Seguro chamar a cada inicialização — o insert usa IGNORE em conflito.
      */
     private fun scanAndEnqueueExistingFiles(folder: java.io.File) {
         val files = folder.listFiles { f -> f.isFile && f.name.endsWith(".csv", ignoreCase = true) }
@@ -46,7 +52,7 @@ class DriveMonitorService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        return START_STICKY   // restart automatically if killed
+        return START_STICKY   // reinicia automaticamente se for morto pelo Android
     }
 
     override fun onDestroy() {
@@ -57,8 +63,6 @@ class DriveMonitorService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
-
-    // ─── Notification ─────────────────────────────────────────────────────────
 
     private fun createNotificationChannel() {
         val channel = NotificationChannel(

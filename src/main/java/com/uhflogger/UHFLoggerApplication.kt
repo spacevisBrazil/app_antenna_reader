@@ -6,18 +6,14 @@ import androidx.work.WorkManager
 import java.util.concurrent.Executors
 
 /**
- * Custom Application class — configures WorkManager to run with a
- * SINGLE-THREADED executor.
+ * Configura o WorkManager com executor de thread única.
  *
- * This is the definitive fix for duplicate Drive uploads/folders:
- * by default WorkManager can run multiple workers concurrently
- * (e.g. a one-time scheduleNow() and a periodic check at the same instant).
- * Forcing a single-thread executor guarantees DriveUploadWorker.doWork()
- * NEVER runs in parallel with itself, eliminating the race condition
- * that created duplicate folders and duplicate file uploads.
+ * Por padrão o WorkManager pode rodar múltiplos workers concorrentemente (ex: um scheduleNow()
+ * e uma verificação periódica ao mesmo tempo). Forçar thread única garante que DriveUploadWorker.doWork()
+ * nunca rode em paralelo consigo mesmo, eliminando a condição de corrida que criava pastas e
+ * arquivos duplicados no Drive.
  *
- * Combined with the synchronized locks in DriveUploadWorker and DriveHelper,
- * this provides defense-in-depth against any future concurrent-trigger scenario.
+ * Combinado com os locks em DriveUploadWorker e DriveHelper, fornece defesa em profundidade.
  */
 class UHFLoggerApplication : Application(), Configuration.Provider {
 

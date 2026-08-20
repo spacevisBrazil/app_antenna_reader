@@ -21,10 +21,9 @@ class SettingsActivity : AppCompatActivity() {
     private val MUTED  = Color.parseColor("#888888")
     private val LABEL  = Color.parseColor("#2E7D32")
 
-    // Root layout reference — needed to show/hide Winnix section
     private lateinit var root: LinearLayout
-    // Winnix-only container — shown/hidden based on antenna type selection
     private lateinit var winnixSection: LinearLayout
+    private lateinit var filterContainer: LinearLayout
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -68,12 +67,6 @@ class SettingsActivity : AppCompatActivity() {
             }
         }
 
-        val modeLabel = if (SettingsManager.getAutoSaveMode(this) == SettingsManager.AUTO_SAVE_MODE_NEW_FILE)
-            "Novo arquivo a cada auto-save" else "Atualizar arquivo atual"
-        buildRow(root, "Modo de auto-save", modeLabel, ROW_AUTO_SAVE_MODE) {
-            showAutoSaveModeDialog(root)
-        }
-
         // --- LOCALIZAÇÃO ------------------------------------------------
         root.addView(spacer(16))
         buildSectionLabel(root, "LOCALIZAÇÃO")
@@ -93,11 +86,20 @@ class SettingsActivity : AppCompatActivity() {
             showAntennaTypeDialog(root)
         }
 
-        // Winnix-only section — visible only when Winnix is selected
+        // Seção Winnix — visível apenas quando Winnix estiver selecionado
         winnixSection = buildWinnixSection()
         root.addView(winnixSection)
         winnixSection.visibility = if (currentType == SettingsManager.ANTENNA_TYPE_WINNIX)
             View.VISIBLE else View.GONE
+
+        // --- FILTRO -------------------------------------------------------
+        // Reduz o volume salvo/enviado antes mesmo dos dados chegarem no CSV
+        // — por isso vem logo após a configuração de captura, antes do Drive
+        // e do servidor SpaceVis (que só enxergam o CSV já filtrado).
+        root.addView(spacer(16))
+        buildSectionLabel(root, "FILTRO DE TAGS")
+        filterContainer = buildFilterContainer()
+        root.addView(filterContainer)
 
         // --- RESTAURAR --------------------------------------------------
         root.addView(spacer(24))
@@ -112,6 +114,16 @@ class SettingsActivity : AppCompatActivity() {
                 com.uhflogger.drive.GoogleSignInActivity::class.java))
         }
 
+        // --- SERVIDOR SPACEVIS -----------------------------------------
+        // Destino ADICIONAL ao Drive, não substituto: o aparelho pode enviar
+        // pros dois, pra um só, ou pra nenhum.
+        root.addView(spacer(16))
+        buildSectionLabel(root, "SERVIDOR SPACEVIS")
+        buildRow(root, "Envio ao servidor", backendStatusLabel(), ROW_BACKEND) {
+            startActivity(android.content.Intent(this,
+                com.uhflogger.backend.BackendSettingsActivity::class.java))
+        }
+
         buildRestoreButton(root)
     }
 
@@ -122,15 +134,20 @@ class SettingsActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        // Refresh Drive account status when returning from GoogleSignInActivity
+        // Atualiza o status da conta Drive ao voltar da GoogleSignInActivity
         val account = com.uhflogger.drive.DriveHelper.getSignedInAccount(this)
         val status  = if (account != null) account.email ?: "Conectado" else "Não conectado"
         root.findViewById<android.widget.TextView>(ROW_DRIVE_ACCOUNT)?.text = status
+        root.findViewById<android.widget.TextView>(ROW_BACKEND)?.text = backendStatusLabel()
     }
 
-    // -------------------------------------------------------------------------
-    // Winnix section
-    // -------------------------------------------------------------------------
+    private fun backendStatusLabel(): String = when {
+        com.uhflogger.backend.BackendSettings.isEnabled(this) -> "Ativado"
+        com.uhflogger.backend.BackendSettings.getAccessToken(this).isNotEmpty() -> "Desligado"
+        else -> "Não configurado"
+    }
+
+    // ─── Seção Winnix ───
 
     private fun buildWinnixSection(): LinearLayout {
         val section = LinearLayout(this).apply {
@@ -140,7 +157,6 @@ class SettingsActivity : AppCompatActivity() {
         section.addView(spacer(8))
         buildSectionLabel(section, "CONFIGURAÇÃO WINNIX")
 
-        // Antenna count (1-4)
         val antCount = SettingsManager.getWinnixAntCount(this)
         buildRow(section, "Número de antenas",
             "$antCount antena${if (antCount > 1) "s" else ""}",
@@ -148,7 +164,6 @@ class SettingsActivity : AppCompatActivity() {
             showWinnixAntCountDialog(section)
         }
 
-        // Power
         val power = SettingsManager.getWinnixPowerDbm(this)
         buildRow(section, "Potência",
             "$power dBm",
@@ -163,7 +178,6 @@ class SettingsActivity : AppCompatActivity() {
             }
         }
 
-        // Working time
         val workMs = SettingsManager.getWinnixWorkingMs(this)
         buildRow(section, "Tempo por antena",
             "${workMs}ms",
@@ -178,7 +192,6 @@ class SettingsActivity : AppCompatActivity() {
             }
         }
 
-        // Inventory mode
         val invMode = SettingsManager.getWinnixInventoryMode(this)
         buildRow(section, "Modo de inventário",
             SettingsManager.winnixInventoryModeLabel(invMode),
@@ -189,9 +202,90 @@ class SettingsActivity : AppCompatActivity() {
         return section
     }
 
-    // -------------------------------------------------------------------------
-    // Dialogs
-    // -------------------------------------------------------------------------
+    // ─── Seção Filtro ───
+    // Camadas 1 e 2 usam checkbox inline: marcar já revela o campo de
+    // configuração no lugar, sem diálogo — o usuário pediu explicitamente
+    // para eliminar o fluxo "clicar pra abrir diálogo, clicar de novo pra
+    // configurar". Não existe UI para a Camada 3 (persistência SIGKILL-safe):
+    // ela é automática sempre que a Camada 2 está ativa, ver TagFilterEngine —
+    // não há cenário em que o usuário queira consolidar em memória e aceitar
+    // perder esse progresso num crash de propósito.
+
+    private fun buildFilterContainer(): LinearLayout {
+        val container = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        container.addView(spacer(8))
+
+        val filterEnabled = SettingsManager.isFilterEnabled(this)
+        val configLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility  = if (filterEnabled) View.VISIBLE else View.GONE
+        }
+
+        buildCheckboxRow(container, "Filtro ativo", filterEnabled) { checked ->
+            SettingsManager.setFilterEnabled(this, checked)
+            configLayout.visibility = if (checked) View.VISIBLE else View.GONE
+        }
+
+        container.addView(configLayout)
+        configLayout.addView(spacer(4))
+
+        // Camada 1 — família de EPC
+        val l1Enabled = SettingsManager.isFilterL1Enabled(this)
+        val l1Field = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility  = if (l1Enabled) View.VISIBLE else View.GONE
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+            lp.bottomMargin = dp(8)
+            layoutParams = lp
+        }
+        buildCheckboxRow(configLayout, "Camada 1 — Família de EPC", l1Enabled) { checked ->
+            SettingsManager.setFilterL1Enabled(this, checked)
+            l1Field.visibility = if (checked) View.VISIBLE else View.GONE
+        }
+        configLayout.addView(l1Field)
+        buildInlineTextField(
+            l1Field,
+            "Padrões de EPC — Ex.: 0000100000000XXX,0076000000004XXX ('X' = qualquer dígito). Vazio = aceita tudo.",
+            SettingsManager.getFilterL1Patterns(this)
+        ) { v -> SettingsManager.setFilterL1Patterns(this, v); toast("Salvo") }
+
+        configLayout.addView(spacer(4))
+
+        // Camada 2 — consolidação por melhor RSSI dentro de uma janela
+        val l2Enabled = SettingsManager.isFilterL2Enabled(this)
+        val l2Field = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility  = if (l2Enabled) View.VISIBLE else View.GONE
+        }
+        buildCheckboxRow(configLayout, "Camada 2 — Consolidação por EPC (melhor RSSI)", l2Enabled) { checked ->
+            SettingsManager.setFilterL2Enabled(this, checked)
+            l2Field.visibility = if (checked) View.VISIBLE else View.GONE
+        }
+        configLayout.addView(l2Field)
+        buildInlineNumberField(
+            l2Field, "Janela de consolidação (min)",
+            getCurrent = { SettingsManager.getFilterL2WindowMin(this) },
+            min = 1, max = 1440,
+            validate = { v ->
+                val sweep = SettingsManager.getFilterL2SweepMin(this)
+                if (v <= sweep) "A janela deve ser maior que o sweep ($sweep min)" else null
+            }
+        ) { v -> SettingsManager.setFilterL2WindowMin(this, v) }
+        buildInlineNumberField(
+            l2Field, "Intervalo de sweep (min)",
+            getCurrent = { SettingsManager.getFilterL2SweepMin(this) },
+            min = 1, max = 1440,
+            validate = { v ->
+                val window = SettingsManager.getFilterL2WindowMin(this)
+                if (v >= window) "O sweep deve ser menor que a janela ($window min)" else null
+            }
+        ) { v -> SettingsManager.setFilterL2SweepMin(this, v) }
+
+        return container
+    }
+
+    // ─── Diálogos ───
 
     private fun showAntennaTypeDialog(parent: LinearLayout) {
         val current = SettingsManager.getAntennaType(this)
@@ -231,7 +325,6 @@ class SettingsActivity : AppCompatActivity() {
                 SettingsManager.setAntennaType(this, type)
                 val label = if (type == SettingsManager.ANTENNA_TYPE_WINNIX) "Winnix HYM750E" else "Jietong"
                 updateRowValue(parent, ROW_ANTENNA_TYPE, label)
-                // Show/hide Winnix section
                 winnixSection.visibility = if (type == SettingsManager.ANTENNA_TYPE_WINNIX)
                     View.VISIBLE else View.GONE
                 toast("Salvo: $label")
@@ -370,41 +463,6 @@ class SettingsActivity : AppCompatActivity() {
             .show()
     }
 
-    private fun showAutoSaveModeDialog(parent: LinearLayout) {
-        val current = SettingsManager.getAutoSaveMode(this)
-        val wrapper = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.WHITE)
-            val p = dp(20); setPadding(p, dp(8), p, dp(8))
-        }
-        val radioGroup = RadioGroup(this)
-        val rbAppend = RadioButton(this).apply {
-            id = 50; text = "Atualizar arquivo atual — um único CSV por sessão"
-            setTextColor(TEXT); textSize = 13f
-            isChecked = current == SettingsManager.AUTO_SAVE_MODE_APPEND
-        }
-        val rbNew = RadioButton(this).apply {
-            id = 51; text = "Novo arquivo a cada auto-save — múltiplos CSVs por sessão"
-            setTextColor(TEXT); textSize = 13f
-            isChecked = current == SettingsManager.AUTO_SAVE_MODE_NEW_FILE
-        }
-        radioGroup.addView(rbAppend); radioGroup.addView(rbNew)
-        wrapper.addView(radioGroup)
-        AlertDialog.Builder(this, android.R.style.Theme_Material_Light_Dialog_Alert)
-            .setTitle("Modo de auto-save")
-            .setView(wrapper)
-            .setPositiveButton("Salvar") { _, _ ->
-                val mode = if (radioGroup.checkedRadioButtonId == 51)
-                    SettingsManager.AUTO_SAVE_MODE_NEW_FILE else SettingsManager.AUTO_SAVE_MODE_APPEND
-                SettingsManager.setAutoSaveMode(this, mode)
-                val label = if (mode == SettingsManager.AUTO_SAVE_MODE_NEW_FILE)
-                    "Novo arquivo a cada auto-save" else "Atualizar arquivo atual"
-                updateRowValue(parent, ROW_AUTO_SAVE_MODE, label)
-                toast("Salvo")
-            }
-            .setNegativeButton("Cancelar", null).show()
-    }
-
     private fun showLocationDialog(parent: LinearLayout) {
         val current = SettingsManager.getLocationMode(this)
 
@@ -450,9 +508,7 @@ class SettingsActivity : AppCompatActivity() {
             .show()
     }
 
-    // -------------------------------------------------------------------------
-    // Restore defaults
-    // -------------------------------------------------------------------------
+    // ─── Restaurar padrões ───
 
     private fun buildRestoreButton(parent: LinearLayout) {
         val btn = Button(this).apply {
@@ -471,8 +527,6 @@ class SettingsActivity : AppCompatActivity() {
                             SettingsManager.DEFAULT_AUTO_SAVE_TAGS)
                         SettingsManager.setAutoSaveMinutes(this@SettingsActivity,
                             SettingsManager.DEFAULT_AUTO_SAVE_MINUTES)
-                        SettingsManager.setAutoSaveMode(this@SettingsActivity,
-                            SettingsManager.DEFAULT_AUTO_SAVE_MODE)
                         SettingsManager.setLocationMode(this@SettingsActivity,
                             SettingsManager.DEFAULT_LOCATION_MODE)
                         SettingsManager.setAntennaType(this@SettingsActivity,
@@ -485,17 +539,48 @@ class SettingsActivity : AppCompatActivity() {
                             SettingsManager.DEFAULT_WINNIX_WORKING_MS)
                         SettingsManager.setWinnixInventoryMode(this@SettingsActivity,
                             SettingsManager.DEFAULT_WINNIX_INVENTORY_MODE)
+                        SettingsManager.setFilterEnabled(this@SettingsActivity,
+                            SettingsManager.DEFAULT_FILTER_ENABLED)
+                        SettingsManager.setFilterL1Enabled(this@SettingsActivity,
+                            SettingsManager.DEFAULT_FILTER_L1_ENABLED)
+                        SettingsManager.setFilterL1Patterns(this@SettingsActivity,
+                            SettingsManager.DEFAULT_FILTER_L1_PATTERNS)
+                        SettingsManager.setFilterL2Enabled(this@SettingsActivity,
+                            SettingsManager.DEFAULT_FILTER_L2_ENABLED)
+                        SettingsManager.setFilterL2WindowMin(this@SettingsActivity,
+                            SettingsManager.DEFAULT_FILTER_L2_WINDOW_MIN)
+                        SettingsManager.setFilterL2SweepMin(this@SettingsActivity,
+                            SettingsManager.DEFAULT_FILTER_L2_SWEEP_MIN)
 
                         updateRowValue(parent, ROW_TAGS,
                             "A cada ${SettingsManager.DEFAULT_AUTO_SAVE_TAGS} tags")
                         updateRowValue(parent, ROW_MINUTES,
                             "A cada ${SettingsManager.DEFAULT_AUTO_SAVE_MINUTES} min")
-                        updateRowValue(parent, ROW_AUTO_SAVE_MODE, "Atualizar arquivo atual")
                         updateRowValue(parent, ROW_LOCATION, "GNSS + Rede")
-                        updateRowValue(parent, ROW_ANTENNA_TYPE, "Jietong")
+                        val defaultAntennaLabel = if (SettingsManager.DEFAULT_ANTENNA_TYPE == SettingsManager.ANTENNA_TYPE_WINNIX)
+                            "Winnix HYM750E" else "Jietong"
+                        updateRowValue(parent, ROW_ANTENNA_TYPE, defaultAntennaLabel)
+                        val defaultCount = SettingsManager.DEFAULT_WINNIX_ANT_COUNT
+                        updateRowValue(winnixSection, ROW_WINNIX_ANT_COUNT,
+                            "$defaultCount antena${if (defaultCount > 1) "s" else ""}")
+                        updateRowValue(winnixSection, ROW_WINNIX_POWER,
+                            "${SettingsManager.DEFAULT_WINNIX_POWER_DBM} dBm")
+                        updateRowValue(winnixSection, ROW_WINNIX_WORKING,
+                            "${SettingsManager.DEFAULT_WINNIX_WORKING_MS}ms")
+                        updateRowValue(winnixSection, ROW_WINNIX_INV_MODE,
+                            SettingsManager.winnixInventoryModeLabel(SettingsManager.DEFAULT_WINNIX_INVENTORY_MODE))
+                        winnixSection.visibility =
+                            if (SettingsManager.DEFAULT_ANTENNA_TYPE == SettingsManager.ANTENNA_TYPE_WINNIX)
+                                View.VISIBLE else View.GONE
 
-                        // Hide Winnix section — default is Jietong
-                        winnixSection.visibility = View.GONE
+                        // Sem IDs para patchar (checkboxes + campos inline não
+                        // têm um "valor" único como as linhas de diálogo) —
+                        // mais simples reconstruir a subárvore inteira a
+                        // partir dos defaults recém-gravados.
+                        val filterIdx = parent.indexOfChild(filterContainer)
+                        parent.removeView(filterContainer)
+                        filterContainer = buildFilterContainer()
+                        parent.addView(filterContainer, filterIdx)
 
                         toast("Configurações restauradas")
                     }
@@ -509,9 +594,7 @@ class SettingsActivity : AppCompatActivity() {
         parent.addView(btn)
     }
 
-    // -------------------------------------------------------------------------
-    // UI helpers
-    // -------------------------------------------------------------------------
+    // ─── Utilitários de UI ───
 
     private fun buildSectionLabel(parent: LinearLayout, text: String) {
         val tv = TextView(this).apply {
@@ -589,6 +672,198 @@ class SettingsActivity : AppCompatActivity() {
         }
     }
 
+    // Borda de input mais visível que borderDrawable() — usada nos campos
+    // inline do filtro. borderDrawable() usa um cinza claro (#E0E0E0) pensado
+    // pra separar cards num fundo #FAFAFA; num EditText branco sobre fundo
+    // branco isso ficava praticamente invisível (o problema relatado: "a
+    // caixa de texto esta da mesma cor que todo o resto, sem borda").
+    private fun fieldBorderDrawable(focused: Boolean = false): android.graphics.drawable.GradientDrawable {
+        return android.graphics.drawable.GradientDrawable().apply {
+            setColor(Color.WHITE)
+            setStroke(dp(if (focused) 2 else 1), if (focused) GREEN else Color.parseColor("#BDBDBD"))
+            cornerRadius = dp(8).toFloat()
+        }
+    }
+
+    // Linha com checkbox: toda a linha é clicável (idioma padrão do Android —
+    // o toque no checkbox consome o evento antes de chegar no listener do
+    // pai, então não dispara duas vezes). Usada pelas camadas 1/2 do filtro
+    // no lugar do antigo padrão "linha abre diálogo".
+    private fun buildCheckboxRow(
+        parent : LinearLayout,
+        title  : String,
+        checked: Boolean,
+        onToggle: (Boolean) -> Unit
+    ): CheckBox {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity     = Gravity.CENTER_VERTICAL
+            setBackgroundColor(CARD)
+            background  = borderDrawable()
+            val pad     = dp(14)
+            setPadding(pad, pad, pad, pad)
+            isClickable = true
+            isFocusable = true
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+            lp.bottomMargin = dp(8)
+            layoutParams = lp
+        }
+        val tvTitle = TextView(this).apply {
+            text     = title
+            textSize = 14f
+            setTextColor(TEXT)
+            layoutParams = LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        val checkBox = CheckBox(this).apply {
+            isChecked = checked
+            setOnCheckedChangeListener { _, isChecked -> onToggle(isChecked) }
+        }
+        row.setOnClickListener { checkBox.toggle() }
+        row.addView(tvTitle)
+        row.addView(checkBox)
+        parent.addView(row)
+        return checkBox
+    }
+
+    // Campo de texto inline (sem diálogo), com rótulo FORA da caixa — mesmo
+    // padrão do buildInlineNumberField abaixo. Antes a explicação/exemplo
+    // ficava dentro da caixa como `hint` do EditText, que só aparece quando o
+    // campo está vazio e some assim que o usuário digita algo — ruim de ler e
+    // some no primeiro toque. Salva ao perder o foco OU ao apertar Enter/Done
+    // no teclado (setOnEditorActionListener): sem isso, o último campo focável
+    // da tela não tem pra onde mover o foco ao apertar Enter, então o
+    // setOnFocusChangeListener nunca dispara e o valor nunca é salvo.
+    private fun buildInlineTextField(
+        parent: LinearLayout,
+        label : String,
+        current: String,
+        onSave: (String) -> Unit
+    ): EditText {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+            lp.bottomMargin = dp(8)
+            layoutParams = lp
+        }
+        val tvLabel = TextView(this).apply {
+            text     = label
+            textSize = 12f
+            setTextColor(MUTED)
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+            lp.bottomMargin = dp(4)
+            layoutParams = lp
+        }
+        val input = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_TEXT
+            setText(current)
+            textSize  = 14f
+            setTextColor(TEXT)
+            background = fieldBorderDrawable()
+            imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_DONE
+            val pad = dp(12)
+            setPadding(pad, pad, pad, pad)
+            setOnFocusChangeListener { v, hasFocus ->
+                background = fieldBorderDrawable(focused = hasFocus)
+                if (!hasFocus) onSave((v as EditText).text.toString().trim())
+            }
+            setOnEditorActionListener { v, actionId, _ ->
+                if (actionId == android.view.inputmethod.EditorInfo.IME_ACTION_DONE) {
+                    v.clearFocus()
+                    hideKeyboard(v)
+                    true
+                } else false
+            }
+        }
+        row.addView(tvLabel)
+        row.addView(input)
+        parent.addView(row)
+        return input
+    }
+
+    // Campo numérico inline com rótulo e validação cruzada (lê o valor atual
+    // do campo irmão via getCurrent/validate, nunca uma closure velha) — usado
+    // pela janela/sweep da Camada 2, onde um depende do outro (D6).
+    private fun buildInlineNumberField(
+        parent: LinearLayout,
+        label : String,
+        getCurrent: () -> Int,
+        min: Int,
+        max: Int,
+        validate: (Int) -> String?,
+        onSave: (Int) -> Unit
+    ): EditText {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+            lp.bottomMargin = dp(8)
+            layoutParams = lp
+        }
+        val tvLabel = TextView(this).apply {
+            text     = label
+            textSize = 12f
+            setTextColor(MUTED)
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+            lp.bottomMargin = dp(4)
+            layoutParams = lp
+        }
+        val input = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setText(getCurrent().toString())
+            textSize = 14f
+            setTextColor(TEXT)
+            background = fieldBorderDrawable()
+            imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_DONE
+            val pad = dp(12)
+            setPadding(pad, pad, pad, pad)
+            setOnFocusChangeListener { v, hasFocus ->
+                background = fieldBorderDrawable(focused = hasFocus)
+                if (!hasFocus) {
+                    val value = (v as EditText).text.toString().toIntOrNull()
+                    val err = when {
+                        value == null  -> "Valor inválido"
+                        value < min    -> "Mínimo: $min"
+                        value > max    -> "Máximo: $max"
+                        else           -> validate(value)
+                    }
+                    if (err != null) {
+                        toast(err)
+                        setText(getCurrent().toString())
+                    } else {
+                        onSave(value!!)
+                        toast("Salvo")
+                    }
+                }
+            }
+            // Sem isso, o último campo focável da tela ("Intervalo de sweep")
+            // não tem pra onde mover o foco ao apertar Enter, e o
+            // setOnFocusChangeListener acima nunca dispara — só salvava se o
+            // usuário tocasse manualmente num campo anterior depois.
+            setOnEditorActionListener { v, actionId, _ ->
+                if (actionId == android.view.inputmethod.EditorInfo.IME_ACTION_DONE) {
+                    v.clearFocus()
+                    hideKeyboard(v)
+                    true
+                } else false
+            }
+        }
+        row.addView(tvLabel)
+        row.addView(input)
+        parent.addView(row)
+        return input
+    }
+
+    private fun hideKeyboard(view: View) {
+        val imm = getSystemService(android.content.Context.INPUT_METHOD_SERVICE)
+            as android.view.inputmethod.InputMethodManager
+        imm.hideSoftInputFromWindow(view.windowToken, 0)
+    }
+
     private fun updateRowValue(parent: LinearLayout, id: Int, text: String) {
         parent.findViewById<TextView>(id)?.text = text
     }
@@ -607,7 +882,6 @@ class SettingsActivity : AppCompatActivity() {
     companion object {
         private const val ROW_TAGS            = 2001
         private const val ROW_MINUTES         = 2002
-        private const val ROW_AUTO_SAVE_MODE  = 2010
         private const val ROW_LOCATION        = 2003
         private const val ROW_ANTENNA_TYPE    = 2004
         private const val ROW_WINNIX_ANT_COUNT= 2005
@@ -615,5 +889,6 @@ class SettingsActivity : AppCompatActivity() {
         private const val ROW_WINNIX_WORKING  = 2007
         private const val ROW_WINNIX_INV_MODE = 2008
         private const val ROW_DRIVE_ACCOUNT   = 2009
+        private const val ROW_BACKEND         = 2011
     }
 }

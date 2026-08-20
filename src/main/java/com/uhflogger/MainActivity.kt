@@ -33,14 +33,20 @@ import com.uhflogger.SettingsActivity
 import com.uhflogger.drive.DriveHelper
 import com.uhflogger.drive.DriveMonitorService
 
-// NOTA: GNSS e bússola foram movidos para dentro do UHFReaderService (foreground
-// service). Antes viviam aqui na Activity e travavam sempre que a tela apagava
-// ou o app ia para background — a MainActivity só cuida de UI/permissões agora.
 class MainActivity : AppCompatActivity() {
 
     companion object {
-        private const val REQ_LOCATION       = 101
-        private const val REQ_BT_PERMISSION  = 102
+        // Uma única chamada com todas as permissões principais (notificação,
+        // localização, BT). Android exibe um diálogo por grupo em sequência e
+        // dispara onRequestPermissionsResult uma única vez no final — sem risco
+        // de interferência entre chamadas separadas ou com o diálogo de bateria.
+        private const val REQ_ALL_PERMISSIONS     = 100
+        // ACCESS_BACKGROUND_LOCATION deve ser pedida SEPARADAMENTE das demais
+        // permissões de localização — Android rejeita se vierem juntas.
+        private const val REQ_BACKGROUND_LOCATION = 103
+        // Bem acima do pior caso observado de conexão (BT connect() ~12s) —
+        // só reabilita o botão se a captura genuinamente não tiver começado.
+        private const val START_BUTTON_SAFETY_TIMEOUT_MS = 15_000L
     }
 
     private lateinit var binding: ActivityMainBinding
@@ -49,11 +55,24 @@ class MainActivity : AppCompatActivity() {
     private var currentToast: Toast? = null
     private var stoppedByError = false
 
+    // Diferente de "capturing" (que pisca false durante reconexões — BT caiu,
+    // app tentando religar sozinho), isSessionActive fica true do clique em
+    // Iniciar até uma parada REAL (Parar, ou Parar após erro) — cobre toda a
+    // janela de reconexão automática. É isso que trava o botão Configurações:
+    // sem essa distinção, cada reconexão automática re-habilitava o menu de
+    // configurações (setCapturingState(false) mexia nele junto), permitindo
+    // mudar configurações que pareciam salvar mas não entravam em vigor até a
+    // próxima parada/início real (o retry de reconexão não recarrega tudo).
+    private var isSessionActive = false
+
     private val uiHandler = Handler(Looper.getMainLooper())
     private val tagCountUpdater = object : Runnable {
         override fun run() {
-            val count = readerService?.tagCount() ?: 0
+            val service = readerService
+            val count = service?.displayTagCount() ?: 0
             binding.tvTagCount.text = "%,d".format(count)
+            binding.tvTagCountLabel.text =
+                if (service?.isFilterActive() == true) "TAGS FILTRADAS" else "TAGS CAPTURADAS"
             uiHandler.postDelayed(this, 1000L)
         }
     }
@@ -66,7 +85,13 @@ class MainActivity : AppCompatActivity() {
             readerService?.mainActivity = this@MainActivity
             readerService?.onStatusChanged = { capturing ->
                 runOnUiThread {
-                    if (capturing) stoppedByError = false  // reconnect succeeded — normal stop from now on
+                    if (capturing) {
+                        stoppedByError = false  // reconnect succeeded — normal stop from now on
+                    } else {
+                        // Só chega aqui numa parada REAL (stopCapture) — nunca
+                        // durante reconexão automática, que usa onCaptureError.
+                        isSessionActive = false
+                    }
                     setCapturingState(capturing)
                 }
             }
@@ -82,8 +107,12 @@ class MainActivity : AppCompatActivity() {
             }
             readerService?.onWrongAntennaType = { msg ->
                 runOnUiThread {
-                    // Probe failed — antenna type mismatch or not responding
-                    // Do NOT change stoppedByError or button state — no capture was started
+                    // Probe failed — antenna type mismatch or not responding.
+                    // Este callback também dispara durante tentativas automáticas
+                    // de reconexão em background — por isso NÃO mexe no estado do
+                    // botão aqui (faria ele piscar "habilitado" a cada retry
+                    // automático, reabrindo risco de corrida). O botão é
+                    // reabilitado por um timeout de segurança em onStartClicked.
                     toast(msg)
                 }
             }
@@ -98,6 +127,7 @@ class MainActivity : AppCompatActivity() {
                     else toast("Nenhuma tag para exportar")
                 }
             }
+            isSessionActive = readerService?.isCapturing() == true || readerService?.isPaused() == true
             setCapturingState(readerService?.isCapturing() == true)
         }
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -117,6 +147,7 @@ class MainActivity : AppCompatActivity() {
                         device?.let { startReaderService(it.deviceName) }
                     } else {
                         toast("Permissão USB negada")
+                        binding.btnStart.isEnabled = true
                     }
                 }
                 UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
@@ -169,14 +200,18 @@ class MainActivity : AppCompatActivity() {
                     val device = intent.getParcelableExtra<android.bluetooth.BluetoothDevice>(
                         android.bluetooth.BluetoothDevice.EXTRA_DEVICE
                     )
-                    val deviceName = try { device?.name } catch (_: SecurityException) { null }
-                    if (deviceName == UHFReaderService.BT_DEVICE_NAME &&
-                        readerService?.isPaused() == true) {
+                    val connectedName = try { device?.name } catch (_: SecurityException) { null }
+                    // Só retoma se: (1) nome é aceito, (2) sessão está pausada,
+                    // (3) é exatamente o dispositivo da sessão que caiu.
+                    if (connectedName != null &&
+                        UHFReaderService.isBtDeviceAllowed(connectedName) &&
+                        readerService?.isPaused() == true &&
+                        readerService?.getActiveDeviceName() == connectedName) {
                         android.os.Handler(mainLooper).postDelayed({
                             if (readerService?.isPaused() == true) {
                                 stoppedByError = false
-                                readerService?.startCapture(UHFReaderService.BT_DEVICE_NAME)
-                                toast("Winnix_BT reconectado — retomando leitura")
+                                readerService?.startCapture(connectedName)
+                                toast("$connectedName reconectado — retomando leitura")
                             }
                         }, 2000)
                     }
@@ -190,10 +225,7 @@ class MainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        requestNotificationPermission()
-        requestLocationPermission()
-        requestBluetoothPermission()
-        ensureBatteryOptimizationExemption()
+        checkAndRequestPermissions()
         registerUsbReceiver()
         bindToService()
         setupButtons()
@@ -223,44 +255,55 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun requestBluetoothPermission() {
-        // BLUETOOTH_CONNECT required on Android 12+ to access paired device names
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
-            if (checkSelfPermission(android.Manifest.permission.BLUETOOTH_CONNECT)
-                != android.content.pm.PackageManager.PERMISSION_GRANTED) {
-                requestPermissions(
-                    arrayOf(
-                        android.Manifest.permission.BLUETOOTH_CONNECT,
-                        android.Manifest.permission.BLUETOOTH_SCAN
-                    ),
-                    REQ_BT_PERMISSION
-                )
-            }
-        }
-    }
-
     /**
-     * Pede ACCESS_FINE_LOCATION/COARSE (necessária pro Service usar GPS) e, no
-     * Android 10+, também ACCESS_BACKGROUND_LOCATION em uma segunda etapa — o
-     * sistema exige que ela seja pedida separadamente, depois da foreground.
+     * Coleta todas as permissões ainda não concedidas e pede numa única chamada.
+     * Android exibe os diálogos em sequência (um por grupo de permissão) e
+     * dispara onRequestPermissionsResult uma única vez com todos os resultados —
+     * evita corrida entre chamadas separadas e garante que o diálogo de bateria
+     * só aparece depois que todas as permissões foram respondidas.
      */
-    private fun requestLocationPermission() {
-        val perms = arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)
-        val missing = perms.filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
-        if (missing.isNotEmpty()) {
-            ActivityCompat.requestPermissions(this, missing.toTypedArray(), REQ_LOCATION)
+    private fun checkAndRequestPermissions() {
+        val needed = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED)
+            needed.add(Manifest.permission.POST_NOTIFICATIONS)
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+                != PackageManager.PERMISSION_GRANTED)
+            needed.add(Manifest.permission.ACCESS_FINE_LOCATION)
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION)
+                != PackageManager.PERMISSION_GRANTED)
+            needed.add(Manifest.permission.ACCESS_COARSE_LOCATION)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.BLUETOOTH_CONNECT)
+                    != PackageManager.PERMISSION_GRANTED)
+                needed.add(android.Manifest.permission.BLUETOOTH_CONNECT)
+            if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.BLUETOOTH_SCAN)
+                    != PackageManager.PERMISSION_GRANTED)
+                needed.add(android.Manifest.permission.BLUETOOTH_SCAN)
+        }
+
+        if (needed.isNotEmpty()) {
+            ActivityCompat.requestPermissions(this, needed.toTypedArray(), REQ_ALL_PERMISSIONS)
         } else {
+            // Já tudo concedido (segundo abrir ou mais) — avança direto na cadeia.
             requestBackgroundLocationIfNeeded()
         }
     }
 
     private fun requestBackgroundLocationIfNeeded() {
+        // ACCESS_BACKGROUND_LOCATION deve ser pedida SEPARADAMENTE e só faz
+        // sentido se a localização em foreground já foi concedida.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_BACKGROUND_LOCATION)
-            != PackageManager.PERMISSION_GRANTED) {
+                != PackageManager.PERMISSION_GRANTED &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+                == PackageManager.PERMISSION_GRANTED) {
             ActivityCompat.requestPermissions(
-                this, arrayOf(Manifest.permission.ACCESS_BACKGROUND_LOCATION), REQ_LOCATION
+                this, arrayOf(Manifest.permission.ACCESS_BACKGROUND_LOCATION), REQ_BACKGROUND_LOCATION
             )
+        } else {
+            ensureBatteryOptimizationExemption()
         }
     }
 
@@ -301,8 +344,15 @@ class MainActivity : AppCompatActivity() {
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == REQ_LOCATION)      requestBackgroundLocationIfNeeded()
-        if (requestCode == REQ_BT_PERMISSION) refreshDeviceList()  // show Winnix_BT if now paired
+        when (requestCode) {
+            REQ_ALL_PERMISSIONS -> {
+                refreshDeviceList()              // exibe dispositivo BT se BLUETOOTH_CONNECT foi concedido
+                requestBackgroundLocationIfNeeded()
+            }
+            REQ_BACKGROUND_LOCATION -> {
+                ensureBatteryOptimizationExemption()  // último passo da cadeia
+            }
+        }
     }
 
     private fun setupButtons() {
@@ -319,8 +369,38 @@ class MainActivity : AppCompatActivity() {
         val deviceName = binding.spinnerDevices.tag?.toString()
             ?: run { toast("Nenhum dispositivo selecionado"); return }
 
+        // Desabilita já aqui, otimisticamente — a conexão (principalmente BT)
+        // pode levar vários segundos, e o botão continuava clicável nesse meio
+        // tempo, permitindo apertar Iniciar duas vezes e disparar duas tentativas
+        // de conexão simultâneas (visto em campo: duas sessões abertas ao mesmo
+        // tempo, uma delas derrubando a outra).
+        //
+        // Reabilitação: NÃO usamos os callbacks de erro do Service pra isso —
+        // onWrongAntennaType também dispara durante retries automáticos em
+        // background (a cada 5s), e mexer no botão ali faria ele "piscar"
+        // habilitado a cada tentativa automática, reabrindo risco de corrida.
+        // Em vez disso, um timeout de segurança reabilita sozinho depois de um
+        // tempo bem maior que o pior caso observado de conexão (~12s BT) — só
+        // reabilita se a captura realmente não tiver começado nesse meio tempo.
+        binding.btnStart.isEnabled = false
+        isSessionActive = true
+        binding.btnSettings.isEnabled = false
+        uiHandler.postDelayed({
+            if (readerService?.isCapturing() != true) {
+                binding.btnStart.isEnabled = true
+                // Conexão nunca teve sucesso nem entrou em reconexão de verdade
+                // (senão isRunning ou isPaused estariam true) — sessão nunca
+                // começou, libera o menu de configurações de novo.
+                if (readerService?.isPaused() != true) {
+                    isSessionActive = false
+                    binding.btnSettings.isEnabled = true
+                }
+                updateButtonColors()
+            }
+        }, START_BUTTON_SAFETY_TIMEOUT_MS)
+
         // Bluetooth device — no USB permission needed, connect directly
-        if (deviceName == UHFReaderService.BT_DEVICE_NAME) {
+        if (UHFReaderService.isBtDeviceAllowed(deviceName)) {
             startReaderService(deviceName)
             return
         }
@@ -328,7 +408,7 @@ class MainActivity : AppCompatActivity() {
         // USB device — check permission as before
         val usbManager = getSystemService(USB_SERVICE) as UsbManager
         val device = usbManager.deviceList.values.firstOrNull { it.deviceName == deviceName }
-            ?: run { toast("Dispositivo não encontrado"); return }
+            ?: run { toast("Dispositivo não encontrado"); binding.btnStart.isEnabled = true; return }
         if (!usbManager.hasPermission(device)) requestUsbPermission(usbManager, device)
         else startReaderService(deviceName)
     }
@@ -336,13 +416,11 @@ class MainActivity : AppCompatActivity() {
     private fun onStopClicked() {
         if (stoppedByError) {
             stoppedByError = false
+            isSessionActive = false
             setCapturingState(false)
             readerService?.saveAfterError()
         } else {
             readerService?.stopCapture()
-            // stopCapture runs on background thread
-            // UI update (setCapturingState) comes via onStatusChanged callback
-            // Toast comes via onStopComplete callback
         }
     }
 
@@ -369,11 +447,9 @@ class MainActivity : AppCompatActivity() {
         val usbManager = getSystemService(USB_SERVICE) as UsbManager
         val drivers    = UsbSerialProber.getDefaultProber().findAllDrivers(usbManager)
 
-        // Build device name list: USB devices first, then BT if paired
         val deviceNames = mutableListOf<String>()
         val labels      = mutableListOf<String>()
 
-        // USB devices
         for (driver in drivers) {
             val dev = driver.device
             val vid = dev.vendorId.toString(16).uppercase().padStart(4, '0')
@@ -383,20 +459,19 @@ class MainActivity : AppCompatActivity() {
             labels.add("USB — VID:$vid / PID:$pid — $mfr")
         }
 
-        // Bluetooth — check if Winnix_BT is paired
+        // Bluetooth — exibe TODOS os dispositivos pareados com nome aceito
         try {
             val btManager = getSystemService(BLUETOOTH_SERVICE) as? android.bluetooth.BluetoothManager
             val adapter   = btManager?.adapter
             @Suppress("DEPRECATION")
-            val btDevice  = adapter?.bondedDevices?.firstOrNull {
-                it.name == UHFReaderService.BT_DEVICE_NAME
-            }
-            if (btDevice != null) {
-                deviceNames.add(UHFReaderService.BT_DEVICE_NAME)
-                labels.add("BT — ${UHFReaderService.BT_DEVICE_NAME} (${btDevice.address})")
-            }
+            adapter?.bondedDevices
+                ?.filter { UHFReaderService.isBtDeviceAllowed(it.name ?: "") }
+                ?.forEach { btDevice ->
+                    deviceNames.add(btDevice.name)
+                    labels.add("BT — ${btDevice.name} (${btDevice.address})")
+                }
         } catch (_: SecurityException) {
-            // BLUETOOTH_CONNECT permission not granted yet — BT device won't appear
+            // BLUETOOTH_CONNECT permission not granted yet — BT devices won't appear
         } catch (_: Exception) {}
 
         if (deviceNames.isEmpty()) {
@@ -424,7 +499,6 @@ class MainActivity : AppCompatActivity() {
         binding.spinnerDevices.setBackgroundResource(R.drawable.bg_spinner_white)
         binding.spinnerDevices.tag = if (deviceNames.isEmpty()) null else deviceNames[0]
 
-        // Keep spinner selection in sync with deviceNames list
         binding.spinnerDevices.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
             override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: android.view.View?, pos: Int, id: Long) {
                 binding.spinnerDevices.tag = deviceNames.getOrNull(pos)
@@ -462,7 +536,11 @@ class MainActivity : AppCompatActivity() {
     private fun setCapturingState(capturing: Boolean) {
         binding.btnStart.isEnabled       = !capturing
         binding.btnStop.isEnabled        = capturing
-        binding.btnSettings.isEnabled    = !capturing
+        // NÃO usa `capturing` aqui — capturing pisca false durante reconexão
+        // automática (onCaptureError chama isso com false), o que reabriria o
+        // menu de configurações no meio de uma tentativa de religar sozinho.
+        // isSessionActive só desliga numa parada real.
+        binding.btnSettings.isEnabled    = !isSessionActive
         binding.spinnerDevices.isEnabled = !capturing
 
         binding.tvStatus.text = if (capturing) "Lendo" else "Parado"
@@ -472,7 +550,6 @@ class MainActivity : AppCompatActivity() {
         updateButtonColors()
     }
 
-    /** Cores sempre derivadas do isEnabled — fonte única de verdade */
     private fun updateButtonColors() {
         binding.btnStart.backgroundTintList = android.content.res.ColorStateList.valueOf(
             if (binding.btnStart.isEnabled) 0xFF2E7D32.toInt() else 0xFFA5D6A7.toInt()
@@ -480,15 +557,6 @@ class MainActivity : AppCompatActivity() {
         binding.btnStop.backgroundTintList = android.content.res.ColorStateList.valueOf(
             if (binding.btnStop.isEnabled) 0xFFC62828.toInt() else 0xFFEF9A9A.toInt()
         )
-    }
-
-    private fun requestNotificationPermission() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
-                != PackageManager.PERMISSION_GRANTED) {
-                ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 100)
-            }
-        }
     }
 
     private fun toast(msg: String) {

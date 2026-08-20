@@ -26,9 +26,8 @@ object DriveHelper {
     private const val KEY_ROOT_ID      = "root_folder_id"
     private const val KEY_DEVICE_ID    = "device_folder_id"
 
-    // Device name: uses the user-configured name from Settings → About phone → Device name
-    // Falls back to Build.MODEL if not set
-    // No extra permissions required
+    // Nome do dispositivo: usa o nome configurado pelo usuário em Configurações → Sobre o dispositivo.
+    // Usa Build.MODEL como fallback. Não requer permissões extras.
     fun getDeviceName(context: Context): String {
         val userSetName = android.provider.Settings.Global.getString(
             context.contentResolver, "device_name"
@@ -69,36 +68,34 @@ object DriveHelper {
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
     /**
-     * Returns the Drive folder ID for this device, creating the hierarchy if needed.
-     * Hierarchy: My Drive → "UHF Logger" → "[Device Model]"
-     * Caches IDs in SharedPreferences to avoid repeated API calls.
+     * Retorna o ID da pasta do dispositivo no Drive, criando a hierarquia se necessário.
+     * Hierarquia: My Drive → "UHF Logger" → "[Nome do dispositivo]"
+     * IDs em cache no SharedPreferences para evitar chamadas repetidas à API.
      */
-    // Process-wide lock for folder creation — prevents the classic
-    // "list() then create()" race condition that creates duplicate folders
-    // when called from multiple threads/workers simultaneously.
+    // Trava de processo para criação de pasta — previne a condição de corrida clássica
+    // "list() então create()" que duplica pastas quando chamada de múltiplas threads simultaneamente.
     private val folderLock = Any()
 
     fun getOrCreateDeviceFolder(context: Context, drive: Drive): String = synchronized(folderLock) {
         val p = prefs(context)
 
-        // Check cache — but verify the folder still exists in Drive
+        // Verifica cache — mas confirma que a pasta ainda existe no Drive
         val cachedId = p.getString(KEY_DEVICE_ID, null)
         if (cachedId != null && folderExists(drive, cachedId)) return@synchronized cachedId
 
-        // Cache miss or folder was deleted — clear and rebuild
+        // Cache inválido ou pasta deletada — limpa e reconstrói
         if (cachedId != null) {
             Log.w(TAG, "Cached device folder no longer exists — rebuilding")
             p.edit().remove(KEY_DEVICE_ID).remove(KEY_ROOT_ID).apply()
         }
 
-        // Get or create root "UHF Logger" folder
+        // Obtém ou cria a pasta raiz "UHF Logger"
         val rootId = p.getString(KEY_ROOT_ID, null)
             ?.takeIf { folderExists(drive, it) }
             ?: findOrCreateFolder(drive, ROOT_FOLDER_NAME, "root").also {
                 p.edit().putString(KEY_ROOT_ID, it).apply()
             }
 
-        // Get or create device subfolder using user-configured device name
         val deviceId = findOrCreateFolder(drive, getDeviceName(context), rootId).also {
             p.edit().putString(KEY_DEVICE_ID, it).apply()
         }
@@ -107,8 +104,8 @@ object DriveHelper {
     }
 
     /**
-     * Checks if a Drive folder still exists (not deleted/trashed).
-     * Used to validate cached folder IDs.
+     * Verifica se uma pasta no Drive ainda existe (não foi deletada nem movida para lixeira).
+     * Usado para validar IDs de pasta em cache.
      */
     private fun folderExists(drive: Drive, folderId: String): Boolean {
         return try {
@@ -123,7 +120,6 @@ object DriveHelper {
     }
 
     private fun findOrCreateFolder(drive: Drive, name: String, parentId: String): String {
-        // Search for existing folder
         val query = "name='$name' and mimeType='application/vnd.google-apps.folder' " +
                 "and '$parentId' in parents and trashed=false"
         val result = drive.files().list()
@@ -133,7 +129,6 @@ object DriveHelper {
 
         result.files.firstOrNull()?.id?.let { return it }
 
-        // Create if not found
         val metadata = DriveFile().apply {
             this.name    = name
             mimeType     = "application/vnd.google-apps.folder"
@@ -152,13 +147,9 @@ object DriveHelper {
     // ─── Upload ───────────────────────────────────────────────────────────────
 
     /**
-     * Uploads a CSV file to the device folder on Google Drive.
-     * Returns the Drive file ID on success, throws on failure.
-     */
-    /**
-     * Checks if a file with the given name already exists in the device folder.
-     * Returns the existing file ID, or null if not found.
-     * Used to prevent duplicate uploads on retry.
+     * Verifica se um arquivo com o nome dado já existe na pasta do dispositivo.
+     * Retorna o ID do arquivo existente, ou null se não encontrado.
+     * Usado para evitar uploads duplicados em caso de retry.
      */
     fun findExistingFile(drive: Drive, context: Context, fileName: String): String? {
         val folderId = getOrCreateDeviceFolder(context, drive)
@@ -172,13 +163,16 @@ object DriveHelper {
         }
     }
 
-    // Process-wide lock for the entire check-then-upload sequence.
-    // Prevents two threads from both passing findExistingFile() (neither sees
-    // the other's in-flight upload) and both creating the file in Drive.
+    // Trava de processo para a sequência check-then-upload.
+    // Evita que duas threads passem por findExistingFile() simultaneamente
+    // (nenhuma vê o upload em andamento da outra) e criem o arquivo duplicado no Drive.
     private val uploadLock = Any()
 
+    /**
+     * Envia um arquivo CSV para a pasta do dispositivo no Google Drive.
+     * Retorna o ID do arquivo no Drive em caso de sucesso; lança exceção em caso de falha.
+     */
     fun uploadCsv(context: Context, drive: Drive, localFile: File): String = synchronized(uploadLock) {
-        // Check if file already exists in Drive (handles retry duplicates)
         val existing = findExistingFile(drive, context, localFile.name)
         if (existing != null) {
             Log.i(TAG, "Skipping upload — file already in Drive: ${localFile.name}")

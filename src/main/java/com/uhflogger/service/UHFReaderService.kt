@@ -34,13 +34,14 @@ import com.uhflogger.MainActivity
 import com.uhflogger.SettingsManager
 import com.uhflogger.decoder.ProtocolDecoder
 import com.uhflogger.decoder.WinnixProtocolDecoder
+import com.uhflogger.filter.TagFilterEngine
 import com.uhflogger.model.TagRecord
 import com.uhflogger.serial.BluetoothInputOutputManager
 import com.uhflogger.serial.BluetoothSerialPort
 import com.uhflogger.serial.ISerialPort
 import com.uhflogger.serial.UsbSerialPortWrapper
-import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
+import com.uhflogger.drive.DriveHelper
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
@@ -82,39 +83,165 @@ class UHFReaderService : Service(), SensorEventListener {
     private var locationSensorHandler: android.os.Handler? = null
 
     @Volatile private var currentLocation: Location? = null
-    @Volatile private var currentBearing : Float = Float.NaN
+    // Bearing "de fusão de sensores" (acelerômetro+magnetômetro) — fallback
+    // sempre disponível, usado quando não há GNSS confiável pra essa amostra.
+    @Volatile private var currentSensorBearing: Float = Float.NaN
+    // Bearing vindo do GNSS (direção de deslocamento real, imune a interferência
+    // magnética do trator) — só é confiável em movimento.
+    @Volatile private var currentGnssBearing: Float = Float.NaN
+    // Qual fonte está "ativa" agora (histerese) — escrito SÓ dentro de
+    // onLocationChanged (roda na locationSensorThread), lido pela thread de
+    // RFID em getCurrentBearing(). @Volatile garante visibilidade sem lock.
+    @Volatile private var bearingSourceIsGnss: Boolean = false
+    @Volatile private var currentGnssSpeed: Float? = null           // null = hasSpeed()==false
+    @Volatile private var currentLocationTimeMs: Long = 0L          // 0 = nenhum fix ainda
+    @Volatile private var currentLocationProviderLabel: String = "" // "GNSS" ou "NETWORK"
     private var accelerometerData = FloatArray(3)
     private var magnetometerData  = FloatArray(3)
 
     private val locationListener = object : LocationListener {
         override fun onLocationChanged(location: Location) {
-            if (isBetterLocation(location, currentLocation)) {
-                currentLocation = location
+            // Speed e bearing via Doppler são extraídos de TODO fix entrante,
+            // independente de a posição ser aceita ou não pelo isBetterLocation.
+            // Doppler (variação de frequência) é calculado pelo chip separadamente
+            // do pseudorange (posição) — permanece confiável mesmo quando o fix
+            // tem acurácia degradada (ex: multipath de telhado metálico entrega
+            // 25m de erro de posição mas Doppler de velocidade ainda é preciso).
+            // Sem essa extração antecipada, speed e bearing ficavam congelados
+            // durante qualquer janela de rejeição de fix por acurácia.
+            // Nota: bearingSourceIsGnss (histerese) só é atualizado em
+            // applyLocation() — a flag não muda para fixes rejeitados, apenas os
+            // valores brutos são pré-populados aqui.
+            if (location.hasSpeed()) currentGnssSpeed = location.speed
+            if (location.hasBearing() && location.hasSpeed()
+                    && location.speed > BEARING_SPEED_HIGH_MS) {
+                currentGnssBearing = location.bearing
             }
+            val accepted = isBetterLocation(location, currentLocation)
+            // Log de diagnóstico: mostra TODA chegada de fix, aceito ou não, com
+            // motivo. Sem isso, não dá pra distinguir "Android nunca entregou
+            // nada" de "entregou mas foi rejeitado por precisão" — os dois
+            // parecem iguais de fora (CSV vazio), mas são causas bem diferentes.
+            Log.i(TAG, "LOCATION_RX: provider=${location.provider} " +
+                    "accuracy=${if (location.hasAccuracy()) "%.1f".format(java.util.Locale.US, location.accuracy) else "n/a"}m " +
+                    "speed=${if (location.hasSpeed()) "%.1f".format(java.util.Locale.US, location.speed) else "n/a"}m/s " +
+                    "age=${System.currentTimeMillis() - location.time}ms " +
+                    "aceito=$accepted" +
+                    (if (!accepted) " (motivo: degradou demais fix bom, provider pior, fix velho, ou acima do teto absoluto em movimento)" else ""))
+            if (accepted) applyLocation(location)
         }
-        override fun onProviderEnabled(provider: String)  {}
-        override fun onProviderDisabled(provider: String) {}
+        override fun onProviderEnabled(provider: String)  {
+            Log.i(TAG, "LOCATION_PROVIDER_ENABLED: $provider")
+        }
+        override fun onProviderDisabled(provider: String) {
+            Log.w(TAG, "LOCATION_PROVIDER_DISABLED: $provider")
+        }
         @Deprecated("Deprecated in Java")
         override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
     }
 
     /**
-     * Mesma lógica de antes (ex-MainActivity): rejeita fixes velhos ou pouco
-     * precisos, prefere GPS sobre rede, e mantém o fix mais recente/preciso.
+     * Adota `location` como a posição atual — atualiza lat/lon, speed,
+     * timestamp, provider e decide a histerese do bearing híbrido. Chamado
+     * tanto pelo listener de updates novos quanto pelo fallback de
+     * getLastKnownLocation() no início da captura, pra nunca duplicar essa
+     * lógica em dois lugares (e arriscar um ficar desatualizado).
+     */
+    private fun applyLocation(location: Location) {
+        currentLocation = location
+        // System.currentTimeMillis() capturado AQUI — no exato instante em que
+        // o app recebe/aceita este fix — em vez de location.time (relógio
+        // interno do chip GNSS, que pode divergir do relógio do Android em
+        // algumas centenas de ms, inclusive "no futuro"). Mesmo domínio de
+        // relógio que o Timestamp do EPC, então Location Timestamp nunca pode
+        // vir maior que o Timestamp — é sequencial por construção.
+        currentLocationTimeMs        = System.currentTimeMillis()
+        currentLocationProviderLabel = if (location.provider == LocationManager.GPS_PROVIDER) "GNSS" else "NETWORK"
+        currentGnssSpeed = if (location.hasSpeed()) location.speed else null
+
+        // Histerese do bearing híbrido: só troca de fonte quando cruza a borda
+        // apropriada, pra não "piscar" entre GNSS e sensores quando a
+        // velocidade oscila perto do limiar (ex: fazendo curva devagar).
+        val speed = currentGnssSpeed
+        if (speed != null && location.hasBearing()) {
+            currentGnssBearing = location.bearing
+            if (!bearingSourceIsGnss && speed > BEARING_SPEED_HIGH_MS) {
+                bearingSourceIsGnss = true
+            } else if (bearingSourceIsGnss && speed < BEARING_SPEED_LOW_MS) {
+                bearingSourceIsGnss = false
+            }
+        } else {
+            // Sem speed ou sem bearing confiável neste fix — não dá pra avaliar
+            // o GNSS, cai pra fusão de sensores.
+            bearingSourceIsGnss = false
+        }
+    }
+
+    /**
+     * Mesma lógica de antes, com uma mudança: em vez de exigir precisão
+     * igual-ou-melhor que a atual, aceita qualquer fix dentro do teto de 50m
+     * que não seja MUITO pior (>3x) que o atual. Isso prioriza recência (dado
+     * mais "casado" com cada tag) sem aceitar degradação absurda — importante
+     * porque o trator passa por áreas de sinal fraco e a posição real precisa
+     * continuar atualizando, não "congelar" só porque um fix é um pouco pior.
      */
     private fun isBetterLocation(newLoc: Location, current: Location?): Boolean {
         val now = System.currentTimeMillis()
         if (now - newLoc.time > GPS_MAX_LOCATION_AGE_MS) return false
-        if (newLoc.hasAccuracy() && newLoc.accuracy > GPS_MAX_ACCURACY_M) return false
+        // Sem posição nenhuma ainda — aceita mesmo que a precisão seja ruim.
+        // "Algo é melhor que nada": nunca deixar o dado em branco quando existe
+        // QUALQUER fix disponível (ex: só NETWORK_PROVIDER funcionando, com erro
+        // de centenas de metros, dentro de um galpão sem GNSS).
         if (current == null) return true
-        if (now - current.time > GPS_MAX_LOCATION_AGE_MS) return true
+        // Regra 3: fix em cache expirou — force-aceita qualquer coisa para não
+        // manter uma posição velha indefinidamente. Checa nos dois domínios de
+        // relógio possíveis: current.time (relógio interno do chip GNSS) e
+        // currentLocationTimeMs (System.currentTimeMillis() gravado no momento
+        // do aceite, mesmo domínio dos timestamps do CSV e dos EPCs). O chip
+        // GNSS pode divergir centenas de ms do relógio do Android — o OR garante
+        // que o timeout de 30s dispara corretamente independente de qualquer deriva.
+        if (now - current.time > GPS_MAX_LOCATION_AGE_MS ||
+                now - currentLocationTimeMs > GPS_MAX_LOCATION_AGE_MS) return true
         val newIsGps     = newLoc.provider == LocationManager.GPS_PROVIDER
         val currentIsGps = current.provider == LocationManager.GPS_PROVIDER
         if (newIsGps && !currentIsGps) return true
         if (!newIsGps && currentIsGps) return false
         if (!newLoc.hasAccuracy()) return false
         if (!current.hasAccuracy()) return true
-        return newLoc.accuracy <= current.accuracy
+        // Mesma posição GPS → aceita independente de acurácia, só para atualizar
+        // o timestamp. Resolve o congelamento causado pelo stationary filter do
+        // chip: chip trava coordenadas quando parado mas continua variando a
+        // acurácia reportada — sem isso o cache de 30s expirava e um fix NETWORK
+        // errado entrava no lugar.
+        if (newIsGps && newLoc.latitude == current.latitude
+                     && newLoc.longitude == current.longitude) return true
+        // O teto de 50m só faz sentido pra PROTEGER um fix que já é bom — se o
+        // atual já é ruim (aceito por falta de opção melhor), qualquer melhora
+        // serve, mesmo que continue acima do teto. Sem essa distinção, o
+        // primeiro fix ruim aceito ficava "preso" mesmo quando fixes bem
+        // melhores (mas ainda acima de 50m) chegavam depois.
+        return if (current.accuracy <= GPS_MAX_ACCURACY_M) {
+            // Caminho 1 — relativo (comportamento original, inalterado):
+            // aceita se o novo fix não for muito pior que o atual (fator 3×).
+            val passesRelative = newLoc.accuracy <= current.accuracy * GPS_ACCURACY_DEGRADE_FACTOR
+            // Caminho 2 — absoluto confirmado por Doppler:
+            // aceita se o fix entrante indica via Doppler que estamos em
+            // movimento E a acurácia está dentro do teto absoluto. Resolve o
+            // "fix-âncora": parado 5 min → fix de 3m → threshold relativo = 9m
+            // → multipath de telhado metálico (20-30m) rejeitado em cadeia.
+            // Usa newLoc.speed (Doppler do fix ENTRANTE) em vez de
+            // currentGnssSpeed (cache do último aceito) para evitar dependência
+            // circular — se a posição estiver congelando, o cache de speed
+            // também estaria, mas o Doppler do fix entrante reflete estado atual.
+            // Nenhum dos dois caminhos aceita tudo sozinho: o caminho 2 exige
+            // confirmação de movimento via Doppler E acurácia dentro do teto.
+            val incomingSpeed = if (newLoc.hasSpeed()) newLoc.speed else 0f
+            val passesAbsolute = incomingSpeed > BEARING_SPEED_HIGH_MS
+                    && newLoc.accuracy <= GPS_MOVING_ABSOLUTE_MAX_M
+            passesRelative || passesAbsolute
+        } else {
+            newLoc.accuracy <= current.accuracy
+        }
     }
 
     override fun onSensorChanged(event: SensorEvent) {
@@ -128,17 +255,28 @@ class UHFReaderService : Service(), SensorEventListener {
             SensorManager.getOrientation(rotationMatrix, orientationAngles)
             var bearing = Math.toDegrees(orientationAngles[0].toDouble()).toFloat()
             if (bearing < 0) bearing += 360f
-            currentBearing = bearing
+            currentSensorBearing = bearing
         }
     }
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 
-    private val locationSensorsActive = java.util.concurrent.atomic.AtomicBoolean(false)
+    // Trava dos SENSORES (bússola) — não precisa de permissão, então uma vez
+    // registrado, fica registrado pro resto da vida do serviço.
+    private val sensorsRegistered = java.util.concurrent.atomic.AtomicBoolean(false)
+    // Trava da LOCALIZAÇÃO — separada de propósito. Antes, uma única trava
+    // cobria as duas coisas: se a permissão de localização ainda não tivesse
+    // sido concedida na primeira chamada (ex: app acabou de abrir, diálogo de
+    // permissão ainda não respondido), a trava já ficava "true" e o GPS NUNCA
+    // MAIS era tentado de novo — nem quando startCapture() chamava essa
+    // função de novo já com a permissão concedida. Resultado: sessão inteira
+    // sem nenhum dado de localização, mesmo com permissão OK depois. Agora,
+    // enquanto isso não tiver sucesso pelo menos uma vez, toda chamada tenta
+    // de novo.
+    @Volatile private var locationRegistered = false
 
     /** Inicia GPS + bússola numa thread própria. Chamado a partir de startCapture —
      *  roda mesmo com tela apagada, e não compartilha thread com a leitura RFID. */
     private fun startLocationAndSensors() {
-        if (!locationSensorsActive.compareAndSet(false, true)) return  // já ativo — evita registrar 2x
         val ctx = appContext ?: return
 
         // Se a permissão foi concedida DEPOIS do onCreate (ex: usuário acabou de
@@ -147,52 +285,73 @@ class UHFReaderService : Service(), SensorEventListener {
         // atualizado é seguro e é a forma documentada de "upgrade" o tipo.
         startForegroundWithSafeType()
 
-        // Thread + Looper dedicados. É isso que garante que onLocationChanged e
-        // onSensorChanged nunca rodem na UI thread nem na thread de leitura serial.
-        val thread = android.os.HandlerThread("UHFLogger-LocationSensor").also { it.start() }
-        locationSensorThread  = thread
-        val handler = android.os.Handler(thread.looper)
-        locationSensorHandler = handler
+        // Thread + Looper dedicados — só cria uma vez, reaproveita nas
+        // chamadas seguintes (não recria a cada retry de localização).
+        val handler = locationSensorHandler ?: run {
+            val thread = android.os.HandlerThread("UHFLogger-LocationSensor").also { it.start() }
+            locationSensorThread = thread
+            android.os.Handler(thread.looper).also { locationSensorHandler = it }
+        }
 
-        if (ContextCompat.checkSelfPermission(ctx, android.Manifest.permission.ACCESS_FINE_LOCATION)
-            != PackageManager.PERMISSION_GRANTED) {
-            Log.w(TAG, "ACCESS_FINE_LOCATION não concedida — GNSS não será registrado")
-        } else {
-            try {
-                val lm = (locationManager ?: (ctx.getSystemService(LOCATION_SERVICE) as LocationManager)
-                    .also { locationManager = it })
-                val gnssOnly = SettingsManager.getLocationMode(ctx) == SettingsManager.LOCATION_MODE_GNSS
-                // Passando `handler` explicitamente: os callbacks chegam na
-                // locationSensorThread, não na thread que chamou startCapture().
-                lm.requestLocationUpdates(
-                    LocationManager.GPS_PROVIDER, GPS_UPDATE_INTERVAL_MS, GPS_UPDATE_MIN_METERS, locationListener, handler.looper)
-                if (!gnssOnly) {
+        if (!locationRegistered) {
+            if (ContextCompat.checkSelfPermission(ctx, android.Manifest.permission.ACCESS_FINE_LOCATION)
+                != PackageManager.PERMISSION_GRANTED) {
+                Log.w(TAG, "ACCESS_FINE_LOCATION não concedida — GNSS não será registrado (vai tentar de novo na próxima chamada)")
+            } else {
+                try {
+                    val lm = (locationManager ?: (ctx.getSystemService(LOCATION_SERVICE) as LocationManager)
+                        .also { locationManager = it })
+                    val gnssOnly = SettingsManager.getLocationMode(ctx) == SettingsManager.LOCATION_MODE_GNSS
+                    // Passando `handler` explicitamente: os callbacks chegam na
+                    // locationSensorThread, não na thread que chamou startCapture().
                     lm.requestLocationUpdates(
-                        LocationManager.NETWORK_PROVIDER, GPS_UPDATE_INTERVAL_MS, GPS_UPDATE_MIN_METERS, locationListener, handler.looper)
-                }
-                if (currentLocation == null) {
-                    val last = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER)
-                    if (last != null && System.currentTimeMillis() - last.time <= GPS_MAX_LOCATION_AGE_MS) {
-                        currentLocation = last
-                    } else if (!gnssOnly) {
-                        val lastNet = lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
-                        if (lastNet != null && System.currentTimeMillis() - lastNet.time <= GPS_MAX_LOCATION_AGE_MS) {
-                            currentLocation = lastNet
+                        LocationManager.GPS_PROVIDER, GPS_UPDATE_INTERVAL_MS, GPS_UPDATE_MIN_METERS, locationListener, handler.looper)
+                    if (!gnssOnly) {
+                        lm.requestLocationUpdates(
+                            LocationManager.NETWORK_PROVIDER, GPS_UPDATE_INTERVAL_MS, GPS_UPDATE_MIN_METERS, locationListener, handler.looper)
+                    }
+                    locationRegistered = true
+                    Log.i(TAG, "LOCATION_REGISTERED: modo=${if (gnssOnly) "GNSS puro" else "híbrido (GNSS+NETWORK)"} — GPS_PROVIDER e${if (gnssOnly) "" else " NETWORK_PROVIDER"} registrados sem exceção")
+                    if (currentLocation == null) {
+                        // Usa a última posição conhecida MAIS RECENTE entre GPS e
+                        // NETWORK — sem limite de idade ("algo é melhor que nada"),
+                        // mas também sem preferir GPS cegamente: se o cache do GPS
+                        // tem 2h e o do NETWORK tem 10min, o NETWORK é o certo aqui.
+                        // Preferir provider sem olhar a idade só faz sentido quando
+                        // os dois são comparavelmente frescos — não é o caso ao
+                        // comparar dois caches parados, potencialmente muito
+                        // diferentes em idade um do outro.
+                        val lastGps = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER)
+                        val lastNet = if (!gnssOnly) lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER) else null
+                        val best = when {
+                            lastGps != null && lastNet != null -> if (lastGps.time >= lastNet.time) lastGps else lastNet
+                            lastGps != null -> lastGps
+                            lastNet != null -> lastNet
+                            else -> null
+                        }
+                        if (best != null) {
+                            applyLocation(best)
+                            val label = if (best.provider == LocationManager.GPS_PROVIDER) "GPS" else "NETWORK"
+                            Log.i(TAG, "LOCATION_CACHE: usando última posição $label conhecida (mais recente entre as disponíveis), idade=${System.currentTimeMillis()-best.time}ms")
+                        } else {
+                            Log.i(TAG, "LOCATION_CACHE: nenhuma posição em cache disponível (GPS nem NETWORK) — aguardando fix novo")
                         }
                     }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Falha ao registrar location updates", e)
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "Falha ao registrar location updates", e)
             }
         }
 
-        val sm = (sensorManager ?: (ctx.getSystemService(SENSOR_SERVICE) as SensorManager)
-            .also { sensorManager = it })
-        sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)?.let {
-            sm.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL, handler)
-        }
-        sm.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)?.let {
-            sm.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL, handler)
+        if (sensorsRegistered.compareAndSet(false, true)) {
+            val sm = (sensorManager ?: (ctx.getSystemService(SENSOR_SERVICE) as SensorManager)
+                .also { sensorManager = it })
+            sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)?.let {
+                sm.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL, handler)
+            }
+            sm.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)?.let {
+                sm.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL, handler)
+            }
         }
     }
 
@@ -204,12 +363,29 @@ class UHFReaderService : Service(), SensorEventListener {
         try { locationSensorThread?.quitSafely() } catch (_: Exception) {}
         locationSensorThread  = null
         locationSensorHandler = null
-        locationSensorsActive.set(false)
+        locationRegistered = false
+        sensorsRegistered.set(false)
     }
 
     fun getCurrentLatitude()  = currentLocation?.let { "%.6f".format(java.util.Locale.US, it.latitude) }  ?: ""
     fun getCurrentLongitude() = currentLocation?.let { "%.6f".format(java.util.Locale.US, it.longitude) } ?: ""
-    fun getCurrentBearing()   = if (!currentBearing.isNaN()) "%.1f".format(java.util.Locale.US, currentBearing) else ""
+
+    /** Bearing híbrido: GNSS quando em movimento (histerese em onLocationChanged
+     *  decide isso), fusão de sensores caso contrário — ou se o GNSS não tiver
+     *  valor válido ainda mesmo com bearingSourceIsGnss=true (defensivo). */
+    fun getCurrentBearing(): String {
+        val value = if (bearingSourceIsGnss && !currentGnssBearing.isNaN()) currentGnssBearing
+        else currentSensorBearing
+        return if (!value.isNaN()) "%.1f".format(java.util.Locale.US, value) else ""
+    }
+
+    fun getCurrentGnssSpeed(): String =
+        currentGnssSpeed?.let { "%.2f".format(java.util.Locale.US, it) } ?: ""
+
+    fun getCurrentLocationTimestamp(): String =
+        if (currentLocationTimeMs > 0) currentLocationTimeMs.toString() else ""
+
+    fun getCurrentLocationProvider(): String = currentLocationProviderLabel
 
     // =========================================================================
     // WakeLock — impede o CPU de dormir (Doze) enquanto a captura estiver ativa,
@@ -265,7 +441,6 @@ class UHFReaderService : Service(), SensorEventListener {
     // =========================================================================
     private val jietongDecoder = ProtocolDecoder()
     private val winnixDecoder  = WinnixProtocolDecoder()
-    private val tagBuffer      = ConcurrentLinkedQueue<TagRecord>()
     private val totalCount     = AtomicInteger(0)
     private val isRunning      = AtomicBoolean(false)
     private val isPausedState  = AtomicBoolean(false)
@@ -288,10 +463,10 @@ class UHFReaderService : Service(), SensorEventListener {
 
     private val stopExecutor   = Executors.newSingleThreadExecutor()
     private val configExecutor = Executors.newSingleThreadExecutor()
-    // Dedicated executor for BT reconnect loop — separate so it never blocks stop/config ops
+    // Executor dedicado ao loop de reconexão BT — separado para nunca bloquear stop/config
     @Volatile private var btReconnectExecutor: java.util.concurrent.ExecutorService? = null
-    // Independent flag controlling the reconnect loop's lifetime — separate from
-    // isPausedState which fluctuates during each connection attempt.
+    // Flag que controla exclusivamente o ciclo de vida do loop de reconexão — independente
+    // de isPausedState, que oscila durante cada tentativa de conexão.
     private val btReconnectActive = java.util.concurrent.atomic.AtomicBoolean(false)
 
     // Mesma ideia, agora pro USB: antes disso, a reconexão USB dependia 100% do
@@ -305,22 +480,58 @@ class UHFReaderService : Service(), SensorEventListener {
     // Auto-save
     private var autoSaveTagCount   : Int  = SettingsManager.DEFAULT_AUTO_SAVE_TAGS
     private var autoSaveIntervalMin: Long = SettingsManager.DEFAULT_AUTO_SAVE_MINUTES.toLong()
-    private var autoSaveMode       : Int  = SettingsManager.DEFAULT_AUTO_SAVE_MODE
     private var autoSaveExecutor   : ScheduledExecutorService? = null
     private var autoSaveTimerJob   : ScheduledFuture<*>? = null
-    // Tags accumulated since the last auto-save — resets after each save (req 1)
+    // Tags acumuladas desde o último auto-save — reinicia após cada gravação
     private val tagsSinceLastSave  = AtomicInteger(0)
+
+    // =========================================================================
+    // Filtro de tags — configuração recarregada uma vez por sessão nova
+    // (igual autoSaveTagCount/autoSaveIntervalMin acima), NÃO em cada
+    // resume de reconexão BT/USB, pra não resetar a consolidação em
+    // andamento só porque a antena piscou.
+    // =========================================================================
+    private var tagFilterEngine: TagFilterEngine? = null
+    private var filterEnabled         = SettingsManager.DEFAULT_FILTER_ENABLED
+    private var filterL1Enabled       = SettingsManager.DEFAULT_FILTER_L1_ENABLED
+    private var filterL1Patterns      = SettingsManager.DEFAULT_FILTER_L1_PATTERNS
+    private var filterL2Enabled       = SettingsManager.DEFAULT_FILTER_L2_ENABLED
+    private var filterL2WindowMs      = SettingsManager.DEFAULT_FILTER_L2_WINDOW_MIN * 60_000L
+    private var filterSweepIntervalMs = SettingsManager.DEFAULT_FILTER_L2_SWEEP_MIN * 60_000L
+    private var filterPersistJob: ScheduledFuture<*>? = null
+    private var filterSweepJob  : ScheduledFuture<*>? = null
+    // D2: com a Camada 2 ativa, rotação por CONTAGEM de tags brutas deixa de
+    // fazer sentido (as tags são consolidadas antes de chegar no arquivo) —
+    // a rotação passa a ser só por tempo, com o mesmo intervalo da janela.
+    private val filterForcesTimeOnlyRotation get() = filterEnabled && filterL2Enabled
 
     private var appContext: Context? = null
     private var activeAntennaType : String  = SettingsManager.ANTENNA_TYPE_JIETONG
     private var activeIsBluetooth : Boolean = false  // true=BT session, false=USB session
 
+    // =========================================================================
+    // Watchdog de silêncio — detecta "conexão zumbi": o socket continua de pé
+    // (nenhum erro é lançado, então o mecanismo normal de reconexão nunca é
+    // acionado), mas parou de chegar QUALQUER byte, mesmo com o módulo
+    // continuando a escanear normalmente do outro lado. Sem isso, o app fica
+    // preso pra sempre (visto num teste real de 12h+).
+    //
+    // Design: só assume "morto" depois de PERGUNTAR (manda start_inventory,
+    // que o Winnix sempre responde, mesmo sem tag nenhuma no campo) — nunca
+    // conclui isso só pelo silêncio sozinho, porque silêncio também é normal
+    // (trecho do campo sem tag por perto pode durar bastante tempo).
+    // =========================================================================
+    @Volatile private var lastDataReceivedAt : Long = 0L
+    @Volatile private var lastProbeSentAt    : Long = 0L
+    private var consecutiveFailedProbes = 0
+    private var watchdogExecutor: ScheduledExecutorService? = null
+
     // Winnix temperature tracking
     @Volatile private var winnixStartTemp     : String = ""
-    // Generic temperature read via onNewData — used for both start and stop temp on BT
+    // Temperatura lida via onNewData — usada tanto para temp. inicial quanto de encerramento em BT
     @Volatile private var winnixTempResult    : String = ""
     private val winnixTempLatch     = java.util.concurrent.atomic.AtomicReference<java.util.concurrent.CountDownLatch?>(null)
-    // Flag set by onNewData when 0x8D (stop confirmation) is received
+    // Sinalizado por onNewData quando a confirmação de parada 0x8D é recebida
     private val winnixStopConfirmed = java.util.concurrent.atomic.AtomicBoolean(false)
 
     // Callbacks
@@ -337,8 +548,33 @@ class UHFReaderService : Service(), SensorEventListener {
     override fun onCreate() {
         super.onCreate()
         appContext = applicationContext
+        tagFilterEngine = TagFilterEngine(appContext!!)
         createNotificationChannel()
         startForegroundWithSafeType()
+
+        // GPS/bússola/WakeLock começam a "esquentar" assim que o serviço existe
+        // (app aberto), não só quando a captura começa de fato. Sem isso, todo
+        // início de captura (principalmente em ambiente fechado, onde o
+        // NETWORK_PROVIDER pode levar até ~1-2min pra conseguir o primeiro fix
+        // "a frio") ficava com um buraco de dado logo no começo. Como o
+        // aparelho fica ligado na energia do trator o tempo todo, manter isso
+        // ativo entre sessões de captura tem custo de bateria desprezível.
+        acquireCaptureWakeLock()
+        startLocationAndSensors()
+
+        // Watchdog de silêncio — roda o tempo todo (igual GPS/WakeLock acima),
+        // mas só age de verdade quando isRunning=true (dentro de watchdogTick).
+        // Reaproveita o mesmo padrão já validado da renovação do WakeLock:
+        // try/catch dentro da tarefa agendada, pra uma exceção numa rodada não
+        // derrubar as próximas (scheduleWithFixedDelay suprime execuções
+        // futuras se uma delas lançar exceção sem ser capturada).
+        watchdogExecutor = Executors.newSingleThreadScheduledExecutor()
+        watchdogExecutor?.scheduleWithFixedDelay(
+            {
+                try { watchdogTick() } catch (e: Exception) { Log.e(TAG, "WATCHDOG: erro inesperado no tick: ${e.message}", e) }
+            },
+            WATCHDOG_CHECK_INTERVAL_MS, WATCHDOG_CHECK_INTERVAL_MS, TimeUnit.MILLISECONDS
+        )
 
         // Retomada automática: se o Service está sendo (re)criado porque o
         // Android o religou sozinho depois de um SIGKILL/OOM-kill — não
@@ -415,6 +651,7 @@ class UHFReaderService : Service(), SensorEventListener {
         stopCapture(userInitiated = false)
         stopLocationAndSensors()
         releaseCaptureWakeLock()
+        watchdogExecutor?.shutdownNow(); watchdogExecutor = null
         mainActivity = null
         btReconnectActive.set(false)
         btReconnectExecutor?.shutdownNow(); btReconnectExecutor = null
@@ -453,15 +690,30 @@ class UHFReaderService : Service(), SensorEventListener {
             tagsSinceLastSave.set(0)
             autoSaveTagCount    = SettingsManager.getAutoSaveTags(ctx)
             autoSaveIntervalMin = SettingsManager.getAutoSaveMinutes(ctx)
-            autoSaveMode        = SettingsManager.getAutoSaveMode(ctx)
 
-            val prefix   = if (activeAntennaType == SettingsManager.ANTENNA_TYPE_WINNIX) "winnix" else "jietong"
-            val fileName = CsvExporter.startSession(ctx, prefix)
-            if (fileName == null) {
-                Log.e(TAG, "Failed to create CSV session")
-                return
+            filterEnabled         = SettingsManager.isFilterEnabled(ctx)
+            filterL1Enabled       = SettingsManager.isFilterL1Enabled(ctx)
+            filterL1Patterns      = SettingsManager.getFilterL1Patterns(ctx)
+            filterL2Enabled       = SettingsManager.isFilterL2Enabled(ctx)
+            filterL2WindowMs      = SettingsManager.getFilterL2WindowMin(ctx) * 60_000L
+            filterSweepIntervalMs = SettingsManager.getFilterL2SweepMin(ctx) * 60_000L
+            if (filterForcesTimeOnlyRotation) {
+                // Mesma janela da Camada 2 — ver D2 no histórico de decisões do filtro.
+                autoSaveIntervalMin = SettingsManager.getFilterL2WindowMin(ctx).toLong()
             }
-            Log.i(TAG, "Session: $fileName ($activeAntennaType)")
+            tagFilterEngine?.start(
+                TagFilterEngine.Config(
+                    filterEnabled = filterEnabled,
+                    l1Enabled = filterL1Enabled,
+                    l1PatternsCsv = filterL1Patterns,
+                    l2Enabled = filterL2Enabled,
+                    l2WindowMs = filterL2WindowMs,
+                )
+            )
+
+            val prefix = buildFileIdentifier(ctx, btDeviceName = if (isBtDeviceAllowed(deviceName)) deviceName else null)
+            CsvExporter.startSession(ctx, prefix)
+            Log.i(TAG, "Session prepared: prefix=$prefix ($activeAntennaType)")
         } else {
             Log.i(TAG, "Resuming session — ${totalCount.get()} tags so far ($activeAntennaType)")
         }
@@ -469,10 +721,10 @@ class UHFReaderService : Service(), SensorEventListener {
         jietongDecoder.reset()
         winnixDecoder.reset()
 
-        activeIsBluetooth = (deviceName == BT_DEVICE_NAME)
-        winnixRingClear()  // clear stale bytes from previous session
+        activeIsBluetooth = isBtDeviceAllowed(deviceName)
+        winnixRingClear()  // descarta bytes residuais da sessão anterior
 
-        if (deviceName == BT_DEVICE_NAME) {
+        if (isBtDeviceAllowed(deviceName)) {
             startBtConnection(deviceName, resuming)
         } else {
             startUsbConnection(deviceName, resuming)
@@ -480,6 +732,25 @@ class UHFReaderService : Service(), SensorEventListener {
     }
 
     // ── USB connection ─────────────────────────────────────────────────────
+    /**
+     * Identificador usado no nome do arquivo CSV: MAC do módulo (sem os dois
+     * pontos, que são inválidos em nome de arquivo no Windows) quando é BT,
+     * ou o nome do aparelho Android (já existe pronto e sanitizado em
+     * DriveHelper, usado pra organizar as pastas do Drive) quando é USB.
+     * A estrutura de pastas do Drive não muda — só o nome do arquivo em si.
+     */
+    private fun buildFileIdentifier(ctx: Context, btDeviceName: String?): String {
+        if (btDeviceName == null) return DriveHelper.getDeviceName(ctx)
+        return try {
+            val adapter = (ctx.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
+            val mac = adapter?.bondedDevices?.firstOrNull { it.name == btDeviceName }?.address
+            mac?.replace(":", "") ?: "BT"
+        } catch (se: SecurityException) {
+            Log.w(TAG, "buildFileIdentifier: sem permissão pra ler MAC do BT (${se.message})")
+            "BT"
+        }
+    }
+
     private fun startUsbConnection(deviceName: String, resuming: Boolean) {
         val ctx = appContext ?: return
         val usbManager = getSystemService(Context.USB_SERVICE) as UsbManager
@@ -521,6 +792,9 @@ class UHFReaderService : Service(), SensorEventListener {
         }
 
         isRunning.set(true)
+        lastDataReceivedAt = System.currentTimeMillis()
+        lastProbeSentAt = 0L
+        consecutiveFailedProbes = 0
         if (activeAntennaType == SettingsManager.ANTENNA_TYPE_WINNIX) {
             startWinnixCapture(wrapper, ctx)
         } else {
@@ -538,7 +812,7 @@ class UHFReaderService : Service(), SensorEventListener {
         Log.i(TAG, "BT_CONNECT: startBtConnection called resuming=$resuming retryCount=$retryCount")
         configExecutor.submit {
             try {
-                // Check BLUETOOTH_CONNECT permission (required on Android 12+)
+                // Verifica permissão BLUETOOTH_CONNECT (obrigatória no Android 12+)
                 if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
                     if (ctx.checkSelfPermission(android.Manifest.permission.BLUETOOTH_CONNECT)
                         != android.content.pm.PackageManager.PERMISSION_GRANTED) {
@@ -554,17 +828,17 @@ class UHFReaderService : Service(), SensorEventListener {
                 val adapter   = btManager.adapter
                     ?: run { Log.e(TAG, "BT_CONNECT: Bluetooth not available"); if (!resuming) CsvExporter.cancelSession(); isPausedState.set(resuming); return@submit }
 
-                Log.i(TAG, "BT_CONNECT: searching for paired device '$BT_DEVICE_NAME'")
+                Log.i(TAG, "BT_CONNECT: searching for paired device '$deviceName'")
                 @Suppress("DEPRECATION")
                 val btDevice = try {
-                    adapter.bondedDevices?.firstOrNull { it.name == BT_DEVICE_NAME }
+                    adapter.bondedDevices?.firstOrNull { it.name == deviceName }
                 } catch (se: SecurityException) {
                     Log.e(TAG, "BT_CONNECT: SecurityException on bondedDevices: ${se.message}")
                     if (!resuming) CsvExporter.cancelSession()
                     isPausedState.set(resuming)
                     return@submit
                 } ?: run {
-                    Log.e(TAG, "BT_CONNECT: device '$BT_DEVICE_NAME' not found in paired devices")
+                    Log.e(TAG, "BT_CONNECT: device '$deviceName' not found in paired devices")
                     if (!resuming) CsvExporter.cancelSession()
                     isPausedState.set(resuming)
                     return@submit
@@ -577,16 +851,14 @@ class UHFReaderService : Service(), SensorEventListener {
                     btPort.connect()
                     Log.i(TAG, "BT_CONNECT: socket connected successfully")
                 } catch (e: Exception) {
-                    // No internal retry here — the outer BT reconnect loop
-                    // (startBtReconnectLoop) already retries every BT_RECONNECT_INTERVAL_MS
-                    // indefinitely. Retrying here too just burned time in nested
-                    // attempts without improving odds — a fresh attempt after a real
-                    // wait is just as effective. Fail fast, let the outer loop retry.
+                    // Sem retry interno — o loop externo (startBtReconnectLoop) já retenta
+                    // a cada BT_RECONNECT_INTERVAL_MS indefinidamente. Falhar rápido aqui
+                    // e deixar o loop externo tentar é mais eficaz.
                     Log.e(TAG, "BT_CONNECT: socket connect FAILED: ${e.message}")
                     btPort.close()
                     if (!resuming) CsvExporter.cancelSession()
                     isPausedState.set(resuming)
-                    onWrongAntennaType?.invoke("Winnix_BT: falha ao conectar")
+                    onWrongAntennaType?.invoke("$deviceName: falha ao conectar")
                     return@submit
                 }
 
@@ -596,9 +868,8 @@ class UHFReaderService : Service(), SensorEventListener {
                     Log.w(TAG, "BT_CONNECT: probe FAILED")
                     btPort.close()
                     activePort = null
-                    // Connection succeeded but module didn't answer the probe — this is
-                    // fast (not a connect() timeout), so one quick local retry is cheap
-                    // and catches transient issues without the outer loop's 5s wait.
+                    // Conexão OK mas módulo não respondeu ao probe — como é rápido (sem timeout de connect()),
+                    // uma tentativa local de retry é barata e resolve problemas transitórios.
                     if (retryCount < 1) {
                         Log.i(TAG, "BT_CONNECT: retrying probe once")
                         Thread.sleep(BT_RETRY_DELAY_MS)
@@ -606,18 +877,21 @@ class UHFReaderService : Service(), SensorEventListener {
                     } else {
                         isRunning.set(false)
                         if (resuming) isPausedState.set(true)
-                        onWrongAntennaType?.invoke("Winnix_BT: módulo não respondeu.")
+                        onWrongAntennaType?.invoke("$deviceName: módulo não respondeu.")
                     }
                     return@submit
                 }
 
                 Log.i(TAG, "BT_CONNECT: probe OK — starting Winnix capture")
                 isRunning.set(true)
+                lastDataReceivedAt = System.currentTimeMillis()
+                lastProbeSentAt = 0L
+                consecutiveFailedProbes = 0
                 startWinnixCaptureBt(btPort, ctx)
                 startAutoSaveTimer()
                 updateNotification("Capturando via BT…")
                 onStatusChanged?.invoke(true)
-                Log.i(TAG, "BT_CONNECT: capture started successfully on $BT_DEVICE_NAME")
+                Log.i(TAG, "BT_CONNECT: capture started successfully on $deviceName")
 
             } catch (e: Exception) {
                 Log.e(TAG, "BT_CONNECT: unexpected error: ${e.message}", e)
@@ -636,9 +910,6 @@ class UHFReaderService : Service(), SensorEventListener {
      *   próximo onCreate() retome sozinho.
      */
     fun stopCapture(userInitiated: Boolean = true) {
-        // Handle two cases:
-        // 1. Actively capturing (isRunning=true) — normal stop
-        // 2. Paused with BT reconnect loop running (isRunning=false, isPaused=true) — stop loop + finalize
         val wasRunning = isRunning.compareAndSet(true, false)
         val wasPaused  = isPausedState.get()
         if (!wasRunning && !wasPaused) return
@@ -648,7 +919,11 @@ class UHFReaderService : Service(), SensorEventListener {
         btReconnectExecutor?.shutdownNow(); btReconnectExecutor = null
         usbReconnectActive.set(false)
         usbReconnectExecutor?.shutdownNow(); usbReconnectExecutor = null
-        stopAutoSaveTimer()
+        // Captura o executor antigo pra esperar ele esvaziar antes de finalizar
+        // a sessão (ver await abaixo) — sem isso, uma escrita de writeTagsNow()
+        // ainda em voo (submetida um instante antes do Stop) poderia terminar
+        // DEPOIS do finalizeSession(), corrompendo/perdendo a última linha.
+        val oldAutoSaveExecutor = stopAutoSaveTimer()
 
         // Só marca "não capturando" se for parada REAL/intencional. Se for
         // onDestroy() sendo chamado porque o Android está derrubando o processo
@@ -661,10 +936,8 @@ class UHFReaderService : Service(), SensorEventListener {
         }
 
         stopExecutor.submit {
-            // 1. Para o inventário
             sendWinnixStop()
 
-            // 2. Para o btIoManager via flag, lê temperatura, depois fecha porta
             val localBtIo = btIoManager
             val localIo   = ioManager
             btIoManager = null
@@ -681,7 +954,6 @@ class UHFReaderService : Service(), SensorEventListener {
                 if (port != null) winnixReadTemperatureBt(port) else ""
             } else ""
 
-            // 4. Para IOManagers e fecha porta
             if (localBtIo != null) {
                 closePort()        // interrompe stream.read() bloqueante → btIoManager sai via IOException
                 localBtIo.stop()   // garante flag running=false
@@ -691,16 +963,37 @@ class UHFReaderService : Service(), SensorEventListener {
                 closePort()
             }
 
+            // Espera qualquer writeTagsNow() já submetido terminar de ir pro
+            // disco antes de finalizar a sessão — ver comentário no oldAutoSaveExecutor acima.
+            try {
+                oldAutoSaveExecutor?.awaitTermination(10, TimeUnit.SECONDS)
+            } catch (_: InterruptedException) {}
+
+            // D1: se foi o usuário quem pediu Parar, trata tudo que ainda está
+            // pendente na Camada 2 como se a janela tivesse expirado — nada
+            // fica esperando um tempo que não vai mais passar. Numa morte de
+            // processo (userInitiated=false) NÃO fazemos isso: o estado
+            // persistido continua em disco e é recuperado no próximo start
+            // (ver TagFilterEngine.start()).
+            val d1Expired = if (userInitiated) {
+                (tagFilterEngine?.flushAllNow() ?: emptyList()).also { expired ->
+                    if (expired.isNotEmpty()) {
+                        totalCount.addAndGet(expired.size)
+                        Log.i(TAG, "Filter: ${expired.size} EPC(s) pendentes forçados no Stop (D1)")
+                    }
+                }
+            } else emptyList()
+
             val tagCount = totalCount.get()
-            val fileName = drainAndFinalize(winnixStopTemp)
+            val fileName = drainAndFinalize(d1Expired, winnixStopTemp)
             updateNotification("Captura encerrada — $tagCount tags")
             totalCount.set(0)
+            tagFilterEngine?.resetNewEntriesSeen()
 
-            // Só desliga GPS/bússola/wakelock se não for uma pausa transitória de
-            // reconexão BT — stopCapture só chega aqui quando é encerramento real
-            // (isPausedState já foi setado false no início desta função).
-            stopLocationAndSensors()
-            releaseCaptureWakeLock()
+            // GPS/bússola/wakelock NÃO são mais desligados aqui — continuam
+            // ativos enquanto o serviço existir (ver onCreate), pra não
+            // "esfriar" o NETWORK_PROVIDER a cada ciclo Parar/Iniciar. Só
+            // param de verdade em onDestroy().
 
             Log.i(TAG, "Capture stopped. Total: $tagCount, file: $fileName")
             onStatusChanged?.invoke(false)
@@ -715,21 +1008,45 @@ class UHFReaderService : Service(), SensorEventListener {
         usbReconnectActive.set(false)
         usbReconnectExecutor?.shutdownNow(); usbReconnectExecutor = null
         appContext?.let { SettingsManager.setCaptureState(it, capturing = false) }
+        val oldAutoSaveExecutor = stopAutoSaveTimer()
         stopExecutor.submit {
+            try {
+                oldAutoSaveExecutor?.awaitTermination(10, TimeUnit.SECONDS)
+            } catch (_: InterruptedException) {}
+
+            val expired = tagFilterEngine?.flushAllNow() ?: emptyList()
+            if (expired.isNotEmpty()) totalCount.addAndGet(expired.size)
             val tagCount = totalCount.get()
-            val fileName = drainAndFinalize("")
+            val fileName = drainAndFinalize(expired, "")
             totalCount.set(0)
-            stopLocationAndSensors()
-            releaseCaptureWakeLock()
+            tagFilterEngine?.resetNewEntriesSeen()
+            // GPS/bússola/wakelock continuam ativos — ver onCreate/onDestroy.
             Log.i(TAG, "Saved after error. Total: $tagCount, file: $fileName")
             onStopComplete?.invoke(fileName, tagCount)
         }
     }
 
-    fun isCapturing(): Boolean = isRunning.get()
-    fun isPaused()   : Boolean = isPausedState.get()
+    fun isCapturing()      : Boolean = isRunning.get()
+    fun isPaused()         : Boolean = isPausedState.get()
+    fun getActiveDeviceName(): String? = activeDeviceName
     fun tagCount()   : Int     = totalCount.get()
     fun flushTags(): List<TagRecord> = emptyList()
+
+    // Indicador ao vivo pra UI (MainActivity), separado de tagCount()/totalCount
+    // porque este último precisa continuar sendo a contagem REAL de linhas
+    // gravadas no CSV (usado no toast do Stop, notificação, checagem de
+    // "sessão sem tags" em drainAndFinalize). Com a Camada 2 ativa, totalCount
+    // só sobe quando a janela expira (até ~30min depois da leitura), o que
+    // deixa o contador da tela parado por muito tempo mesmo com a antena lendo
+    // — displayTagCount() usa TagFilterEngine.newEntriesSeen() nesse caso, que
+    // sobe assim que uma tag NOVA é aceita pela Camada 1/2, sem esperar a
+    // janela fechar. Sem Camada 2 (filtro off, ou só Camada 1), writeTagsNow()
+    // já escreve na hora, então totalCount já é "ao vivo" por conta própria.
+    fun displayTagCount(): Int =
+        if (filterEnabled && filterL2Enabled) tagFilterEngine?.newEntriesSeen() ?: 0
+        else totalCount.get()
+
+    fun isFilterActive(): Boolean = filterEnabled
 
     // =========================================================================
     // Jietong capture (USB only)
@@ -737,18 +1054,23 @@ class UHFReaderService : Service(), SensorEventListener {
     private fun startJietongCapture(wrapper: UsbSerialPortWrapper) {
         ioManager = SerialInputOutputManager(wrapper.rawPort(), object : SerialInputOutputManager.Listener {
             override fun onNewData(data: ByteArray) {
-                val lat  = getCurrentLatitude()
-                val lon  = getCurrentLongitude()
-                val brg  = getCurrentBearing()
-                val tags = jietongDecoder.feed(data, lat, lon, brg)
-                if (tags.isNotEmpty()) {
-                    tagBuffer.addAll(tags)
-                    totalCount.addAndGet(tags.size)
-                    val sinceLast = tagsSinceLastSave.addAndGet(tags.size)
-                    if (sinceLast >= autoSaveTagCount) {
-                        rescheduleTimerJob()
-                        autoSaveExecutor?.submit { flushBufferToDisk() }
+                // Ver comentário em winnixOnNewData(): uma exceção não capturada
+                // aqui mata a thread de leitura silenciosamente pra sempre.
+                try {
+                    lastDataReceivedAt = System.currentTimeMillis()
+                    val lat  = getCurrentLatitude()
+                    val lon  = getCurrentLongitude()
+                    val brg  = getCurrentBearing()
+                    val spd  = getCurrentGnssSpeed()
+                    val locTs = getCurrentLocationTimestamp()
+                    val prov  = getCurrentLocationProvider()
+                    val rawTags = jietongDecoder.feed(data, lat, lon, brg, spd, locTs, prov)
+                    if (rawTags.isNotEmpty()) {
+                        val tags = tagFilterEngine?.process(rawTags) ?: rawTags
+                        if (tags.isNotEmpty()) writeTagsNow(tags)
                     }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Jietong onNewData: erro ao processar frame — descartado, leitura CONTINUA: ${e.message}", e)
                 }
             }
             override fun onRunError(e: Exception) = handleRunError(e)
@@ -810,12 +1132,11 @@ class UHFReaderService : Service(), SensorEventListener {
 
         winnixStartTemp = ""
 
-        // Config runs on configExecutor — btPort is already connected at this point
         configExecutor.submit {
             try {
                 winnixConfigSequence(btPort, antennas, powerDbm, workingMs, invMode, inactiveMs)
 
-                // Start temperature — read BEFORE starting btIoManager (no competition)
+                // Temperatura inicial — lida ANTES de iniciar o btIoManager (sem concorrência na porta)
                 val startTemp = winnixReadTemperature(btPort)
                 winnixStartTemp = if (startTemp != null) "%.1f".format(java.util.Locale.US, startTemp) else ""
                 Log.i(TAG, "Winnix BT start temperature: $winnixStartTemp°C")
@@ -825,8 +1146,7 @@ class UHFReaderService : Service(), SensorEventListener {
                 btPort.write(winnixBuildStartInventory(), 2000)
                 Log.i(TAG, "Winnix BT inventory started")
 
-                // Guard: only assign btIoManager if still running
-                // Prevents race where stopCapture() ran while configExecutor was still starting
+                // Garante que stopCapture() não foi chamado enquanto o configExecutor ainda inicializava
                 if (!isRunning.get()) {
                     Log.w(TAG, "BT capture aborted — stop was called during startup")
                     btPort.close()
@@ -909,12 +1229,30 @@ class UHFReaderService : Service(), SensorEventListener {
     }
 
     private fun winnixOnNewData(data: ByteArray) {
-        // Accumulate bytes — BT can fragment frames across multiple onNewData calls
+        // try/catch envolvendo TUDO: essencial. onNewData roda na thread de
+        // leitura serial (USB via SerialInputOutputManager ou BT via
+        // BluetoothInputOutputManager, ambos chamando esta mesma função). Uma
+        // exceção não capturada aqui (ex.: frame corrompido/BT ruidoso) mata
+        // essa thread silenciosamente pra sempre: isRunning fica travado em
+        // true, e como ninguém mais lê, forceReconnectDueToSilence() também
+        // não ajuda — não há leitura bloqueada pra receber a IOException do
+        // close(). Vira um "zumbi" permanente que só um restart manual resolve.
+        // Mesmo padrão de proteção já usado nos loops de reconexão BT/USB.
+        try {
+            winnixOnNewDataInner(data)
+        } catch (e: Exception) {
+            Log.e(TAG, "winnixOnNewData: erro ao processar frame — descartado, leitura CONTINUA: ${e.message}", e)
+        }
+    }
+
+    private fun winnixOnNewDataInner(data: ByteArray) {
+        lastDataReceivedAt = System.currentTimeMillis()
+        // Acumula bytes — o BT pode fragmentar frames em múltiplas chamadas onNewData
         winnixRingAppend(data)
 
         val buf = winnixRingSnapshot()
 
-        // Check for stop confirmation (0x8D)
+        // Verifica confirmação de parada (0x8D)
         if (!winnixStopConfirmed.get()) {
             for (i in 0 until buf.size - 4) {
                 if (buf[i] == 0xA5.toByte() && buf[i+1] == 0x5A.toByte()
@@ -927,7 +1265,7 @@ class UHFReaderService : Service(), SensorEventListener {
             }
         }
 
-        // Check for temperature response (0x35) — fills latch for winnixReadTemperatureBt()
+        // Verifica resposta de temperatura (0x35) — preenche o latch para winnixReadTemperatureBt()
         val tempLatch = winnixTempLatch.get()
         if (tempLatch != null && tempLatch.count > 0) {
             for (i in 0 until buf.size - 7) {
@@ -948,21 +1286,19 @@ class UHFReaderService : Service(), SensorEventListener {
         val lat  = getCurrentLatitude()
         val lon  = getCurrentLongitude()
         val brg  = getCurrentBearing()
-        val tags = winnixDecoder.feed(data, lat, lon, brg)
-        if (tags.isNotEmpty()) {
-            val processedTags = tags.toMutableList()
+        val spd  = getCurrentGnssSpeed()
+        val locTs = getCurrentLocationTimestamp()
+        val prov  = getCurrentLocationProvider()
+        val rawTags = winnixDecoder.feed(data, lat, lon, brg, spd, locTs, prov)
+        if (rawTags.isNotEmpty()) {
+            val processedTags = rawTags.toMutableList()
             val temp = winnixStartTemp
             if (temp.isNotEmpty()) {
                 winnixStartTemp = ""
                 processedTags[0] = processedTags[0].copy(temperature = temp)
             }
-            tagBuffer.addAll(processedTags)
-            totalCount.addAndGet(processedTags.size)
-            val sinceLast = tagsSinceLastSave.addAndGet(processedTags.size)
-            if (sinceLast >= autoSaveTagCount) {
-                rescheduleTimerJob()
-                autoSaveExecutor?.submit { flushBufferToDisk() }
-            }
+            val tags = tagFilterEngine?.process(processedTags) ?: processedTags
+            if (tags.isNotEmpty()) writeTagsNow(tags)
         }
     }
 
@@ -989,8 +1325,8 @@ class UHFReaderService : Service(), SensorEventListener {
             // pra não segurar o lock por até 3s à toa.
             val sent = synchronized(this) { activePort?.write(winnixBuildStopInventory(), 2000); activePort != null }
             if (!sent) return
-            // Wait up to 3s for 0x8D confirmation via onNewData
-            // Send only ONCE — sending multiple 0x8C confuses the module
+            // Aguarda até 3s pela confirmação 0x8D via onNewData
+            // Envia apenas UMA vez — múltiplos 0x8C confundem o módulo
             val deadline = System.currentTimeMillis() + 3000L
             while (!winnixStopConfirmed.get() && System.currentTimeMillis() < deadline) {
                 Thread.sleep(50)
@@ -1079,9 +1415,9 @@ class UHFReaderService : Service(), SensorEventListener {
     }
 
     /**
-     * mode: table mode 1-5 (as defined in SettingsManager WINNIX_INV_MODE_*).
-     * Protocol DByte0 values are 0-4, with a -1 offset from the table numbering.
-     * Verified against doc example: Fast read (table Mode 2) = DByte0 0x01.
+     * mode: modo de tabela 1-5 (conforme SettingsManager WINNIX_INV_MODE_*).
+     * Valores de DByte0 no protocolo são 0-4, com offset -1 em relação à tabela.
+     * Verificado contra doc: Fast read (Mode 2) = DByte0 0x01.
      *   Multi-tag (1) → DByte0=0x00
      *   Fast read (2) → DByte0=0x01
      *   Ultra Low Power (3) → DByte0=0x02
@@ -1093,11 +1429,11 @@ class UHFReaderService : Service(), SensorEventListener {
     }
 
     /**
-     * Read temperature for BT sessions — uses latch filled by onNewData.
-     * The btIoManager delivers all bytes via onNewData, so we cannot use
-     * winnixReadTemperature (available() polling) which competes with btIoManager.
-     * Instead: set latch, send 0x34, wait for onNewData to detect 0x35 and signal.
-     * Called ONLY when btIoManager is active (during capture or stop temp before port close).
+     * Lê a temperatura em sessões BT — usa latch preenchido via onNewData.
+     * O btIoManager consome todos os bytes via onNewData, então winnixReadTemperature
+     * (polling de available()) não funciona — concorreria com o btIoManager pelo mesmo stream.
+     * Em vez disso: define o latch, envia 0x34, aguarda onNewData detectar 0x35 e sinalizar.
+     * Chamada SOMENTE com btIoManager ativo (durante captura ou na temperatura de encerramento).
      */
     private fun winnixReadTemperatureBt(port: ISerialPort): String {
         winnixTempResult = ""
@@ -1133,7 +1469,7 @@ class UHFReaderService : Service(), SensorEventListener {
             while (System.currentTimeMillis() < deadline) {
                 val n = try { port.read(buf, 200) } catch (_: Exception) { 0 }
                 for (i in 0 until n) collected.add(buf[i])
-                // Search for 0x35 response anywhere in collected bytes
+                // Procura resposta 0x35 em qualquer posição dos bytes coletados
                 val data = collected.toByteArray()
                 for (idx in 0 until data.size - 7) {
                     if (data[idx]   == 0xA5.toByte() &&
@@ -1187,6 +1523,67 @@ class UHFReaderService : Service(), SensorEventListener {
     // =========================================================================
     // Shared error handler
     // =========================================================================
+    /**
+     * Roda a cada WATCHDOG_CHECK_INTERVAL_MS, o tempo todo (mesmo sem
+     * capturar — só age quando isRunning=true). Detecta silêncio prolongado
+     * e distingue "sem tag por perto" (normal) de "conexão morta de verdade"
+     * através de uma sonda ativa, em vez de assumir o pior só pelo silêncio.
+     */
+    private fun watchdogTick() {
+        if (!isRunning.get()) return
+        val now     = System.currentTimeMillis()
+        val silence = now - lastDataReceivedAt
+
+        if (silence < WATCHDOG_SILENCE_THRESHOLD_MS) {
+            if (consecutiveFailedProbes > 0) {
+                Log.i(TAG, "WATCHDOG: dado voltou a chegar — só estava quieto (sem tag por perto), não precisa reconfigurar nada")
+            }
+            consecutiveFailedProbes = 0
+            return
+        }
+
+        // Silêncio prolongado — só manda a sonda de novo a cada
+        // WATCHDOG_PROBE_INTERVAL_MS (não a cada tick de 10s, senão martelaria
+        // o módulo). Enquanto o silêncio persistir até o próximo horário de
+        // sonda, isso já significa (por construção) que a sonda anterior não
+        // trouxe resposta — não precisa de uma máquina de estado separada pra
+        // isso, o próprio "silêncio ainda > threshold" já prova.
+        if (now - lastProbeSentAt < WATCHDOG_PROBE_INTERVAL_MS) return
+
+        val port = activePort
+        if (port == null) return  // sem porta ativa — outro caminho já cuida disso
+
+        lastProbeSentAt = now
+        consecutiveFailedProbes++
+        Log.w(TAG, "WATCHDOG: ${silence / 1000}s sem nenhum dado — mandando sonda (start_inventory), tentativa #$consecutiveFailedProbes")
+        try {
+            synchronized(this) { port.write(winnixBuildStartInventory(), 1000) }
+        } catch (e: Exception) {
+            Log.e(TAG, "WATCHDOG: falha ao mandar sonda: ${e.message}")
+        }
+
+        if (consecutiveFailedProbes >= WATCHDOG_MAX_FAILED_PROBES) {
+            Log.e(TAG, "WATCHDOG: sem resposta após $consecutiveFailedProbes sondas — conexão zumbi confirmada, forçando reconexão")
+            consecutiveFailedProbes = 0
+            forceReconnectDueToSilence()
+        }
+    }
+
+    /**
+     * Força o fechamento da porta ativa — isso faz a leitura bloqueada (presa
+     * esperando um dado que nunca chega) lançar IOException, disparando
+     * handleRunError() normalmente, que já sabe iniciar o loop de reconexão
+     * certo (BT ou USB). Não precisamos duplicar lógica de reconexão nenhuma
+     * — só destravar o que já existe.
+     */
+    private fun forceReconnectDueToSilence() {
+        try {
+            synchronized(this) { activePort?.close() }
+        } catch (e: Exception) {
+            Log.e(TAG, "WATCHDOG: erro ao forçar fechamento da porta: ${e.message}")
+        }
+    }
+
     private fun handleRunError(e: Exception) {
         Log.e(TAG, "Serial read error — device likely disconnected", e)
         if (!isRunning.compareAndSet(true, false)) return
@@ -1238,13 +1635,23 @@ class UHFReaderService : Service(), SensorEventListener {
 
                 if (!isPausedState.get() && !isRunning.get()) continue  // tentativa anterior ainda em andamento
 
-                Log.i(TAG, "USB_RECONNECT: attempt #$attempt — calling startCapture (same as Start button)")
-                startCapture(deviceName)
+                // try/catch aqui é essencial: sem isso, QUALQUER exceção não
+                // prevista em qualquer lugar dentro de startCapture() (GPS,
+                // WakeLock, I/O de arquivo, o que for) mata esse loop inteiro
+                // silenciosamente pra sempre — sem log, sem crash visível, só
+                // parando de tentar reconectar. Foi exatamente isso que
+                // aconteceu num teste real de 12h+ sem supervisão.
+                try {
+                    Log.i(TAG, "USB_RECONNECT: attempt #$attempt — calling startCapture (same as Start button)")
+                    startCapture(deviceName)
 
-                var waited = 0L
-                while (waited < USB_ATTEMPT_SETTLE_MS && !isRunning.get() && usbReconnectActive.get()) {
-                    try { Thread.sleep(USB_POLL_INTERVAL_MS) } catch (_: InterruptedException) { break }
-                    waited += USB_POLL_INTERVAL_MS
+                    var waited = 0L
+                    while (waited < USB_ATTEMPT_SETTLE_MS && !isRunning.get() && usbReconnectActive.get()) {
+                        try { Thread.sleep(USB_POLL_INTERVAL_MS) } catch (_: InterruptedException) { break }
+                        waited += USB_POLL_INTERVAL_MS
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "USB_RECONNECT: exceção na tentativa #$attempt — loop CONTINUA (não morre): ${e.message}", e)
                 }
             }
             Log.i(TAG, "USB_RECONNECT: loop exiting — isRunning=${isRunning.get()}")
@@ -1252,23 +1659,25 @@ class UHFReaderService : Service(), SensorEventListener {
     }
 
     /**
-     * Retry loop that periodically calls startCapture() with BT_DEVICE_NAME.
-     * Conditions to keep running:
-     *   - isPausedState == true  (not stopped by user)
-     *   - isRunning == false     (not already capturing)
-     * Stops automatically when:
-     *   - User clicks Stop → stopCapture() → isPausedState = false
-     *   - Reconnect succeeds → startCapture() → isRunning = true
+     * Loop de reconexão BT — chama startCapture() periodicamente com o nome do
+     * dispositivo da sessão ativa (activeDeviceName), que pode ser "Winnix_BT" ou
+     * "SPACEVIS_RFID_XXXX". Nunca usa a constante diretamente — o dispositivo já
+     * foi escolhido pelo usuário no início da sessão.
+     * Continua rodando enquanto:
+     *   - isPausedState == true  (não parado pelo usuário)
+     *   - isRunning == false     (ainda não capturando)
+     * Para automaticamente quando:
+     *   - Usuário clica Parar → stopCapture() → isPausedState = false
+     *   - Reconexão tem sucesso → startCapture() → isRunning = true
      *   - onDestroy() → btReconnectExecutor.shutdownNow()
      */
     private fun startBtReconnectLoop() {
         btReconnectExecutor?.shutdownNow()
         btReconnectExecutor = Executors.newSingleThreadExecutor()
-        // Dedicated flag — controls ONLY this loop's lifetime.
-        // Independent of isPausedState, which startCapture() flips during each attempt.
-        // This prevents the loop from exiting prematurely while a connection
-        // attempt is still in progress on configExecutor (BluetoothSocket.connect()
-        // can take 10-12s to time out on a powered-off device).
+        // Flag dedicada — controla SOMENTE o ciclo de vida deste loop.
+        // Independente de isPausedState, que startCapture() altera durante cada tentativa.
+        // Evita que o loop saia prematuramente enquanto uma tentativa ainda está em andamento
+        // no configExecutor (BluetoothSocket.connect() pode levar 10-12s para timeout).
         btReconnectActive.set(true)
         btReconnectExecutor?.submit {
             Log.i(TAG, "BT_RECONNECT: loop started, will retry every ${BT_RECONNECT_INTERVAL_MS}ms")
@@ -1283,34 +1692,37 @@ class UHFReaderService : Service(), SensorEventListener {
                     break
                 }
 
-                // Only call startCapture if no attempt is currently in flight.
-                // isPausedState is restored to true by startBtConnection's failure
-                // paths, but during the attempt itself it's false — we must NOT
-                // call startCapture again while one is already running, and we
-                // must NOT exit the loop just because isPausedState is momentarily false.
+                // Só chama startCapture se nenhuma tentativa estiver em andamento.
+                // isPausedState fica false durante a tentativa — não sair do loop por isso.
                 if (!isPausedState.get() && !isRunning.get()) {
                     Log.i(TAG, "BT_RECONNECT: previous attempt still in flight, skipping this cycle")
                     continue
                 }
 
                 Log.i(TAG, "BT_RECONNECT: attempt #$attempt — calling startCapture (same as Start button)")
-                startCapture(BT_DEVICE_NAME)
+                // try/catch aqui é essencial: sem isso, QUALQUER exceção não
+                // prevista dentro de startCapture() mata esse loop inteiro
+                // silenciosamente pra sempre — sem log, sem crash visível, só
+                // parando de tentar reconectar. Foi exatamente isso que
+                // aconteceu num teste real de 12h+ sem supervisão.
+                try {
+                    startCapture(activeDeviceName ?: BT_DEVICE_NAME)
 
-                // Poll in small increments instead of one fixed sleep.
-                // Exits AS SOON AS isRunning becomes true — no wasted waiting
-                // on the common case (fast reconnect). Still waits up to
-                // BT_ATTEMPT_SETTLE_MS total on the worst case (connect() timeout),
-                // so it never exits prematurely while an attempt is still in flight.
-                Log.i(TAG, "BT_RECONNECT: waiting for result (polling)...")
-                val settleDeadline = System.currentTimeMillis() + BT_ATTEMPT_SETTLE_MS
-                while (System.currentTimeMillis() < settleDeadline) {
-                    if (isRunning.get()) {
-                        Log.i(TAG, "BT_RECONNECT: reconnected early — exiting wait")
-                        break
+                    // Polling em pequenos incrementos — sai assim que isRunning se tornar true,
+                    // sem esperar o tempo máximo no caso comum (reconexão rápida).
+                    Log.i(TAG, "BT_RECONNECT: waiting for result (polling)...")
+                    val settleDeadline = System.currentTimeMillis() + BT_ATTEMPT_SETTLE_MS
+                    while (System.currentTimeMillis() < settleDeadline) {
+                        if (isRunning.get()) {
+                            Log.i(TAG, "BT_RECONNECT: reconnected early — exiting wait")
+                            break
+                        }
+                        try { Thread.sleep(BT_POLL_INTERVAL_MS) } catch (_: InterruptedException) { break }
                     }
-                    try { Thread.sleep(BT_POLL_INTERVAL_MS) } catch (_: InterruptedException) { break }
+                    Log.i(TAG, "BT_RECONNECT: after attempt #$attempt — isPaused=${isPausedState.get()} isRunning=${isRunning.get()}")
+                } catch (e: Exception) {
+                    Log.e(TAG, "BT_RECONNECT: exceção na tentativa #$attempt — loop CONTINUA (não morre): ${e.message}", e)
                 }
-                Log.i(TAG, "BT_RECONNECT: after attempt #$attempt — isPaused=${isPausedState.get()} isRunning=${isRunning.get()}")
             }
             Log.i(TAG, "BT_RECONNECT: loop ended after $attempt attempts (active=${btReconnectActive.get()} isRunning=${isRunning.get()})")
         }
@@ -1322,83 +1734,125 @@ class UHFReaderService : Service(), SensorEventListener {
     private fun startAutoSaveTimer() {
         autoSaveExecutor = Executors.newSingleThreadScheduledExecutor()
         rescheduleTimerJob()
+        scheduleFilterJobs()
     }
 
     /**
-     * (Re)schedules the time-based auto-save job starting from now.
-     * Called on initial start AND whenever a tag-count-triggered save happens,
-     * so the time counter resets — preventing a near-immediate duplicate
-     * save right after a count-triggered one.
+     * Agenda, no MESMO executor do auto-save (sem thread pool extra), os dois
+     * jobs periódicos do filtro: persistência em lote do estado da Camada 2
+     * (durabilidade contra SIGKILL, sempre ativa junto com a Camada 2 — ver
+     * TagFilterEngine) e o sweep que expira entradas vencidas da Camada 2.
+     * Reagendado a cada (re)conexão bem-sucedida, igual startAutoSaveTimer()
+     * já fazia com rescheduleTimerJob().
+     */
+    private fun scheduleFilterJobs() {
+        filterPersistJob?.cancel(false); filterPersistJob = null
+        filterSweepJob?.cancel(false); filterSweepJob = null
+        if (!filterEnabled || !filterL2Enabled) return
+
+        filterPersistJob = autoSaveExecutor?.scheduleWithFixedDelay(
+            { try { tagFilterEngine?.persistDirtyNow() } catch (e: Exception) { Log.e(TAG, "Filter persist error", e) } },
+            FILTER_PERSIST_INTERVAL_MS, FILTER_PERSIST_INTERVAL_MS, TimeUnit.MILLISECONDS
+        )
+        filterSweepJob = autoSaveExecutor?.scheduleWithFixedDelay(
+            { try { runFilterSweep() } catch (e: Exception) { Log.e(TAG, "Filter sweep error", e) } },
+            filterSweepIntervalMs, filterSweepIntervalMs, TimeUnit.MILLISECONDS
+        )
+    }
+
+    /** Camada 2: entradas expiradas viram tags normais de novo — gravadas na hora. */
+    private fun runFilterSweep() {
+        if (!isRunning.get()) return
+        val expired = tagFilterEngine?.sweepExpired() ?: emptyList()
+        if (expired.isEmpty()) return
+        Log.i(TAG, "Filter L2: ${expired.size} EPC(s) expiraram — gravando")
+        writeTagsNow(expired)
+    }
+
+    /**
+     * Ponto único de escrita: chamado a cada lote que chega (Jietong/Winnix) e a
+     * cada expiração da Camada 2 do filtro (runFilterSweep). Sem buffer em RAM —
+     * a tag vai para o autoSaveExecutor (thread única, mesma que já serializava
+     * o auto-save antigo) imediatamente, então uma morte de processo perde no
+     * máximo o lote que ainda não terminou de ir para o disco.
+     *
+     * autoSaveTagCount/tagsSinceLastSave continuam existindo, mas agora só
+     * decidem ROTAÇÃO de arquivo (modo NEW_FILE) — a durabilidade não depende
+     * mais deles.
+     */
+    private fun writeTagsNow(tags: List<TagRecord>) {
+        if (tags.isEmpty()) return
+        totalCount.addAndGet(tags.size)
+        autoSaveExecutor?.submit {
+            if (!CsvExporter.appendTags(tags)) Log.e(TAG, "Failed to write ${tags.size} tag(s)")
+        }
+        val sinceLast = tagsSinceLastSave.addAndGet(tags.size)
+        if (!filterForcesTimeOnlyRotation && sinceLast >= autoSaveTagCount) {
+            rescheduleTimerJob()
+            autoSaveExecutor?.submit { onAutoSaveTrigger() }
+        }
+    }
+
+    /**
+     * (Re)agenda o job de auto-save por tempo a partir de agora.
+     * Chamado na inicialização e a cada save disparado por contagem de tags,
+     * reiniciando o contador — evita um save duplicado logo após o save por contagem.
      */
     private fun rescheduleTimerJob() {
         autoSaveTimerJob?.cancel(false)
         autoSaveTimerJob = autoSaveExecutor?.scheduleWithFixedDelay(
-            { if (isRunning.get()) flushBufferToDisk() },
+            // Só dispara se algo novo chegou desde o último trigger — sem isso,
+            // um intervalo ocioso (antena sem leitura por horas) rotacionaria
+            // pra um arquivo vazio no modo NEW_FILE (bug já corrigido antes, ver
+            // CLAUDE.md #16/#17).
+            { if (isRunning.get() && tagsSinceLastSave.get() > 0) onAutoSaveTrigger() },
             autoSaveIntervalMin, autoSaveIntervalMin, TimeUnit.MINUTES
         )
     }
 
-    private fun stopAutoSaveTimer() {
+    /** Retorna o executor antigo (já em shutdown, ainda podendo ter tasks em voo) pra quem chama aguardar. */
+    private fun stopAutoSaveTimer(): ScheduledExecutorService? {
         autoSaveTimerJob?.cancel(false)
         autoSaveTimerJob = null
-        autoSaveExecutor?.shutdown()
+        filterPersistJob?.cancel(false)
+        filterPersistJob = null
+        filterSweepJob?.cancel(false)
+        filterSweepJob = null
+        val executor = autoSaveExecutor
         autoSaveExecutor = null
+        executor?.shutdown()
+        return executor
     }
 
-    private fun flushBufferToDisk() {
+    /**
+     * Disparado por tempo ou por contagem de tags (writeTagsNow). Já não carrega
+     * lote nenhum — os dados já estão no disco (ou a caminho, mesmo executor,
+     * FIFO). Aqui só troca de arquivo e atualiza a notificação/callback.
+     */
+    private fun onAutoSaveTrigger() {
         if (!isRunning.get()) return
-
-        val batch = mutableListOf<TagRecord>()
-        while (tagBuffer.isNotEmpty()) tagBuffer.poll()?.let { batch.add(it) }
-
-        // Req 4: skip if no new tags to save
-        if (batch.isEmpty()) {
-            Log.d(TAG, "Auto-save skipped — no new tags")
-            return
-        }
-
-        // Reset the per-save counter (Req 1: resets the other counter)
         tagsSinceLastSave.set(0)
 
         val ctx = appContext ?: return
+        val fileName = CsvExporter.finalizeSession(emptyList())
+        Log.i(TAG, "Auto-save (new file): $fileName")
+        val prefix = buildFileIdentifier(ctx, btDeviceName = if (activeIsBluetooth) activeDeviceName else null)
+        CsvExporter.startSession(ctx, prefix)
+        Log.i(TAG, "New session prepared: prefix=$prefix")
 
-        if (autoSaveMode == SettingsManager.AUTO_SAVE_MODE_NEW_FILE) {
-            // Req 2: new file mode — finalize current session and start a new one
-            val fileName = CsvExporter.finalizeSession(batch)
-            Log.i(TAG, "Auto-save (new file): $fileName — ${batch.size} tags")
-            // Start a new session for the next batch
-            val prefix   = if (activeAntennaType == SettingsManager.ANTENNA_TYPE_WINNIX) "winnix" else "jietong"
-            val newFile  = CsvExporter.startSession(ctx, prefix)
-            Log.i(TAG, "New session started: $newFile")
-            updateNotification("Capturando… (${totalCount.get()} tags)")
-            onAutoSaved?.invoke(totalCount.get())
-        } else {
-            // Req 2: append mode — default, existing behavior
-            val ok = CsvExporter.appendTags(batch)
-            if (ok) {
-                Log.i(TAG, "Auto-save (append): ${batch.size} tags, total: ${totalCount.get()}")
-                updateNotification("Capturando… (${totalCount.get()} tags)")
-                onAutoSaved?.invoke(totalCount.get())
-            } else {
-                Log.e(TAG, "Auto-save failed — reinserting ${batch.size} tags")
-                tagBuffer.addAll(batch)
-                tagsSinceLastSave.addAndGet(batch.size)  // restore counter on failure
-            }
-        }
+        updateNotification("Capturando… (${totalCount.get()} tags)")
+        onAutoSaved?.invoke(totalCount.get())
     }
 
-    private fun drainAndFinalize(winnixStopTemp: String = ""): String? {
-        val lastBatch = mutableListOf<TagRecord>()
-        while (tagBuffer.isNotEmpty()) tagBuffer.poll()?.let { lastBatch.add(it) }
-
-        // Req 4: if no tags at all this session, cancel — don't create empty CSV
-        if (totalCount.get() == 0 && lastBatch.isEmpty()) {
+    private fun drainAndFinalize(finalBatch: List<TagRecord> = emptyList(), winnixStopTemp: String = ""): String? {
+        // Nenhuma tag lida — cancela sem criar CSV vazio
+        if (totalCount.get() == 0) {
             Log.i(TAG, "Session cancelled — no tags read")
             CsvExporter.cancelSession()
             return null
         }
 
-        return CsvExporter.finalizeSession(lastBatch, winnixStopTemp)
+        return CsvExporter.finalizeSession(finalBatch, winnixStopTemp)
     }
 
     // =========================================================================
@@ -1436,20 +1890,22 @@ class UHFReaderService : Service(), SensorEventListener {
         const val ACTION_STOP       = "com.uhflogger.STOP"
         const val EXTRA_DEVICE_NAME = "device_name"
         const val BT_DEVICE_NAME    = "Winnix_BT"
+
+        /**
+         * Retorna true se o nome do dispositivo BT é aceito pelo app.
+         * "Winnix_BT" — legado (nome fixo de hardware antigo).
+         * "SPACEVIS_RFID_XXXX" — módulos novos: prefixo fixo + 4 chars hex do MAC.
+         */
+        fun isBtDeviceAllowed(name: String): Boolean =
+            name == BT_DEVICE_NAME ||
+            (name.startsWith("SPACEVIS_RFID_") && name.length == 18)
         private const val BT_RETRY_DELAY_MS       = 2000L  // delay before the single probe retry
         private const val BT_RECONNECT_INTERVAL_MS= 5000L  // retry interval when session is paused
-        // Must exceed worst case: BluetoothSocket.connect() timeout (~12s) is NOT
-        // bounded by our code — it's an Android system timeout we cannot control.
-        // 20s gives comfortable headroom above the ~12s connect() worst case.
-        // Worst case per startBtConnection now: 1 connect() attempt (~12s timeout
-        // when device out of range) + optionally 1 probe retry (~2.5s).
-        // No more nested connect() retries — the outer reconnect loop handles
-        // retrying entirely, every BT_RECONNECT_INTERVAL_MS.
-        // 12s + 2.5s + margin → 18s covers it comfortably.
+        // Deve superar o pior caso: timeout do BluetoothSocket.connect() (~12s) é um
+        // timeout do sistema Android, fora do nosso controle. Pior caso por tentativa:
+        // 1 connect() (~12s) + 1 retry de probe (~2.5s) = ~14.5s → 18s com margem.
         private const val BT_ATTEMPT_SETTLE_MS     = 18000L
-        // Polling interval while waiting for an attempt to settle.
-        // Small enough to react quickly when reconnect succeeds,
-        // large enough to not busy-loop.
+        // Intervalo de polling: pequeno o suficiente para reagir rápido, grande o suficiente para não ser busy-loop.
         private const val BT_POLL_INTERVAL_MS      = 500L
 
         // USB — abrir a porta é rápido (sem handshake de pareamento/timeout como
@@ -1458,14 +1914,52 @@ class UHFReaderService : Service(), SensorEventListener {
         private const val USB_ATTEMPT_SETTLE_MS      = 5000L
         private const val USB_POLL_INTERVAL_MS       = 300L
 
-        // GNSS — mesmas constantes que existiam na MainActivity
-        private const val GPS_UPDATE_INTERVAL_MS = 1000L
-        private const val GPS_UPDATE_MIN_METERS  = 1f
+        // GNSS — 500ms/0m: prioriza recência (trator lento, "andou 1m" descartava
+        // fixes válidos demais). O chip nunca entrega mais rápido do que consegue
+        // de verdade — isso é só o pedido máximo, não uma garantia.
+        private const val GPS_UPDATE_INTERVAL_MS = 500L
+        private const val GPS_UPDATE_MIN_METERS  = 0f
         private const val GPS_MAX_LOCATION_AGE_MS = 30_000L
         private const val GPS_MAX_ACCURACY_M      = 50f
+        // "Meio termo" acordado: aceita o fix mais novo mesmo se um pouco pior
+        // que o atual (nunca "congela" a posição por rejeição), mas rejeita se
+        // for MUITO pior (>3x) — o teto absoluto de 50m acima já barra o lixo
+        // total (galpão fechado etc), isso aqui só evita descartar degradação
+        // razoável de sinal em movimento.
+        private const val GPS_ACCURACY_DEGRADE_FACTOR = 3.0f
+        // Teto absoluto de acurácia aceito quando o fix entrante confirma via
+        // Doppler que estamos em movimento — segundo caminho de aceitação em
+        // isBetterLocation(), paralelo ao relativo. Evita o "fix-âncora" (fix
+        // muito bom obtido parado bloqueando updates degradados por multipath)
+        // sem abrir para fixes ruins (>30m ainda são rejeitados mesmo em movimento).
+        // Valor de partida conservador — ajustar para 35m se dados de campo
+        // mostrarem multipath de telhado metálico excedendo 30m com frequência.
+        private const val GPS_MOVING_ABSOLUTE_MAX_M = 30f
+
+        // Bearing híbrido — histerese pra não trocar de fonte a cada oscilação
+        // de velocidade perto do limiar (ex: reduzindo numa curva).
+        private const val BEARING_SPEED_HIGH_MS = 1.2f  // acima disso, passa a usar GNSS
+        private const val BEARING_SPEED_LOW_MS  = 0.8f  // abaixo disso, volta pra sensores
 
         // WakeLock renovado a cada 15 min — cobre captura de dias sem nunca
         // segurar um acquire() sem timeout.
         private const val WAKELOCK_RENEW_MS = 15 * 60 * 1000L
+
+        // Watchdog de silêncio — checa a cada 10s; considera "quieto" só
+        // depois de 30s sem nenhum byte (tempo o suficiente pra não confundir
+        // com um trecho normal do campo sem tag); manda a sonda no máximo a
+        // cada 30s (não martela o módulo); desiste e força reconexão só
+        // depois de 3 sondas seguidas sem resposta (~90s de silêncio
+        // confirmado mesmo perguntando ativamente).
+        private const val WATCHDOG_CHECK_INTERVAL_MS   = 10_000L
+        private const val WATCHDOG_SILENCE_THRESHOLD_MS = 30_000L
+        private const val WATCHDOG_PROBE_INTERVAL_MS    = 30_000L
+        private const val WATCHDOG_MAX_FAILED_PROBES    = 3
+
+        // Filtro — intervalo do batch write da Camada 2/3 (persistência do
+        // estado de consolidação em Room). Pior caso de perda num SIGKILL:
+        // as atualizações de RSSI ocorridas só nesta janela — nunca a
+        // entrada inteira, já que o batch anterior já está em disco.
+        private const val FILTER_PERSIST_INTERVAL_MS = 2_500L
     }
 }

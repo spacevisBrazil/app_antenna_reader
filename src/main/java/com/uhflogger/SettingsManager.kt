@@ -10,7 +10,6 @@ object SettingsManager {
     // Keys
     const val KEY_AUTO_SAVE_TAGS          = "auto_save_tags"
     const val KEY_AUTO_SAVE_MINUTES       = "auto_save_minutes"
-    const val KEY_AUTO_SAVE_MODE          = "auto_save_mode"
     const val KEY_LOCATION_MODE           = "location_mode"
     const val KEY_ANTENNA_TYPE            = "antenna_type"
     const val KEY_WINNIX_ANT_COUNT        = "winnix_ant_count"
@@ -23,6 +22,17 @@ object SettingsManager {
     // estava lendo ou parado quando voltar.
     const val KEY_WAS_CAPTURING           = "was_capturing"
     const val KEY_LAST_DEVICE_NAME        = "last_device_name"
+
+    // Filtro de tags. A camada 3 (persistência SIGKILL-safe) não tem chave
+    // própria — é automática sempre que a camada 2 está ativa, ver
+    // TagFilterEngine (não faz sentido o usuário desligar só a proteção
+    // contra perda de dados por crash, mantendo a consolidação ligada).
+    const val KEY_FILTER_ENABLED          = "filter_enabled"
+    const val KEY_FILTER_L1_ENABLED       = "filter_l1_enabled"
+    const val KEY_FILTER_L1_PATTERNS      = "filter_l1_patterns"
+    const val KEY_FILTER_L2_ENABLED       = "filter_l2_enabled"
+    const val KEY_FILTER_L2_WINDOW_MIN    = "filter_l2_window_min"
+    const val KEY_FILTER_L2_SWEEP_MIN     = "filter_l2_sweep_min"
 
     // Location mode values
     const val LOCATION_MODE_HYBRID        = "hybrid"
@@ -38,18 +48,27 @@ object SettingsManager {
     const val WINNIX_INV_MODE_ADAPTIVE    = 5   // Adaptive  — S0+S1, recommended default
 
     // Defaults
-    const val DEFAULT_AUTO_SAVE_TAGS         = 10_000
+    const val DEFAULT_AUTO_SAVE_TAGS         = 5_000
     const val DEFAULT_AUTO_SAVE_MINUTES      = 10
-    // Auto-save mode
-    const val AUTO_SAVE_MODE_APPEND          = 0  // append to current file (default)
-    const val AUTO_SAVE_MODE_NEW_FILE        = 1  // create new file each auto-save
-    const val DEFAULT_AUTO_SAVE_MODE         = AUTO_SAVE_MODE_APPEND
+    // Único modo de auto-save suportado: sempre abre um novo arquivo. Mantido
+    // como constante (não mais uma preferência configurável) porque o valor é
+    // enviado ao backend em DeviceIdentity.captureConfig().
+    const val AUTO_SAVE_MODE_NEW_FILE        = 1
     const val DEFAULT_LOCATION_MODE          = LOCATION_MODE_HYBRID
-    const val DEFAULT_ANTENNA_TYPE           = ANTENNA_TYPE_JIETONG
-    const val DEFAULT_WINNIX_ANT_COUNT       = 1
+    const val DEFAULT_ANTENNA_TYPE           = ANTENNA_TYPE_WINNIX
+    const val DEFAULT_WINNIX_ANT_COUNT       = 2
     const val DEFAULT_WINNIX_POWER_DBM       = 30
     const val DEFAULT_WINNIX_WORKING_MS      = 100
-    const val DEFAULT_WINNIX_INVENTORY_MODE  = WINNIX_INV_MODE_FAST
+    const val DEFAULT_WINNIX_INVENTORY_MODE  = WINNIX_INV_MODE_ADAPTIVE
+
+    // Filtro — ligado por padrão, com as camadas 1 e 2 ativas e a camada 1 já
+    // com os padrões de EPC conhecidos das antenas em uso.
+    const val DEFAULT_FILTER_ENABLED         = true
+    const val DEFAULT_FILTER_L1_ENABLED      = true
+    const val DEFAULT_FILTER_L1_PATTERNS     = "00001000000XXXXX,0000000000000000000XXXXX,00760000000XXXXX"
+    const val DEFAULT_FILTER_L2_ENABLED      = true
+    const val DEFAULT_FILTER_L2_WINDOW_MIN   = 30
+    const val DEFAULT_FILTER_L2_SWEEP_MIN    = 5
 
     private fun prefs(context: Context): SharedPreferences =
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -65,12 +84,6 @@ object SettingsManager {
 
     fun setAutoSaveMinutes(context: Context, value: Int) =
         prefs(context).edit().putInt(KEY_AUTO_SAVE_MINUTES, value).apply()
-
-    fun getAutoSaveMode(context: Context): Int =
-        prefs(context).getInt(KEY_AUTO_SAVE_MODE, DEFAULT_AUTO_SAVE_MODE)
-
-    fun setAutoSaveMode(context: Context, value: Int) =
-        prefs(context).edit().putInt(KEY_AUTO_SAVE_MODE, value).apply()
 
     fun getLocationMode(context: Context): String =
         prefs(context).getString(KEY_LOCATION_MODE, DEFAULT_LOCATION_MODE) ?: DEFAULT_LOCATION_MODE
@@ -134,4 +147,50 @@ object SettingsManager {
 
     fun getLastDeviceName(context: Context): String? =
         prefs(context).getString(KEY_LAST_DEVICE_NAME, null)
+
+    // -------------------------------------------------------------------
+    // Filtro de 3 camadas
+    // -------------------------------------------------------------------
+    fun isFilterEnabled(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_FILTER_ENABLED, DEFAULT_FILTER_ENABLED)
+
+    fun setFilterEnabled(context: Context, value: Boolean) =
+        prefs(context).edit().putBoolean(KEY_FILTER_ENABLED, value).apply()
+
+    fun isFilterL1Enabled(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_FILTER_L1_ENABLED, DEFAULT_FILTER_L1_ENABLED)
+
+    fun setFilterL1Enabled(context: Context, value: Boolean) =
+        prefs(context).edit().putBoolean(KEY_FILTER_L1_ENABLED, value).apply()
+
+    // Padrões separados por vírgula, ex.: "0000100000000XXX,0076000000004XXX".
+    // Posições com 'X' aceitam qualquer dígito hex; as demais precisam bater
+    // exatamente. Lista vazia = camada 1 não filtra nada (evita o risco de
+    // descartar tudo silenciosamente por falta de configuração).
+    fun getFilterL1Patterns(context: Context): String =
+        prefs(context).getString(KEY_FILTER_L1_PATTERNS, DEFAULT_FILTER_L1_PATTERNS) ?: DEFAULT_FILTER_L1_PATTERNS
+
+    fun setFilterL1Patterns(context: Context, value: String) =
+        prefs(context).edit().putString(KEY_FILTER_L1_PATTERNS, value).apply()
+
+    fun isFilterL2Enabled(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_FILTER_L2_ENABLED, DEFAULT_FILTER_L2_ENABLED)
+
+    fun setFilterL2Enabled(context: Context, value: Boolean) =
+        prefs(context).edit().putBoolean(KEY_FILTER_L2_ENABLED, value).apply()
+
+    fun getFilterL2WindowMin(context: Context): Int =
+        prefs(context).getInt(KEY_FILTER_L2_WINDOW_MIN, DEFAULT_FILTER_L2_WINDOW_MIN)
+
+    fun setFilterL2WindowMin(context: Context, value: Int) =
+        prefs(context).edit().putInt(KEY_FILTER_L2_WINDOW_MIN, value).apply()
+
+    // Intervalo do sweep periódico que expira entradas da camada 2. Precisa
+    // ser MENOR que a janela (validado em SettingsActivity) — senão entradas
+    // expiradas poderiam nunca ser detectadas antes da próxima rotação.
+    fun getFilterL2SweepMin(context: Context): Int =
+        prefs(context).getInt(KEY_FILTER_L2_SWEEP_MIN, DEFAULT_FILTER_L2_SWEEP_MIN)
+
+    fun setFilterL2SweepMin(context: Context, value: Int) =
+        prefs(context).edit().putInt(KEY_FILTER_L2_SWEEP_MIN, value).apply()
 }

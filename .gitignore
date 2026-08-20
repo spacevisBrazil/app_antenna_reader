@@ -1,1 +1,4 @@
 /build
+graphify-out/
+release/*.apk
+CLAUDE.md
