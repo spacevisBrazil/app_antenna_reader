@@ -25,6 +25,7 @@ class BackendSettingsActivity : AppCompatActivity() {
 
     private lateinit var etFarmId  : EditText
     private lateinit var farmBox   : LinearLayout
+    private lateinit var tvFarm    : TextView
     private lateinit var etCode    : EditText
     private lateinit var tvStatus  : TextView
     private lateinit var btnActivate: Button
@@ -56,6 +57,19 @@ class BackendSettingsActivity : AppCompatActivity() {
         // fazenda e o servidor a informa na ativação — mostrar o campo só cria
         // uma pergunta que a pessoa não tem como responder, e um jeito a mais de
         // errar. Só aparece se a resolução automática falhar (ver updateStatus).
+        // Fazenda de trabalho — mesmo padrão do app de campo (FarmSelectorRow):
+        // mostra o NOME, e só vira botão quando há mais de uma pra escolher. Com
+        // uma fazenda só, um seletor seria um toque a mais que não decide nada.
+        root.addView(label("Fazenda"))
+        tvFarm = TextView(this).apply {
+            textSize = 16f
+            setTextColor(0xFF111111.toInt())
+            setPadding(dp(14), dp(14), dp(14), dp(14))
+            setBackgroundColor(0xFFFFFFFF.toInt())
+            setOnClickListener { abrirSeletorDeFazenda() }
+        }
+        root.addView(tvFarm)
+
         farmBox = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
@@ -109,7 +123,54 @@ class BackendSettingsActivity : AppCompatActivity() {
         // 5h depois de ativar em todo aparelho onde ninguém os preencheu.
 
         updateStatus()
+        atualizarFazenda()
         aplicarLinkDeAtivacao(intent)
+    }
+
+    /**
+     * Redesenha a linha da fazenda e busca a lista no servidor.
+     *
+     * A busca é best-effort e roda fora da UI thread: sem rede, a lista salva no
+     * último bootstrap continua valendo e o seletor abre do mesmo jeito — que é o
+     * ponto de guardá-la em disco. Com rede, pega fazenda que a conta-device
+     * ganhou depois da ativação, e corrige nome que mudou no cadastro.
+     */
+    private fun atualizarFazenda() {
+        pintarFazenda()
+        if (BackendSettings.getAccessToken(this).isEmpty()) return
+        runCatching {
+            io.submit {
+                val token = runCatching { DeviceAuthManager.validAccessToken(this) }.getOrNull()
+                if (token != null) runCatching { DeviceAuthManager.fetchFarms(this, token) }
+                runOnUiThread { if (!isFinishing && !isDestroyed) pintarFazenda() }
+            }
+        }
+    }
+
+    private fun pintarFazenda() {
+        val id    = BackendSettings.getFarmId(this)
+        val nome  = BackendSettings.getFarmName(this)
+        val todas = BackendSettings.getFarms(this)
+        val podeTrocar = todas.size >= 2
+
+        tvFarm.text = when {
+            id <= 0            -> "Nenhuma fazenda selecionada"
+            nome.isNotEmpty()  -> if (podeTrocar) "$nome  ›" else nome
+            else               -> "Fazenda $id"
+        }
+        tvFarm.setTextColor(if (id > 0) 0xFF111111.toInt() else 0xFF888888.toInt())
+        // Só é clicável quando há escolha de verdade a fazer.
+        tvFarm.isClickable = podeTrocar
+        tvFarm.isEnabled   = podeTrocar
+    }
+
+    private fun abrirSeletorDeFazenda() {
+        val todas = BackendSettings.getFarms(this)
+        if (todas.size < 2) return
+        escolherFazenda(
+            todas.map { (id, nome) -> DeviceAuthManager.Farm(id, nome) },
+            cancelavel = true,
+        )
     }
 
     /**
@@ -220,6 +281,9 @@ class BackendSettingsActivity : AppCompatActivity() {
                     onFailure = { toast(it.message ?: "Falha na ativação") },
                 )
                 updateStatus()
+                // A ativação acabou de trazer a lista de fazendas do bootstrap;
+                // a linha da fazenda tem que refletir isso na hora.
+                atualizarFazenda()
             }
         }
     }
@@ -246,19 +310,44 @@ class BackendSettingsActivity : AppCompatActivity() {
      * em que fazenda está, não o id dela no banco. Mesma regra do app de campo,
      * que só decide sozinho quando existe uma única fazenda.
      */
-    private fun escolherFazenda(opcoes: List<DeviceAuthManager.Farm>) {
+    private fun escolherFazenda(
+        opcoes: List<DeviceAuthManager.Farm>,
+        // Na ATIVAÇÃO não há como desistir: sem fazenda o envio não sai do lugar
+        // e a tela não teria como voltar a perguntar. Aberto pelo seletor, com uma
+        // fazenda já escolhida, fechar sem trocar é uma saída legítima.
+        cancelavel: Boolean = false,
+    ) {
         val nomes = opcoes.map { it.name }.toTypedArray()
         androidx.appcompat.app.AlertDialog.Builder(this)
             .setTitle("Qual é a fazenda deste aparelho?")
-            .setCancelable(false)
+            .setCancelable(cancelavel)
             .setItems(nomes) { _, i ->
                 val f = opcoes[i]
-                BackendSettings.setFarmId(this, f.id)
+                BackendSettings.setFarm(this, f.id, f.name)
                 etFarmId.setText(f.id.toString())
                 toast("Fazenda: ${f.name}")
+                pintarFazenda()
+                // Arquivo pendente NÃO muda de fazenda junto: cada um carrega a
+                // fazenda em que foi capturado (BackendUploadEntry.farmId). Dizer
+                // isso aqui evita a conclusão errada de que trocar a fazenda
+                // "corrige" o destino do que ainda está na fila.
+                avisarPendentesDaFazendaAnterior()
                 updateStatus()
             }
             .show()
+    }
+
+    private fun avisarPendentesDaFazendaAnterior() {
+        runCatching {
+            io.submit {
+                val pendentes = runCatching { BackendUploadStore.openCount(this) }.getOrNull() ?: 0
+                if (pendentes > 0) runOnUiThread {
+                    if (!isFinishing && !isDestroyed) {
+                        toast("$pendentes arquivo(s) pendente(s) seguem indo para a fazenda anterior")
+                    }
+                }
+            }
+        }
     }
 
     /** Garante FileObserver + agenda periódica mesmo sem conta Google no aparelho. */

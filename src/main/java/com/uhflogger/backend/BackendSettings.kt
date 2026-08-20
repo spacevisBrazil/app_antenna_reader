@@ -2,6 +2,8 @@ package com.uhflogger.backend
 
 import android.content.Context
 import android.content.SharedPreferences
+import org.json.JSONArray
+import org.json.JSONObject
 
 /**
  * Configuração e credenciais do envio ao backend SpaceVis.
@@ -41,6 +43,8 @@ object BackendSettings {
     private const val KEY_REFRESH_TOKEN = "refresh_token"
     private const val KEY_EXPIRES_AT    = "expires_at"
     private const val KEY_DEVICE_EMAIL  = "device_email"
+    private const val KEY_FARM_NAME     = "farm_name"
+    private const val KEY_FARMS         = "farms"
 
     private fun prefs(context: Context): SharedPreferences =
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -93,6 +97,54 @@ object BackendSettings {
     fun setFarmId(context: Context, value: Int) =
         prefs(context).edit().putInt(KEY_FARM_ID, value).apply()
 
+    /**
+     * Nome da fazenda de trabalho — o que a tela mostra.
+     *
+     * O id existe pro protocolo (header `farmid`); o nome existe pra pessoa. Uma
+     * tela que só diz "Fazenda 85" não permite conferir nada: quem está com o
+     * aparelho na mão sabe que está na Santa Martha, não que ela é a 85.
+     */
+    fun getFarmName(context: Context): String =
+        prefs(context).getString(KEY_FARM_NAME, "").orEmpty()
+
+    /** Grava id e nome juntos — os dois sempre descrevem a MESMA fazenda. */
+    fun setFarm(context: Context, id: Int, name: String) {
+        prefs(context).edit()
+            .putInt(KEY_FARM_ID, id)
+            .putString(KEY_FARM_NAME, name)
+            .apply()
+    }
+
+    /**
+     * Fazendas a que este aparelho tem acesso, como o servidor as devolveu no
+     * último bootstrap.
+     *
+     * Guardada em disco de propósito: o seletor precisa abrir com a lista mesmo
+     * sem rede, e em fazenda o sinal é intermitente. Uma lista que só existisse
+     * em memória deixaria a troca de fazenda impossível justamente onde ela é
+     * necessária.
+     */
+    fun getFarms(context: Context): List<Pair<Int, String>> {
+        val raw = prefs(context).getString(KEY_FARMS, "").orEmpty()
+        if (raw.isEmpty()) return emptyList()
+        return try {
+            val arr = JSONArray(raw)
+            (0 until arr.length()).mapNotNull { i ->
+                val o = arr.optJSONObject(i) ?: return@mapNotNull null
+                val id = o.optInt("id", 0)
+                if (id <= 0) null else id to o.optString("name").ifEmpty { "Fazenda $id" }
+            }
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    fun setFarms(context: Context, farms: List<Pair<Int, String>>) {
+        val arr = JSONArray()
+        farms.forEach { (id, name) -> arr.put(JSONObject().put("id", id).put("name", name)) }
+        prefs(context).edit().putString(KEY_FARMS, arr.toString()).apply()
+    }
+
     // ── Sessão (ativação por chave — ADR 0002) ────────────────────────────────
 
     fun getAccessToken(context: Context): String =
@@ -134,6 +186,10 @@ object BackendSettings {
             .remove(KEY_REFRESH_TOKEN)
             .remove(KEY_EXPIRES_AT)
             .remove(KEY_DEVICE_EMAIL)
+            // A lista de fazendas pertence à SESSÃO: ela veio do bootstrap
+            // daquela conta-device. Mantê-la depois de a sessão cair ofereceria
+            // ao operador fazendas que a próxima chave pode nem alcançar.
+            .remove(KEY_FARMS)
             .commit()
     }
 

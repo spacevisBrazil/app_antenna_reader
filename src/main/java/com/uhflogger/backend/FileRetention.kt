@@ -51,7 +51,8 @@ object FileRetention {
         // Cria a linha se o worker do backend ainda nem viu este arquivo —
         // senão a marcação se perderia e o arquivo ficaria preso pra sempre.
         BackendUploadStore.ensure(
-            context, file.absolutePath, CsvReadingParser.captureClientId(file.name)
+            context, file.absolutePath, CsvReadingParser.captureClientId(file.name),
+            BackendSettings.getFarmId(context),
         )
         BackendUploadStore.markDriveDone(context, file.absolutePath)
 
