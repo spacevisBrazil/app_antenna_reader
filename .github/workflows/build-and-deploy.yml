@@ -21,7 +21,8 @@ env:
 
 jobs:
   build-prd:
-    runs-on: ubuntu-latest
+    # Imagem fixa: a migração do ubuntu-latest para o 26 muda o SDK pré-instalado.
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       id-token: write # Workload Identity → GCP, sem chave JSON
@@ -59,11 +60,16 @@ jobs:
       - name: Verify signature and read version
         id: apk
         run: |
+          # pipefail: sem ele um apksigner quebrado vira SHA-1 vazio, sem pista.
+          set -euo pipefail
           BT="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
+          echo "build-tools: $BT"
+          ls -l build/outputs/apk/prd/release/
           APK=build/outputs/apk/prd/release/uhflogger-prd-release.apk
 
-          SHA1=$("$BT/apksigner" verify --print-certs "$APK" \
-            | sed -n 's/^Signer #1 certificate SHA-1 digest: //p')
+          CERTS=$("$BT/apksigner" verify --print-certs "$APK")
+          echo "$CERTS"
+          SHA1=$(echo "$CERTS" | sed -n 's/^Signer #1 certificate SHA-1 digest: //p')
           if [ "$SHA1" != "$EXPECTED_CERT_SHA1" ]; then
             echo "::error::APK assinado com certificado inesperado: '$SHA1'"
             exit 1
