@@ -1,0 +1,118 @@
+name: Build & Deploy
+
+# Todo merge na main gera um APK de PRODUÇÃO assinado e o publica no bucket
+# privado. O ambiente vem do flavor `prd` (URL compilada no build.gradle) — não
+# há variável de ambiente para escolher servidor, nem aqui nem no aparelho.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  BUCKET: gs://spacevis-uhflogger-releases
+  # SHA-1 do certificado de release. Se o APK sair assinado com outra chave, o
+  # job falha em vez de publicar algo que não instala por cima dos aparelhos
+  # em campo (e que quebraria o login do Drive).
+  EXPECTED_CERT_SHA1: f7e872f607e41959bbcd10aafded7a36a38c12e8
+
+jobs:
+  build-prd:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # Workload Identity → GCP, sem chave JSON
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Restore keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.UHFLOGGER_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::error::Secret UHFLOGGER_KEYSTORE_BASE64 ausente — o APK sairia unsigned."
+            exit 1
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/uhflogger-release.jks"
+          echo "UHFLOGGER_STORE_FILE=$RUNNER_TEMP/uhflogger-release.jks" >> "$GITHUB_ENV"
+
+      # versionCode/versionName saem do GITHUB_RUN_NUMBER (ver build.gradle):
+      # cada build é instalável por cima do anterior sem bump manual.
+      - name: Test + build (prdRelease)
+        env:
+          UHFLOGGER_STORE_PASSWORD: ${{ secrets.UHFLOGGER_STORE_PASSWORD }}
+          UHFLOGGER_KEY_ALIAS: uhflogger
+          UHFLOGGER_KEY_PASSWORD: ${{ secrets.UHFLOGGER_KEY_PASSWORD }}
+        run: ./gradlew testPrdReleaseUnitTest assemblePrdRelease
+
+      - name: Verify signature and read version
+        id: apk
+        run: |
+          BT="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
+          APK=build/outputs/apk/prd/release/uhflogger-prd-release.apk
+
+          SHA1=$("$BT/apksigner" verify --print-certs "$APK" \
+            | sed -n 's/^Signer #1 certificate SHA-1 digest: //p')
+          if [ "$SHA1" != "$EXPECTED_CERT_SHA1" ]; then
+            echo "::error::APK assinado com certificado inesperado: '$SHA1'"
+            exit 1
+          fi
+
+          VERSION=$("$BT/aapt2" dump badging "$APK" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p")
+          NAME="uhflogger-${VERSION}-prd.apk"
+          cp "$APK" "$NAME"
+          sha256sum "$NAME" > "$NAME.sha256"
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Cleanup keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/uhflogger-release.jks"
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/236966659537/locations/global/workloadIdentityPools/github/providers/spacevisbrazil
+          service_account: uhflogger-ci@stocci-farm-prod.iam.gserviceaccount.com
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      # Uma cópia versionada (histórico, rollback) e uma `latest` com nome fixo
+      # para quem só quer "o APK de produção atual".
+      - name: Upload to bucket
+        run: |
+          NAME="${{ steps.apk.outputs.name }}"
+          gcloud storage cp "$NAME" "$NAME.sha256" "$BUCKET/prd/"
+          gcloud storage cp "$NAME" "$BUCKET/prd/uhflogger-prd-latest.apk"
+
+      - name: Summary
+        run: |
+          NAME="${{ steps.apk.outputs.name }}"
+          {
+            echo "### APK de produção ${{ steps.apk.outputs.version }}"
+            echo ""
+            echo "- Versionado: \`$BUCKET/prd/$NAME\`"
+            echo "- Último: \`$BUCKET/prd/uhflogger-prd-latest.apk\`"
+            echo "- [Abrir no Console](https://console.cloud.google.com/storage/browser/${BUCKET#gs://}/prd?project=stocci-farm-prod)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Notify Slack
+        if: ${{ vars.SLACK_ENABLED == 'true' }}
+        uses: slackapi/slack-github-action@v2
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": "UHF Logger — APK PRODUÇÃO ${{ steps.apk.outputs.version }}\n${{ env.BUCKET }}/prd/${{ steps.apk.outputs.name }}\nLink: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }

@@ -9,6 +9,7 @@ import java.io.File
 import java.io.FileWriter
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import kotlin.io.path.createTempDirectory
 
 /**
  * Simulação de bancada (não depende de Android/Gradle-instrumentado) do
@@ -174,7 +175,7 @@ class ProposedAutoSaveSimulationTest {
     // ------------------------------------------------------------------
     @Test
     fun `filtro desligado - alto volume, kill simulado perde no maximo 1 tag`() {
-        val folder = createTempDir()
+        val folder = createTempDirectory().toFile()
         val svc = SimService(folder, SimFilterEngine(l2Enabled = false, l2WindowMs = 0), "APPEND")
 
         // Simula rajada: 500 lotes pequenos chegando rápido, como a serial entregaria.
@@ -201,7 +202,7 @@ class ProposedAutoSaveSimulationTest {
 
     @Test
     fun `filtro camada 2 ativo - consolida por melhor RSSI e so libera apos a janela`() {
-        val folder = createTempDir()
+        val folder = createTempDirectory().toFile()
         val windowMs = 1000L
         val filter = SimFilterEngine(l2Enabled = true, l2WindowMs = windowMs)
         val svc = SimService(folder, filter, "APPEND")
@@ -231,7 +232,7 @@ class ProposedAutoSaveSimulationTest {
 
     @Test
     fun `rotacao por gatilho nao perde nem duplica tags entre arquivos`() {
-        val folder = createTempDir()
+        val folder = createTempDirectory().toFile()
         val svc = SimService(folder, SimFilterEngine(l2Enabled = false, l2WindowMs = 0), "NEW_FILE")
 
         svc.onTagsArrived(listOf(tag("A", -40, 1), tag("B", -40, 2)), now = 0)
@@ -249,7 +250,7 @@ class ProposedAutoSaveSimulationTest {
 
     @Test
     fun `temperatura de encerramento Winnix ainda e aplicada corretamente na ultima linha`() {
-        val folder = createTempDir()
+        val folder = createTempDirectory().toFile()
         val svc = SimService(folder, SimFilterEngine(l2Enabled = false, l2WindowMs = 0), "APPEND")
 
         svc.onTagsArrived(listOf(tag("A", -40, 1), tag("B", -40, 2), tag("C", -40, 3)), now = 0)

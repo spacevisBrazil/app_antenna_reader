@@ -11,6 +11,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.io.path.createTempDirectory
 
 /**
  * Simula o design REALMENTE implementado em UHFReaderService.kt após a
@@ -175,7 +176,7 @@ class RealDesignAdversarialTest {
 
     @Test
     fun `stop imediatamente apos start com zero tags nao cria CSV`() {
-        val folder = createTempDir()
+        val folder = createTempDirectory().toFile()
         val svc = SimService(folder, "APPEND")
         svc.startCapture()
 
@@ -193,7 +194,7 @@ class RealDesignAdversarialTest {
 
     @Test
     fun `start-stop rapido em sequencia nao perde nem duplica tags`() {
-        val folder = createTempDir()
+        val folder = createTempDirectory().toFile()
         val svc = SimService(folder, "APPEND")
         svc.startCapture()
 
@@ -215,7 +216,7 @@ class RealDesignAdversarialTest {
 
     @Test
     fun `rotacao por contagem exatamente no limiar nao perde tag do arquivo seguinte`() {
-        val folder = createTempDir()
+        val folder = createTempDirectory().toFile()
         val svc = SimService(folder, "NEW_FILE", autoSaveTagCount = 3)
         svc.startCapture()
 
@@ -238,7 +239,7 @@ class RealDesignAdversarialTest {
 
     @Test
     fun `saveAfterError com tags pendentes na Camada 2 nao perde nada`() {
-        val folder = createTempDir()
+        val folder = createTempDirectory().toFile()
         val svc = SimService(folder, "APPEND")
         svc.startCapture()
         svc.writeTagsNow(listOf(tag("A", seq = 1)))
@@ -259,7 +260,7 @@ class RealDesignAdversarialTest {
 
     @Test
     fun `tag chegando apos stop nao trava nem derruba o service - apenas conta como falha`() {
-        val folder = createTempDir()
+        val folder = createTempDirectory().toFile()
         val svc = SimService(folder, "APPEND")
         svc.startCapture()
         svc.writeTagsNow(listOf(tag("A", seq = 1)))
@@ -278,7 +279,7 @@ class RealDesignAdversarialTest {
 
     @Test
     fun `stop duplo - segunda chamada nao duplica finalizacao nem lanca excecao`() {
-        val folder = createTempDir()
+        val folder = createTempDirectory().toFile()
         val svc = SimService(folder, "APPEND")
         svc.startCapture()
         svc.writeTagsNow(listOf(tag("A", seq = 1)))
@@ -299,7 +300,7 @@ class RealDesignAdversarialTest {
 
     @Test
     fun `alto volume intercalado com rotacoes mantem contagem exata sem duplicar`() {
-        val folder = createTempDir()
+        val folder = createTempDirectory().toFile()
         val svc = SimService(folder, "NEW_FILE", autoSaveTagCount = 10)
         svc.startCapture()
 
@@ -323,7 +324,7 @@ class RealDesignAdversarialTest {
 
     @Test
     fun `timer de auto-save disparando sem tags novas nao rotaciona para arquivo vazio`() {
-        val folder = createTempDir()
+        val folder = createTempDirectory().toFile()
         val svc = SimService(folder, "NEW_FILE", autoSaveTagCount = 1000)
         svc.startCapture()
 
