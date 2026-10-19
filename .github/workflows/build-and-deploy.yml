@@ -46,6 +46,7 @@ jobs:
           echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/uhflogger-release.jks"
           echo "UHFLOGGER_STORE_FILE=$RUNNER_TEMP/uhflogger-release.jks" >> "$GITHUB_ENV"
 
+      # Testes no prdDebug: o AGP 9 só gera unit test para o build type debug.
       # versionCode/versionName saem do GITHUB_RUN_NUMBER (ver build.gradle):
       # cada build é instalável por cima do anterior sem bump manual.
       - name: Test + build (prdRelease)
@@ -53,7 +54,7 @@ jobs:
           UHFLOGGER_STORE_PASSWORD: ${{ secrets.UHFLOGGER_STORE_PASSWORD }}
           UHFLOGGER_KEY_ALIAS: uhflogger
           UHFLOGGER_KEY_PASSWORD: ${{ secrets.UHFLOGGER_KEY_PASSWORD }}
-        run: ./gradlew testPrdReleaseUnitTest assemblePrdRelease
+        run: ./gradlew testPrdDebugUnitTest assemblePrdRelease
 
       - name: Verify signature and read version
         id: apk
