@@ -21,13 +21,37 @@ nenhuma: trocar a Build Variant é a única forma de mudar para onde os dados v�
 > O `applicationId` é o mesmo nos dois flavors (o OAuth do Drive é atrelado a
 > package + SHA-1). **Um app por vez por aparelho** — desinstale o outro antes.
 
+## APK de produção (CI)
+
+**Todo merge na `main` gera um APK de produção assinado**, sem passo manual
+(`.github/workflows/build-and-deploy.yml`). Ele vai para o bucket privado:
+
+```
+gs://spacevis-uhflogger-releases/prd/uhflogger-1.4.0-b<N>-prd.apk   # versionado
+gs://spacevis-uhflogger-releases/prd/uhflogger-prd-latest.apk       # último
+```
+
+```bash
+gcloud storage cp gs://spacevis-uhflogger-releases/prd/uhflogger-prd-latest.apk .
+```
+
+- O ambiente é o flavor `prd`: não há variável de ambiente para configurar.
+- `versionCode` = `100 + GITHUB_RUN_NUMBER`: cada build instala por cima do
+  anterior, sem bump manual. O `versionName` ganha o sufixo `-b<N>`.
+- O job falha se o APK sair com certificado diferente do esperado.
+- PR para a `main` roda testes + `assembleHmlDebug` (`ci.yml`).
+
+Secrets do repo: `UHFLOGGER_KEYSTORE_BASE64`, `UHFLOGGER_STORE_PASSWORD`,
+`UHFLOGGER_KEY_PASSWORD`. A autenticação no GCP é por Workload Identity
+(pool `github` em `stocci-farm-prod`, SA `uhflogger-ci`), sem chave JSON.
+
 ## Buildar para testar
 
 Use as variantes **`Debug`**: não precisam de keystore e instalam por cima da
 versão anterior, preservando a fila local de envio.
 
 1. `git checkout main && git pull`
-2. Abra no Android Studio e aguarde o Gradle Sync
+2. Abra a raiz do repo no Android Studio (é um projeto Gradle completo) e aguarde o Gradle Sync — ou rode `./gradlew assemblePrdDebug`
 3. `View → Tool Windows → Build Variants` → escolha `prdDebug` ou `hmlDebug`
 4. Clique em ▶ Run (instala direto no aparelho)
 
@@ -60,7 +84,7 @@ no aparelho).
 4. Build Variant → `prdRelease` → `Build → Build Bundle(s)/APK(s) → Build APK(s)`
 5. Confirme a assinatura:
    ```bash
-   apksigner verify --print-certs build/outputs/apk/prd/release/app-prd-release.apk
+   apksigner verify --print-certs build/outputs/apk/prd/release/uhflogger-prd-release.apk
    ```
 
 ⚠️ A assinatura muda de debug para release, então **não dá para atualizar por

@@ -8,3 +8,9 @@ CLAUDE.md
 keystore.properties
 *.jks
 *.keystore
+
+# Gradle / Android Studio
+.gradle/
+local.properties
+.idea/
+*.iml

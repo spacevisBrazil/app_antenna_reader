@@ -1,3 +1,15 @@
+// O repo é um projeto Gradle de módulo único: este arquivo é a raiz e o app ao
+// mesmo tempo. Antes ele só existia como módulo `app` dentro de um projeto do
+// Android Studio que nunca foi versionado — o que impedia buildar em CI.
+//
+// Kotlin fixado aqui porque o AGP 9 compila Kotlin sozinho (sem plugin
+// kotlin-android) e, sem o pin, usaria a versão que ele embarca.
+buildscript {
+    dependencies {
+        classpath libs.kotlin.gradle.plugin
+    }
+}
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.ksp)
@@ -54,8 +66,13 @@ android {
         applicationId "com.uhflogger"
         minSdk 26
         targetSdk 34
-        versionCode 14
-        versionName "1.4.0"
+        // No CI cada build ganha um versionCode maior que o anterior, sem bump
+        // manual — o Android recusa instalar por cima de versionCode menor. O
+        // offset 100 deixa o primeiro build de CI acima do 14 já em campo.
+        // Local continua 14: build de máquina não é para distribuir.
+        def ciBuildNumber = System.getenv('GITHUB_RUN_NUMBER')?.toInteger()
+        versionCode ciBuildNumber ? 100 + ciBuildNumber : 14
+        versionName "1.4.0" + (ciBuildNumber ? "-b${ciBuildNumber}" : "")
     }
 
     signingConfigs {
