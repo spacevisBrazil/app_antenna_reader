@@ -64,6 +64,15 @@ if [ -z "$VERSION_ID" ]; then
   echo "Versão criada: id $VERSION_ID"
 else
   echo "Versão já existia: id $VERSION_ID"
+  # Religar uma versão existente desliga a atual da config (o Headwind deixa
+  # uma só com action=1). Num "Re-run" de build antigo isso seria downgrade
+  # nos aparelhos — então só segue se esta ainda for a mais nova do app.
+  NEWEST=$(api GET "/rest/private/applications/$HMDM_APP_ID/versions" \
+    | json 'print(max(v["versionCode"] for v in d["data"]))')
+  if [ "$VERSION_CODE" -lt "$NEWEST" ]; then
+    echo "::warning::$VERSION ($VERSION_CODE) é mais antiga que a versão $NEWEST já publicada — não religo para não fazer downgrade."
+    exit 0
+  fi
 fi
 
 # Liga a versão SÓ à configuração alvo. notify=true dispara o push para os
