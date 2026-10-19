@@ -104,6 +104,20 @@ jobs:
           gcloud storage cp "$NAME" "$NAME.sha256" "$BUCKET/prd/"
           gcloud storage cp "$NAME" "$BUCKET/prd/uhflogger-prd-latest.apk"
 
+      # Atualiza os aparelhos: sobe o APK no Headwind (self-hosted) e liga a
+      # versão nova à config `uhf-logger`. Os aparelhos recebem push e instalam
+      # sozinhos, respeitando a janela de atualização da config. Desligado até
+      # existir o usuário de CI no Headwind (vars.HMDM_ENABLED).
+      - name: Deploy to MDM (Headwind)
+        if: ${{ vars.HMDM_ENABLED == 'true' }}
+        env:
+          HMDM_URL: ${{ vars.HMDM_URL }}
+          HMDM_APP_ID: ${{ vars.HMDM_APP_ID }}
+          HMDM_CONFIG_ID: ${{ vars.HMDM_CONFIG_ID }}
+          HMDM_LOGIN: ${{ secrets.HMDM_LOGIN }}
+          HMDM_PASSWORD: ${{ secrets.HMDM_PASSWORD }}
+        run: scripts/hmdm-deploy.sh "${{ steps.apk.outputs.name }}"
+
       - name: Summary
         run: |
           NAME="${{ steps.apk.outputs.name }}"
