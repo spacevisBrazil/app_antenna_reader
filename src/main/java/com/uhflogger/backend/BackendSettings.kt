@@ -43,6 +43,9 @@ object BackendSettings {
     private const val KEY_REFRESH_TOKEN = "refresh_token"
     private const val KEY_EXPIRES_AT    = "expires_at"
     private const val KEY_DEVICE_EMAIL  = "device_email"
+    // Segredo do aparelho (ativação por chave). Com ele o aparelho pega sessão
+    // nova sozinho quando a sessão offline morre — ver DeviceAuthManager.reauth.
+    private const val KEY_DEVICE_SECRET = "device_secret"
     private const val KEY_FARM_NAME     = "farm_name"
     private const val KEY_FARMS         = "farms"
 
@@ -159,6 +162,16 @@ object BackendSettings {
     fun getDeviceEmail(context: Context): String =
         prefs(context).getString(KEY_DEVICE_EMAIL, "").orEmpty()
 
+    fun getDeviceSecret(context: Context): String =
+        prefs(context).getString(KEY_DEVICE_SECRET, "").orEmpty()
+
+    /** `commit()` pelo mesmo motivo do saveSession: perder isto é perder a volta. */
+    fun saveDeviceSecret(context: Context, secret: String) {
+        prefs(context).edit().putString(KEY_DEVICE_SECRET, secret).commit()
+    }
+
+    fun hasDeviceSecret(context: Context): Boolean = getDeviceSecret(context).isNotEmpty()
+
     /**
      * Grava a sessão com `commit()` (síncrono) de propósito: o mesmo motivo do
      * `SettingsManager.setCaptureState` — acontece raramente e um SIGKILL logo
@@ -186,6 +199,9 @@ object BackendSettings {
             .remove(KEY_REFRESH_TOKEN)
             .remove(KEY_EXPIRES_AT)
             .remove(KEY_DEVICE_EMAIL)
+            // Só se limpa a sessão por corte DEFINITIVO (revogado/excluído) ou
+            // reativação manual — o segredo não serve mais nesses casos.
+            .remove(KEY_DEVICE_SECRET)
             // A lista de fazendas pertence à SESSÃO: ela veio do bootstrap
             // daquela conta-device. Mantê-la depois de a sessão cair ofereceria
             // ao operador fazendas que a próxima chave pode nem alcançar.

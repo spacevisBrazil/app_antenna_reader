@@ -56,9 +56,14 @@ class BackendUploadWorker(
 
         val token = DeviceAuthManager.validAccessToken(context)
         if (token == null) {
-            // Sem sessão utilizável: não adianta insistir em loop — a tela de
-            // configuração precisa de uma chave nova. `retry` faria o
-            // WorkManager bater no servidor de novo sem chance de sucesso.
+            // Sessão ainda recuperável (sem sinal, servidor fora do ar): tenta
+            // de novo depois. Antes isto virava `failure` mesmo só sem rede.
+            if (DeviceAuthManager.hasRecoverableSession(context)) {
+                Log.i(TAG, "Sessão não renovada agora — nova tentativa depois")
+                return Result.retry()
+            }
+            // Sem sessão nem segredo: não adianta insistir em loop — a tela de
+            // configuração precisa de uma chave nova.
             Log.w(TAG, "Sem sessão válida — reative o aparelho pela chave")
             return Result.failure()
         }
