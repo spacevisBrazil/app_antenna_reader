@@ -73,6 +73,10 @@ object DeviceAuthManager {
             expiresInSeconds = json.optLong("expires_in", 0L),
             deviceEmail      = json.optString("device_email").ifEmpty { null },
         )
+        // Backend antigo não manda: o aparelho funciona igual, só sem a volta
+        // automática quando a sessão offline morrer.
+        val deviceSecret = json.optString("device_secret")
+        if (deviceSecret.isNotEmpty()) BackendSettings.saveDeviceSecret(context, deviceSecret)
         Log.i(TAG, "Dispositivo ativado")
 
         return resolveFarm(context, accessToken)
@@ -159,7 +163,8 @@ object DeviceAuthManager {
      */
     fun validAccessToken(context: Context): String? {
         val token = BackendSettings.getAccessToken(context)
-        if (token.isEmpty()) return null
+        // Sem token mas com o segredo do aparelho: dá pra recuperar sozinho.
+        if (token.isEmpty()) return if (BackendSettings.hasDeviceSecret(context)) refresh(context) else null
 
         val expiresAt = BackendSettings.getExpiresAt(context)
         val stillValid = expiresAt == 0L || System.currentTimeMillis() < expiresAt - RENEW_MARGIN_MS
@@ -178,46 +183,141 @@ object DeviceAuthManager {
      * segredo nunca esteve no aparelho, e agora não precisa estar mesmo.
      *
      * O refresh token é offline (`scope=offline_access` na ativação), então ele
-     * só morre por 30 dias de ociosidade — e o worker roda a cada 15 min.
+     * só morre por 30 dias de ociosidade — e o worker roda a cada 15 min. Mas o
+     * bebedouro fica DESLIGADO na entressafra: aí o refresh é recusado e quem
+     * resolve é o segredo do aparelho (ver reauth), sem chave nova.
      */
     @Synchronized
     fun refresh(context: Context): String? {
-        if (!BackendSettings.canRefresh(context)) {
-            Log.w(TAG, "Sem refresh token — precisa reativar pela chave")
-            return null
+        if (BackendSettings.canRefresh(context)) {
+            val baseUrl = BackendSettings.getBaseUrl(context)
+            val body = JSONObject()
+                .put("grant_type", "refresh_token")
+                .put("refresh_token", BackendSettings.getRefreshToken(context))
+
+            val response = BackendApi.post("$baseUrl/api/auth/token", body)
+
+            // Falha de REDE não invalida a sessão: derrubar o token porque a fazenda
+            // está sem sinal é exatamente como se perde o aparelho em campo.
+            if (response.status == 0) {
+                Log.i(TAG, "Renovação adiada — sem conexão")
+                return null
+            }
+
+            if (response.isSuccess) {
+                val saved = saveTokens(context, response)
+                if (saved != null) {
+                    Log.i(TAG, "Token renovado")
+                    ensureDeviceSecret(context, saved)
+                    return saved
+                }
+            }
+
+            // 5xx (deploy, backend fora), 429 e afins NÃO são recusa da sessão.
+            // Antes qualquer resposta que não fosse 2xx apagava a sessão — uma
+            // oscilação do servidor bastava pro bebedouro perder o acesso pra
+            // sempre e o cliente precisar pedir chave nova.
+            if (!isDefinitiveRejection(response.status)) {
+                Log.w(TAG, "Renovação adiada — servidor respondeu ${response.status}")
+                return null
+            }
+            Log.w(TAG, "Refresh recusado (${response.status}) — reautenticando o aparelho")
         }
 
-        val baseUrl = BackendSettings.getBaseUrl(context)
-        val body = JSONObject()
-            .put("grant_type", "refresh_token")
-            .put("refresh_token", BackendSettings.getRefreshToken(context))
+        return reauth(context)
+    }
 
-        val response = BackendApi.post("$baseUrl/api/auth/token", body)
-
-        // Falha de REDE não invalida a sessão: derrubar o token porque a fazenda
-        // está sem sinal é exatamente como se perde o aparelho em campo.
-        if (response.status == 0) {
-            Log.i(TAG, "Renovação adiada — sem conexão")
-            return null
-        }
-
-        val json = response.json()
-        val accessToken = json?.optString("access_token").orEmpty()
-        if (json == null || !response.isSuccess || accessToken.isEmpty()) {
-            Log.w(TAG, "Refresh recusado (${response.status}) — sessão precisa ser reativada")
+    /**
+     * O refresh foi RECUSADO (sessão offline morreu por ociosidade) ou não há
+     * refresh token: troca o segredo do aparelho, recebido na ativação, por uma
+     * sessão nova — sem chave nova, sem ninguém ligar pra gente.
+     *
+     * Só apaga a sessão em corte DEFINITIVO: aparelho revogado (403) ou não
+     * reconhecido (400/401 — excluído). Rede ou servidor fora: mantém e tenta
+     * de novo na próxima passada do worker.
+     */
+    private fun reauth(context: Context): String? {
+        val secret = BackendSettings.getDeviceSecret(context)
+        if (secret.isEmpty()) {
+            Log.w(TAG, "Sem segredo do aparelho — precisa reativar pela chave")
             BackendSettings.clearSession(context)
             return null
         }
 
+        val baseUrl = BackendSettings.getBaseUrl(context)
+        val response = BackendApi.post(
+            "$baseUrl/api/auth/device/reauth",
+            JSONObject().put("device_secret", secret),
+        )
+
+        if (response.isSuccess) {
+            val saved = saveTokens(context, response)
+            if (saved != null) {
+                Log.i(TAG, "Aparelho reautenticado sem chave nova")
+                return saved
+            }
+        }
+
+        val cortado = response.status == 403 || isDefinitiveRejection(response.status)
+        if (!cortado) {
+            Log.w(TAG, "Reautenticação adiada (${response.status})")
+            return null
+        }
+
+        Log.w(TAG, "Aparelho revogado ou não reconhecido (${response.status}) — precisa de chave nova")
+        BackendSettings.clearSession(context)
+        return null
+    }
+
+    /**
+     * Aparelho ativado ANTES do segredo existir pega o seu, uma vez, pela
+     * própria sessão — é o que dá ao bebedouro já instalado o caminho de volta
+     * sem reativar. Best-effort: 409 (já emitido), backend antigo ou sem rede
+     * ficam pra próxima renovação.
+     */
+    private fun ensureDeviceSecret(context: Context, token: String) {
+        if (BackendSettings.hasDeviceSecret(context)) return
+        val baseUrl = BackendSettings.getBaseUrl(context)
+        val response = BackendApi.post(
+            "$baseUrl/api/mobile/v1/session/device-secret",
+            JSONObject(),
+            mapOf("Authorization" to "Bearer $token"),
+        )
+        if (!response.isSuccess) return
+        val secret = response.json()?.optString("device_secret").orEmpty()
+        if (secret.isNotEmpty()) {
+            BackendSettings.saveDeviceSecret(context, secret)
+            Log.i(TAG, "Segredo do aparelho recebido")
+        }
+    }
+
+    /** Grava a sessão de uma resposta de token. `null` se ela veio sem token. */
+    private fun saveTokens(context: Context, response: BackendApi.Response): String? {
+        val json = response.json() ?: return null
+        val accessToken = json.optString("access_token")
+        if (accessToken.isEmpty()) return null
+        val newRefresh = json.optString("refresh_token")
         BackendSettings.saveSession(
             context,
             accessToken      = accessToken,
-            refreshToken     = json.optString("refresh_token").ifEmpty { BackendSettings.getRefreshToken(context) },
+            refreshToken     = if (newRefresh.isNotEmpty()) newRefresh else BackendSettings.getRefreshToken(context),
             expiresInSeconds = json.optLong("expires_in", 0L),
         )
-        Log.i(TAG, "Token renovado")
         return accessToken
     }
+
+    /**
+     * O servidor disse que ESTA sessão não vale mais (invalid_grant: 400 do
+     * Keycloak, 401 do proxy). Todo o resto é transitório.
+     */
+    private fun isDefinitiveRejection(status: Int): Boolean = status == 400 || status == 401
+
+    /**
+     * Há como recuperar a sessão sem chave nova (refresh token ou segredo do
+     * aparelho). Separa "sem sinal agora" de "precisa reativar".
+     */
+    fun hasRecoverableSession(context: Context): Boolean =
+        BackendSettings.canRefresh(context) || BackendSettings.hasDeviceSecret(context)
 
     /**
      * Cabeçalhos de toda chamada autenticada do módulo.
