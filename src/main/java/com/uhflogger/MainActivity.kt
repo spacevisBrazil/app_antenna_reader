@@ -75,20 +75,48 @@ class MainActivity : AppCompatActivity() {
     private var isSessionActive = false
 
     // ── Smartbox ────────────────────────────────────────────────────────────
-    /** Quem pediu a captura no meio de uma coleta (vai para a telemetria). */
-    private var smartboxYieldTrigger = SmartboxTelemetry.YieldTrigger.START_CAPTURE
     /** Sessão de coleta para a qual a tela de progresso já abriu (uma vez por sessão). */
     private var smartboxScreenSeq = -1L
     private val smartboxCollectScreen =
         registerForActivityResult(androidx.activity.result.contract.ActivityResultContracts.StartActivityForResult()) { r ->
             if (r.resultCode == SmartboxCollectActivity.RESULT_READ_TAGS) {
-                // "Parar e ler brincos" = o mesmo caminho do Iniciar leitura.
-                smartboxYieldTrigger = SmartboxTelemetry.YieldTrigger.STOP_BUTTON
+                // O operador mandou parar: a smartbox cede JÁ, antes de qualquer
+                // checagem de dispositivo. Se o Iniciar abaixo não puder seguir
+                // (nenhum dispositivo, USB sem permissão), a descarga não fica
+                // rodando escondida com o rádio.
+                SmartboxConnection.appScope.launch {
+                    try {
+                        SmartboxConnection.yieldForCapture(SmartboxTelemetry.YieldTrigger.STOP_BUTTON)
+                    } catch (e: Exception) {
+                        android.util.Log.w("MainActivity", "smartbox não cedeu: ${e.message}")
+                    }
+                }
+                // E segue o mesmo caminho do Iniciar leitura. O yield dele, se
+                // ainda houver sessão, só espera este (não pede de novo).
                 onStartClicked()
             }
         }
 
     private val uiHandler = Handler(Looper.getMainLooper())
+
+    /** Timeout de segurança do Iniciar. Ver StartSafetyTimer: o yield da smartbox não conta no prazo. */
+    private val startSafetyTimer = StartSafetyTimer(
+        START_BUTTON_SAFETY_TIMEOUT_MS,
+        schedule = { r, ms -> uiHandler.postDelayed(r, ms) },
+        cancel = { r -> uiHandler.removeCallbacks(r) },
+    ) {
+        if (readerService?.isCapturing() != true) {
+            binding.btnStart.isEnabled = true
+            // Conexão nunca teve sucesso nem entrou em reconexão de verdade
+            // (senão isRunning ou isPaused estariam true) — sessão nunca
+            // começou, libera o menu de configurações de novo.
+            if (readerService?.isPaused() != true) {
+                isSessionActive = false
+                binding.btnSettings.isEnabled = true
+            }
+            updateButtonColors()
+        }
+    }
     private val tagCountUpdater = object : Runnable {
         override fun run() {
             val service = readerService
@@ -463,19 +491,9 @@ class MainActivity : AppCompatActivity() {
         binding.btnStart.isEnabled = false
         isSessionActive = true
         binding.btnSettings.isEnabled = false
-        uiHandler.postDelayed({
-            if (readerService?.isCapturing() != true) {
-                binding.btnStart.isEnabled = true
-                // Conexão nunca teve sucesso nem entrou em reconexão de verdade
-                // (senão isRunning ou isPaused estariam true) — sessão nunca
-                // começou, libera o menu de configurações de novo.
-                if (readerService?.isPaused() != true) {
-                    isSessionActive = false
-                    binding.btnSettings.isEnabled = true
-                }
-                updateButtonColors()
-            }
-        }, START_BUTTON_SAFETY_TIMEOUT_MS)
+        // Com a smartbox ocupada, startCaptureYieldingSmartbox pausa este timer
+        // durante o yield e o rearma com o prazo cheio antes do startCapture.
+        startSafetyTimer.arm()
 
         // Bluetooth device — no USB permission needed, connect directly
         if (UHFReaderService.isBtDeviceAllowed(deviceName)) {
@@ -529,8 +547,6 @@ class MainActivity : AppCompatActivity() {
      * faltou baixar fica para a próxima vez.
      */
     private fun startCaptureYieldingSmartbox(deviceName: String) {
-        val trigger = smartboxYieldTrigger
-        smartboxYieldTrigger = SmartboxTelemetry.YieldTrigger.START_CAPTURE
         if (!SmartboxConnection.isBusy) {
             readerService?.startCapture(deviceName)
             return
@@ -538,13 +554,17 @@ class MainActivity : AppCompatActivity() {
         // Escopo do processo, não da Activity: se a tela for destruída durante
         // a espera, a captura começa mesmo assim.
         val service = readerService
+        // O tempo do yield não conta no timeout de segurança do Iniciar.
+        val safetyWasArmed = startSafetyTimer.pause()
         SmartboxConnection.appScope.launch {
             try {
-                SmartboxConnection.yieldForCapture(trigger)
+                SmartboxConnection.yieldForCapture(SmartboxTelemetry.YieldTrigger.START_CAPTURE)
             } catch (e: Exception) {
                 // Ceder nunca pode impedir a captura de começar.
                 android.util.Log.w("MainActivity", "smartbox não cedeu: ${e.message}")
             }
+            // appScope é Main: o rearme acontece na main, logo antes do startCapture.
+            startSafetyTimer.resume(safetyWasArmed)
             try {
                 (readerService ?: service)?.startCapture(deviceName)
             } catch (e: Exception) {
