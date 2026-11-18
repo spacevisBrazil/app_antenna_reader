@@ -82,6 +82,11 @@
             android:screenOrientation="portrait" />
 
         <activity
+            android:name=".smartbox.ui.SmartboxDiagnosticActivity"
+            android:exported="false"
+            android:parentActivityName=".smartbox.ui.SmartboxSearchActivity" />
+
+        <activity
             android:name=".smartbox.ui.SmartboxSearchActivity"
             android:exported="false"
             android:parentActivityName=".SettingsActivity" />
