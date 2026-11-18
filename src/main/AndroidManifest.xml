@@ -34,6 +34,9 @@
     <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <!-- Smartbox → Configurar → "Procurar redes (pelo aparelho)". -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
 
 
@@ -80,6 +83,17 @@
             android:name=".smartbox.ui.SmartboxCollectActivity"
             android:exported="false"
             android:screenOrientation="portrait" />
+
+        <activity
+            android:name=".smartbox.ui.SmartboxConfigureActivity"
+            android:exported="false"
+            android:windowSoftInputMode="adjustResize"
+            android:parentActivityName=".smartbox.ui.SmartboxSearchActivity" />
+
+        <activity
+            android:name=".smartbox.ui.SmartboxDiagnosticActivity"
+            android:exported="false"
+            android:parentActivityName=".smartbox.ui.SmartboxSearchActivity" />
 
         <activity
             android:name=".smartbox.ui.SmartboxSearchActivity"

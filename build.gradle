@@ -197,6 +197,8 @@ android {
 dependencies {
     testImplementation libs.junit
     testImplementation 'org.jetbrains.kotlinx:kotlinx-coroutines-test:1.7.3'
+    // org.json real nos testes de JVM: o do android.jar é stub e lança "not mocked".
+    testImplementation 'org.json:json:20240303'
 
     implementation libs.androidx.core.ktx
     implementation libs.androidx.appcompat

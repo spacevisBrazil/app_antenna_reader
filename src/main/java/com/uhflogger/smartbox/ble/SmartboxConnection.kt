@@ -106,10 +106,15 @@ object SmartboxConnection {
         control: DownloadControl? = null,
         advRssi: Int? = null,
         advSeenAt: Long? = null,
+        /** Ações manuais: espera a sessão em andamento (ex.: a coleta terminando um lote) em vez de falhar. */
+        waitIfBusy: Boolean = false,
         block: suspend (OpenSession) -> T,
     ): T {
         val me = Active(target.moduleId, purpose, collectMode, control, currentCoroutineContext()[Job])
-        if (!active.compareAndSet(null, me)) throw SmartboxBusyException(active.value?.moduleId ?: "?")
+        while (!active.compareAndSet(null, me)) {
+            if (!waitIfBusy) throw SmartboxBusyException(active.value?.moduleId ?: "?")
+            active.first { it == null }
+        }
         _activeModuleId.value = target.moduleId
 
         val started = System.currentTimeMillis()
