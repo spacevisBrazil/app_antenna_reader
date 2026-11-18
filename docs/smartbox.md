@@ -11,8 +11,8 @@ Entrega em PRs pequenos:
 | PR | Conteúdo | Estado |
 |---|---|---|
 | 1 | Protocolo, cripto, framing, sessão e descarga (JVM, contra simulador) + chave K pelo build | #19 |
-| 2 | Conexão GATT, busca, coordenação do rádio com o leitor, tela Buscar, telemetria | este |
-| 3 | Banco local, coleta automática, envio ao backend, tela de progresso | — |
+| 2 | Conexão GATT, busca, coordenação do rádio com o leitor, tela Buscar, telemetria | #20 |
+| 3 | Banco local, coleta automática, envio ao backend, tela de progresso | este |
 | 4 | Diagnóstico e Reiniciar | — |
 | 5 | Configurar | — |
 
@@ -91,3 +91,38 @@ hora.
 - **Sem gestor:** o UHF Logger entra com a conta do aparelho, então Transferir, Padrão de
   fábrica e Tirar da fazenda ficam escondidos (`FarmRules.IS_MANAGER = false`). Essas
   ações são feitas no SpaceVis Field, com login de gestor.
+
+## Coleta automática e envio (PR 3)
+
+**Zero passo para o operador.** A coleta já vem ligada sempre que o build tem a chave K, o
+aparelho tem fazenda selecionada e a permissão de Bluetooth foi dada. O ideal é a permissão
+vir concedida pelo MDM. Sem qualquer um desses três, não sobe nada (nem serviço nem scan) e a
+tela principal fica igual a antes (`AutoCollectRules.shouldRun`). Só o técnico desliga, em
+Configurações → Smartbox → Coleta automática.
+
+| Peça | O quê |
+|---|---|
+| `collect/SmartboxCollectService.kt` | serviço em primeiro plano `connectedDevice`, com canal, notificação (4201) e ID próprios; convive com o `UHFReaderService`. Sobe no `MainActivity.onStart` com o app na frente. Se o Android recusar, para quieto e não derruba nada |
+| `collect/SmartboxCollector.kt` | laço da seção 7: procura → conecta → baixa → desconecta → respiro de 2 s. Cada sessão roda num Job filho (o corte do yield não mata o laço) e cede o rádio às telas de técnico (`hold`) |
+| `collect/AutoCollectRules.kt` | candidatas e pausas (§7.2/7.3), regra de ligar e regra do aviso de 24 h. Puro e testado |
+| `data/SmartboxDatabase.kt` | Room próprio (`smartbox.db`), separado do banco que já está em campo. Chave única (módulo, epc, porta, instante) + INSERT OR IGNORE; lote numa transação; pendente nunca é apagada; enviada some depois de 7 dias |
+| `sync/SmartboxUploader.kt` | §9.3: lotes de 250 e a classificação do firmware. Só sobe leitura de smartbox que anunciava a fazenda do aparelho. Puro e testado |
+| `sync/SmartboxUploadWorker.kt` | WorkManager: só com rede, um por vez, retry com backoff. Disparado no fim de cada descarga e quando a coleta liga |
+| `ui/SmartboxCollectActivity.kt` | tela de progresso que trava a navegação (leitor parado) |
+
+### O que o operador vê
+
+| Leitor | Tela principal |
+|---|---|
+| Captura por Bluetooth | linha discreta "Smartbox: aguardando a leitura parar" |
+| Captura por USB | linha "Smartbox SPV-…: baixando N de M" + notificação com progresso |
+| Parado | tela de progresso: nome, barra, "N de M leituras", tempo estimado e um único botão, **Parar e ler brincos**. No fim, "Pronto: N leituras guardadas, enviando ao servidor" por ~3 s, e ela fecha sozinha |
+
+- **Parar e ler brincos** não tem lógica própria: faz o mesmo que **Iniciar leitura**
+  (`startCaptureYieldingSmartbox`), ou seja, a smartbox termina o lote em mãos, desconecta, e a
+  captura começa.
+- **Falhas** (fora de alcance, conexão caiu) são silenciosas: o app tenta de novo com as pausas
+  do §7 e registra só na telemetria.
+- **Aviso amarelo** quando uma smartbox da fazenda está por perto (vista na última hora) há
+  24 h com leituras sem conseguir baixar: "A smartbox X não está sendo baixada. Avise o
+  suporte."
