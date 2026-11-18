@@ -29,6 +29,12 @@ import com.hoho.android.usbserial.driver.UsbSerialProber
 import com.uhflogger.databinding.ActivityMainBinding
 import com.uhflogger.service.UHFReaderService
 import com.uhflogger.smartbox.ble.SmartboxConnection
+import com.uhflogger.smartbox.collect.SmartboxCollectService
+import com.uhflogger.smartbox.collect.SmartboxCollector
+import com.uhflogger.smartbox.radio.CollectMode
+import com.uhflogger.smartbox.ui.SmartboxCollectActivity
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 import com.uhflogger.smartbox.ble.SmartboxTelemetry
 import kotlinx.coroutines.launch
 import com.uhflogger.SettingsManager
@@ -67,6 +73,20 @@ class MainActivity : AppCompatActivity() {
     // mudar configurações que pareciam salvar mas não entravam em vigor até a
     // próxima parada/início real (o retry de reconexão não recarrega tudo).
     private var isSessionActive = false
+
+    // ── Smartbox ────────────────────────────────────────────────────────────
+    /** Quem pediu a captura no meio de uma coleta (vai para a telemetria). */
+    private var smartboxYieldTrigger = SmartboxTelemetry.YieldTrigger.START_CAPTURE
+    /** Sessão de coleta para a qual a tela de progresso já abriu (uma vez por sessão). */
+    private var smartboxScreenSeq = -1L
+    private val smartboxCollectScreen =
+        registerForActivityResult(androidx.activity.result.contract.ActivityResultContracts.StartActivityForResult()) { r ->
+            if (r.resultCode == SmartboxCollectActivity.RESULT_READ_TAGS) {
+                // "Parar e ler brincos" = o mesmo caminho do Iniciar leitura.
+                smartboxYieldTrigger = SmartboxTelemetry.YieldTrigger.STOP_BUTTON
+                onStartClicked()
+            }
+        }
 
     private val uiHandler = Handler(Looper.getMainLooper())
     private val tagCountUpdater = object : Runnable {
@@ -233,6 +253,61 @@ class MainActivity : AppCompatActivity() {
         bindToService()
         setupButtons()
         refreshDeviceList()
+        observeSmartbox()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        // Só sobe com chave no build + fazenda + permissão (e a preferência,
+        // ligada por padrão). Com o app na frente: o Android 12+ não deixa
+        // subir serviço em primeiro plano do fundo.
+        SmartboxCollectService.startIfEnabled(this)
+    }
+
+    /**
+     * Smartbox na tela principal, sem tomar o lugar da captura:
+     * - captura BT: linha discreta "aguardando a leitura parar";
+     * - captura USB: linha com o progresso da coleta em segundo plano;
+     * - leitor parado: abre a tela de progresso (uma vez por sessão);
+     * - aviso amarelo das 24 h.
+     * Coleta desabilitada: tudo GONE, tela igual a antes.
+     */
+    private fun observeSmartbox() {
+        lifecycleScope.launch {
+            repeatOnLifecycle(androidx.lifecycle.Lifecycle.State.RESUMED) {
+                SmartboxCollector.state.collect { s -> renderSmartbox(s) }
+            }
+        }
+    }
+
+    private fun renderSmartbox(s: SmartboxCollector.State) {
+        val name = s.moduleId?.let { com.uhflogger.smartbox.ble.displayName(it) }
+        val fmt = { n: Int -> java.text.NumberFormat.getIntegerInstance(java.util.Locale("pt", "BR")).format(n) }
+        val status = when {
+            s.phase == SmartboxCollector.Phase.WAITING_READER -> "Smartbox: aguardando a leitura parar"
+            s.mode == CollectMode.BACKGROUND && s.phase == SmartboxCollector.Phase.DOWNLOADING ->
+                "Smartbox $name: baixando ${fmt(s.received)}" + (s.total?.let { " de ${fmt(it)}" } ?: "")
+            else -> null
+        }
+        binding.tvSmartboxStatus.text = status
+        binding.tvSmartboxStatus.visibility = if (status == null) android.view.View.GONE else android.view.View.VISIBLE
+
+        val warning = s.stale.takeIf { it.isNotEmpty() }?.let { list ->
+            val names = list.joinToString(", ") { com.uhflogger.smartbox.ble.displayName(it) }
+            if (list.size == 1) "A smartbox $names não está sendo baixada. Avise o suporte."
+            else "As smartboxes $names não estão sendo baixadas. Avise o suporte."
+        }
+        binding.tvSmartboxWarning.text = warning
+        binding.tvSmartboxWarning.visibility = if (warning == null) android.view.View.GONE else android.view.View.VISIBLE
+
+        // Leitor parado e a descarga começou: tela de progresso (abre depois do
+        // handshake, para uma conexão que falha não piscar a tela).
+        if (s.phase == SmartboxCollector.Phase.DOWNLOADING && s.mode == CollectMode.BLOCKING &&
+            s.sessionSeq != smartboxScreenSeq && !isSessionActive
+        ) {
+            smartboxScreenSeq = s.sessionSeq
+            smartboxCollectScreen.launch(Intent(this, SmartboxCollectActivity::class.java))
+        }
     }
 
     override fun onResume() {
@@ -454,6 +529,8 @@ class MainActivity : AppCompatActivity() {
      * faltou baixar fica para a próxima vez.
      */
     private fun startCaptureYieldingSmartbox(deviceName: String) {
+        val trigger = smartboxYieldTrigger
+        smartboxYieldTrigger = SmartboxTelemetry.YieldTrigger.START_CAPTURE
         if (!SmartboxConnection.isBusy) {
             readerService?.startCapture(deviceName)
             return
@@ -463,7 +540,7 @@ class MainActivity : AppCompatActivity() {
         val service = readerService
         SmartboxConnection.appScope.launch {
             try {
-                SmartboxConnection.yieldForCapture(SmartboxTelemetry.YieldTrigger.START_CAPTURE)
+                SmartboxConnection.yieldForCapture(trigger)
             } catch (e: Exception) {
                 // Ceder nunca pode impedir a captura de começar.
                 android.util.Log.w("MainActivity", "smartbox não cedeu: ${e.message}")
