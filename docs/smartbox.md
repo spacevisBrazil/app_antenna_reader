@@ -12,8 +12,8 @@ Entrega em PRs pequenos:
 |---|---|---|
 | 1 | Protocolo, cripto, framing, sessão e descarga (JVM, contra simulador) + chave K pelo build | #19 |
 | 2 | Conexão GATT, busca, coordenação do rádio com o leitor, tela Buscar, telemetria | #20 |
-| 3 | Banco local, coleta automática, envio ao backend, tela de progresso | este |
-| 4 | Diagnóstico e Reiniciar | — |
+| 3 | Banco local, coleta automática, envio ao backend, tela de progresso | #21 |
+| 4 | Diagnóstico e Reiniciar | este |
 | 5 | Configurar | — |
 
 ## Chave K (confidencial)
@@ -126,3 +126,20 @@ Configurações → Smartbox → Coleta automática.
 - **Aviso amarelo** quando uma smartbox da fazenda está por perto (vista na última hora) há
   24 h com leituras sem conseguir baixar: "A smartbox X não está sendo baixada. Avise o
   suporte."
+
+## Diagnóstico (PR 4)
+
+Na tela de técnico Buscar, toque em **Diagnóstico** numa smartbox desta fazenda ou sem
+fazenda. A tela faz uma conexão curta (conecta, `GET_DIAG`, desconecta) e mostra:
+
+- **Cabeçalho**, com dados do CHALLENGE: firmware, protocolo, MAC, modo (e o motivo, se em
+  configuração), pendentes e a fazenda pelo nome.
+- **Estado interno** legível, com as cores da seção 13.2 (`domain/DiagFormat.kt`, puro e
+  testado): relógio comparado com o aparelho no instante da leitura, antenas juntas e em ordem
+  (antena ausente nunca vira 0), temperatura numa linha só. Também dá para ver o **texto cru**.
+- **Reiniciar smartbox**, com confirmação e uma conexão nova. Só aparece em caixa minha ou sem
+  fazenda, segundo o CHALLENGE.
+- **Padrão de fábrica** não existe no UHF Logger: só o gestor faz, no SpaceVis Field.
+
+As ações manuais usam `waitIfBusy`: se a coleta automática estiver terminando um lote, a ação
+espera em vez de falhar.
