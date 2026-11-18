@@ -5,7 +5,8 @@
     <uses-feature android:name="android.hardware.usb.host" />
     <uses-permission android:name="android.permission.USB_PERMISSION" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <!--    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />-->
+    <!-- Coleta da smartbox em segundo plano (SmartboxCollectService). -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
@@ -33,6 +34,9 @@
     <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <!-- Smartbox → Configurar → "Procurar redes (pelo aparelho)". -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
 
 
@@ -70,6 +74,27 @@
              de fora (WhatsApp), e é isso que evita alguém digitar uma chave de
              16 caracteres num celular no meio do pasto. A tela só ACEITA a
              chave — quem valida é o servidor, e a chave é de uso único. -->
+        <service
+            android:name=".smartbox.collect.SmartboxCollectService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+
+        <activity
+            android:name=".smartbox.ui.SmartboxCollectActivity"
+            android:exported="false"
+            android:screenOrientation="portrait" />
+
+        <activity
+            android:name=".smartbox.ui.SmartboxConfigureActivity"
+            android:exported="false"
+            android:windowSoftInputMode="adjustResize"
+            android:parentActivityName=".smartbox.ui.SmartboxSearchActivity" />
+
+        <activity
+            android:name=".smartbox.ui.SmartboxDiagnosticActivity"
+            android:exported="false"
+            android:parentActivityName=".smartbox.ui.SmartboxSearchActivity" />
+
         <activity
             android:name=".smartbox.ui.SmartboxSearchActivity"
             android:exported="false"

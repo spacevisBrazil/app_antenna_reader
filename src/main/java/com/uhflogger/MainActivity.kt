@@ -29,6 +29,12 @@ import com.hoho.android.usbserial.driver.UsbSerialProber
 import com.uhflogger.databinding.ActivityMainBinding
 import com.uhflogger.service.UHFReaderService
 import com.uhflogger.smartbox.ble.SmartboxConnection
+import com.uhflogger.smartbox.collect.SmartboxCollectService
+import com.uhflogger.smartbox.collect.SmartboxCollector
+import com.uhflogger.smartbox.radio.CollectMode
+import com.uhflogger.smartbox.ui.SmartboxCollectActivity
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 import com.uhflogger.smartbox.ble.SmartboxTelemetry
 import kotlinx.coroutines.launch
 import com.uhflogger.SettingsManager
@@ -68,7 +74,49 @@ class MainActivity : AppCompatActivity() {
     // próxima parada/início real (o retry de reconexão não recarrega tudo).
     private var isSessionActive = false
 
+    // ── Smartbox ────────────────────────────────────────────────────────────
+    /** Sessão de coleta para a qual a tela de progresso já abriu (uma vez por sessão). */
+    private var smartboxScreenSeq = -1L
+    private val smartboxCollectScreen =
+        registerForActivityResult(androidx.activity.result.contract.ActivityResultContracts.StartActivityForResult()) { r ->
+            if (r.resultCode == SmartboxCollectActivity.RESULT_READ_TAGS) {
+                // O operador mandou parar: a smartbox cede JÁ, antes de qualquer
+                // checagem de dispositivo. Se o Iniciar abaixo não puder seguir
+                // (nenhum dispositivo, USB sem permissão), a descarga não fica
+                // rodando escondida com o rádio.
+                SmartboxConnection.appScope.launch {
+                    try {
+                        SmartboxConnection.yieldForCapture(SmartboxTelemetry.YieldTrigger.STOP_BUTTON)
+                    } catch (e: Exception) {
+                        android.util.Log.w("MainActivity", "smartbox não cedeu: ${e.message}")
+                    }
+                }
+                // E segue o mesmo caminho do Iniciar leitura. O yield dele, se
+                // ainda houver sessão, só espera este (não pede de novo).
+                onStartClicked()
+            }
+        }
+
     private val uiHandler = Handler(Looper.getMainLooper())
+
+    /** Timeout de segurança do Iniciar. Ver StartSafetyTimer: o yield da smartbox não conta no prazo. */
+    private val startSafetyTimer = StartSafetyTimer(
+        START_BUTTON_SAFETY_TIMEOUT_MS,
+        schedule = { r, ms -> uiHandler.postDelayed(r, ms) },
+        cancel = { r -> uiHandler.removeCallbacks(r) },
+    ) {
+        if (readerService?.isCapturing() != true) {
+            binding.btnStart.isEnabled = true
+            // Conexão nunca teve sucesso nem entrou em reconexão de verdade
+            // (senão isRunning ou isPaused estariam true) — sessão nunca
+            // começou, libera o menu de configurações de novo.
+            if (readerService?.isPaused() != true) {
+                isSessionActive = false
+                binding.btnSettings.isEnabled = true
+            }
+            updateButtonColors()
+        }
+    }
     private val tagCountUpdater = object : Runnable {
         override fun run() {
             val service = readerService
@@ -233,6 +281,61 @@ class MainActivity : AppCompatActivity() {
         bindToService()
         setupButtons()
         refreshDeviceList()
+        observeSmartbox()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        // Só sobe com chave no build + fazenda + permissão (e a preferência,
+        // ligada por padrão). Com o app na frente: o Android 12+ não deixa
+        // subir serviço em primeiro plano do fundo.
+        SmartboxCollectService.startIfEnabled(this)
+    }
+
+    /**
+     * Smartbox na tela principal, sem tomar o lugar da captura:
+     * - captura BT: linha discreta "aguardando a leitura parar";
+     * - captura USB: linha com o progresso da coleta em segundo plano;
+     * - leitor parado: abre a tela de progresso (uma vez por sessão);
+     * - aviso amarelo das 24 h.
+     * Coleta desabilitada: tudo GONE, tela igual a antes.
+     */
+    private fun observeSmartbox() {
+        lifecycleScope.launch {
+            repeatOnLifecycle(androidx.lifecycle.Lifecycle.State.RESUMED) {
+                SmartboxCollector.state.collect { s -> renderSmartbox(s) }
+            }
+        }
+    }
+
+    private fun renderSmartbox(s: SmartboxCollector.State) {
+        val name = s.moduleId?.let { com.uhflogger.smartbox.ble.displayName(it) }
+        val fmt = { n: Int -> java.text.NumberFormat.getIntegerInstance(java.util.Locale("pt", "BR")).format(n) }
+        val status = when {
+            s.phase == SmartboxCollector.Phase.WAITING_READER -> "Smartbox: aguardando a leitura parar"
+            s.mode == CollectMode.BACKGROUND && s.phase == SmartboxCollector.Phase.DOWNLOADING ->
+                "Smartbox $name: baixando ${fmt(s.received)}" + (s.total?.let { " de ${fmt(it)}" } ?: "")
+            else -> null
+        }
+        binding.tvSmartboxStatus.text = status
+        binding.tvSmartboxStatus.visibility = if (status == null) android.view.View.GONE else android.view.View.VISIBLE
+
+        val warning = s.stale.takeIf { it.isNotEmpty() }?.let { list ->
+            val names = list.joinToString(", ") { com.uhflogger.smartbox.ble.displayName(it) }
+            if (list.size == 1) "A smartbox $names não está sendo baixada. Avise o suporte."
+            else "As smartboxes $names não estão sendo baixadas. Avise o suporte."
+        }
+        binding.tvSmartboxWarning.text = warning
+        binding.tvSmartboxWarning.visibility = if (warning == null) android.view.View.GONE else android.view.View.VISIBLE
+
+        // Leitor parado e a descarga começou: tela de progresso (abre depois do
+        // handshake, para uma conexão que falha não piscar a tela).
+        if (s.phase == SmartboxCollector.Phase.DOWNLOADING && s.mode == CollectMode.BLOCKING &&
+            s.sessionSeq != smartboxScreenSeq && !isSessionActive
+        ) {
+            smartboxScreenSeq = s.sessionSeq
+            smartboxCollectScreen.launch(Intent(this, SmartboxCollectActivity::class.java))
+        }
     }
 
     override fun onResume() {
@@ -388,19 +491,9 @@ class MainActivity : AppCompatActivity() {
         binding.btnStart.isEnabled = false
         isSessionActive = true
         binding.btnSettings.isEnabled = false
-        uiHandler.postDelayed({
-            if (readerService?.isCapturing() != true) {
-                binding.btnStart.isEnabled = true
-                // Conexão nunca teve sucesso nem entrou em reconexão de verdade
-                // (senão isRunning ou isPaused estariam true) — sessão nunca
-                // começou, libera o menu de configurações de novo.
-                if (readerService?.isPaused() != true) {
-                    isSessionActive = false
-                    binding.btnSettings.isEnabled = true
-                }
-                updateButtonColors()
-            }
-        }, START_BUTTON_SAFETY_TIMEOUT_MS)
+        // Com a smartbox ocupada, startCaptureYieldingSmartbox pausa este timer
+        // durante o yield e o rearma com o prazo cheio antes do startCapture.
+        startSafetyTimer.arm()
 
         // Bluetooth device — no USB permission needed, connect directly
         if (UHFReaderService.isBtDeviceAllowed(deviceName)) {
@@ -461,6 +554,8 @@ class MainActivity : AppCompatActivity() {
         // Escopo do processo, não da Activity: se a tela for destruída durante
         // a espera, a captura começa mesmo assim.
         val service = readerService
+        // O tempo do yield não conta no timeout de segurança do Iniciar.
+        val safetyWasArmed = startSafetyTimer.pause()
         SmartboxConnection.appScope.launch {
             try {
                 SmartboxConnection.yieldForCapture(SmartboxTelemetry.YieldTrigger.START_CAPTURE)
@@ -468,6 +563,8 @@ class MainActivity : AppCompatActivity() {
                 // Ceder nunca pode impedir a captura de começar.
                 android.util.Log.w("MainActivity", "smartbox não cedeu: ${e.message}")
             }
+            // appScope é Main: o rearme acontece na main, logo antes do startCapture.
+            startSafetyTimer.resume(safetyWasArmed)
             try {
                 (readerService ?: service)?.startCapture(deviceName)
             } catch (e: Exception) {

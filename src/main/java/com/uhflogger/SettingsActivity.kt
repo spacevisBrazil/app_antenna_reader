@@ -135,6 +135,17 @@ class SettingsActivity : AppCompatActivity() {
             startActivity(android.content.Intent(this,
                 com.uhflogger.smartbox.ui.SmartboxSearchActivity::class.java))
         }
+        // Ligada por padrão; desligar é coisa de suporte (o operador não decide).
+        buildRow(root, "Coleta automática",
+            if (com.uhflogger.smartbox.SmartboxPrefs.isAutoEnabled(this)) "Ligada" else "Desligada",
+            ROW_SMARTBOX_AUTO) {
+            val on = !com.uhflogger.smartbox.SmartboxPrefs.isAutoEnabled(this)
+            com.uhflogger.smartbox.SmartboxPrefs.setAutoEnabled(this, on)
+            updateRowValue(root, ROW_SMARTBOX_AUTO, if (on) "Ligada" else "Desligada")
+            if (on) com.uhflogger.smartbox.collect.SmartboxCollectService.startIfEnabled(this)
+            else com.uhflogger.smartbox.collect.SmartboxCollectService.stop(this)
+            toast("Salvo")
+        }
 
         buildRestoreButton(root)
     }
@@ -903,5 +914,6 @@ class SettingsActivity : AppCompatActivity() {
         private const val ROW_DRIVE_ACCOUNT   = 2009
         private const val ROW_BACKEND         = 2011
         private const val ROW_SMARTBOX        = 2012
+        private const val ROW_SMARTBOX_AUTO   = 2013
     }
 }

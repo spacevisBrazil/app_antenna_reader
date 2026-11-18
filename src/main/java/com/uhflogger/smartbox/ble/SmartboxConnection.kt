@@ -9,6 +9,7 @@ import android.util.Log
 import com.uhflogger.analytics.Analytics
 import com.uhflogger.smartbox.radio.CollectMode
 import com.uhflogger.smartbox.radio.ReaderRadio
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -60,6 +61,8 @@ object SmartboxConnection {
         val job: Job?,
     ) {
         @Volatile var link: SmartboxLink? = null
+        /** Yield em andamento nesta sessão: um segundo pedido só espera este. */
+        var yielding: CompletableDeferred<Unit>? = null
     }
 
     /**
@@ -103,10 +106,15 @@ object SmartboxConnection {
         control: DownloadControl? = null,
         advRssi: Int? = null,
         advSeenAt: Long? = null,
+        /** Ações manuais: espera a sessão em andamento (ex.: a coleta terminando um lote) em vez de falhar. */
+        waitIfBusy: Boolean = false,
         block: suspend (OpenSession) -> T,
     ): T {
         val me = Active(target.moduleId, purpose, collectMode, control, currentCoroutineContext()[Job])
-        if (!active.compareAndSet(null, me)) throw SmartboxBusyException(active.value?.moduleId ?: "?")
+        while (!active.compareAndSet(null, me)) {
+            if (!waitIfBusy) throw SmartboxBusyException(active.value?.moduleId ?: "?")
+            active.first { it == null }
+        }
         _activeModuleId.value = target.moduleId
 
         val started = System.currentTimeMillis()
@@ -291,6 +299,22 @@ object SmartboxConnection {
      */
     suspend fun yieldForCapture(trigger: String, maxWaitMs: Long = 5_000L): Boolean {
         val a = active.value ?: return false
+        // "Parar e ler brincos" pede o yield e, em seguida, o caminho do Iniciar
+        // pede de novo: o segundo só espera o primeiro (sem telemetria dupla).
+        val mine = CompletableDeferred<Unit>()
+        val existing = synchronized(a) { a.yielding ?: run { a.yielding = mine; null } }
+        if (existing != null) {
+            existing.await()
+            return true
+        }
+        try {
+            return doYield(a, trigger, maxWaitMs)
+        } finally {
+            mine.complete(Unit)
+        }
+    }
+
+    private suspend fun doYield(a: Active, trigger: String, maxWaitMs: Long): Boolean {
         val t0 = System.currentTimeMillis()
         a.control?.requestStop()
         var forced = false

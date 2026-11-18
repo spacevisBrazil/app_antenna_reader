@@ -5,6 +5,8 @@ import android.util.Log
 import com.uhflogger.backend.BackendApi
 import com.uhflogger.backend.BackendSettings
 import com.uhflogger.backend.DeviceAuthManager
+import com.uhflogger.smartbox.data.PendingReading
+import org.json.JSONArray
 import org.json.JSONObject
 
 /**
@@ -47,6 +49,51 @@ object SmartboxApi {
         if (response.isSuccess || response.status == 409) return Result.Ok
         Log.w(TAG, "cadastro do módulo $moduleId na fazenda $farmId recusado (${response.status})")
         return Result.Failed(describe(response), response.status)
+    }
+
+    /**
+     * Implementação real do [SmartboxBackend]: POST com a credencial do
+     * aparelho; 401 renova o token uma vez e repete.
+     */
+    class Backend(private val context: Context) : SmartboxBackend {
+
+        private fun post(farmId: Long, path: String, body: JSONObject): BackendApi.Response {
+            val farm = farmId.toInt()
+            val url = "${BackendSettings.getBaseUrl(context)}/api/antenna-fixed/v1/farms/$farm$path"
+            var token = DeviceAuthManager.validAccessToken(context)
+                ?: return BackendApi.Response(401, "")
+            var response = BackendApi.post(url, body, DeviceAuthManager.authHeaders(token, farm))
+            if (response.status == 401) {
+                token = DeviceAuthManager.refresh(context) ?: return response
+                response = BackendApi.post(url, body, DeviceAuthManager.authHeaders(token, farm))
+            }
+            return response
+        }
+
+        override fun registerModule(farmId: Long, moduleId: String): HttpOutcome {
+            val r = post(
+                farmId, "/modules",
+                JSONObject().put("moduleId", moduleId).put("name", "Bebedouro $moduleId").put("type", "water_trough"),
+            )
+            // 409 = já existia: é sucesso.
+            return HttpOutcome(if (r.status == 409) 201 else r.status, describe(r))
+        }
+
+        override fun sendVisits(farmId: Long, moduleId: String, readings: List<PendingReading>): HttpOutcome {
+            val arr = JSONArray()
+            readings.forEach {
+                arr.put(
+                    JSONObject()
+                        .put("epc_raw", it.epc)
+                        .put("antenna_port", it.antenna)
+                        .put("rssi_dbm", it.rssi)
+                        .put("reading_timestamp", SmartboxUploader.toReadingTimestamp(it.ts)),
+                )
+            }
+            val r = post(farmId, "/modules/$moduleId/visits/batch", JSONObject().put("readings", arr))
+            val accepted = if (r.isSuccess) r.json()?.optInt("accepted", readings.size) ?: readings.size else 0
+            return HttpOutcome(r.status, describe(r), accepted)
+        }
     }
 
     /** "Sem conexão com o servidor" ou "HTTP N: <message|error do corpo>" (seção 9.3). */
