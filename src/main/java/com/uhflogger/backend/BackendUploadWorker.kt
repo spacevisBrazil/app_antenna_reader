@@ -1,5 +1,7 @@
 package com.uhflogger.backend
 
+import com.uhflogger.analytics.Analytics
+import com.uhflogger.analytics.ConnectionTelemetry
 import android.content.Context
 import android.util.Log
 import androidx.work.BackoffPolicy
@@ -82,6 +84,7 @@ class BackendUploadWorker(
                 if (!processFile(file, token)) allOk = false
             } catch (e: Exception) {
                 Log.e(TAG, "Falha ao enviar ${file.name}", e)
+                trackUploadFailed(UPLOAD_STEP_EXCEPTION, null, e)
                 BackendUploadStore.setError(context, file.absolutePath, e.message?.take(300))
                 allOk = false
             }
@@ -225,6 +228,7 @@ class BackendUploadWorker(
 
         if (!response.isSuccess) {
             Log.w(TAG, "Não abriu captura de ${file.name} (${response.status})")
+            trackUploadFailed(UPLOAD_STEP_OPEN, response.status)
             return null
         }
         return response.json()?.optString("id")?.ifEmpty { null }
@@ -257,6 +261,7 @@ class BackendUploadWorker(
                 else -> "recusado pelo servidor (${response.status})"
             }
             Log.w(TAG, "Lote de ${batch.size} leituras recusado: $motivo")
+            trackUploadFailed(UPLOAD_STEP_BATCH, response.status)
             BackendUploadStore.setError(context, path, "${batch.size} leituras: $motivo")
             return false
         }
@@ -270,13 +275,33 @@ class BackendUploadWorker(
         val response = BackendApi.post(url, JSONObject(), DeviceAuthManager.authHeaders(token, farmId))
         if (!response.isSuccess) {
             Log.w(TAG, "Não fechou a captura $captureId (${response.status})")
+            trackUploadFailed(UPLOAD_STEP_CLOSE, response.status)
             return false
         }
         return true
     }
 
+    /**
+     * Falha de envio é o outro ponto cego em campo (ver docs/analytics.md).
+     * Dispara por passada do worker que falhou — offline, cada retry gera um
+     * evento com status 0, o que também mede quanto tempo o aparelho fica sem rede.
+     */
+    private fun trackUploadFailed(step: String, status: Int?, error: Throwable? = null) {
+        runCatching {
+            Analytics.track(
+                ConnectionTelemetry.EVENT_UPLOAD_FAILED,
+                ConnectionTelemetry.uploadFailed(step, status, error),
+            )
+        }
+    }
+
     companion object {
         private const val TAG = "BackendUploadWorker"
+
+        private const val UPLOAD_STEP_OPEN      = "open_capture"
+        private const val UPLOAD_STEP_BATCH     = "send_batch"
+        private const val UPLOAD_STEP_CLOSE     = "close_capture"
+        private const val UPLOAD_STEP_EXCEPTION = "exception"
         private const val MAX_BATCH = 500   // mesmo teto do endpoint
 
         // Teto por TAMANHO, que é por onde o envio realmente quebrava: o

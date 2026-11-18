@@ -193,6 +193,35 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
 
+    <!-- Smartbox: linha discreta de status (só com a coleta habilitada;
+         sem chave/fazenda fica GONE e a tela é a mesma de antes). -->
+    <TextView
+        android:id="@+id/tvSmartboxStatus"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:textColor="#666666"
+        android:textSize="13sp"
+        android:layout_marginTop="12dp"
+        android:visibility="gone"
+        app:layout_constraintTop_toBottomOf="@id/btnStop"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
+
+    <!-- Smartbox: aviso persistente e calmo (24 h sem conseguir baixar). -->
+    <TextView
+        android:id="@+id/tvSmartboxWarning"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:textColor="#5D4037"
+        android:textSize="13sp"
+        android:padding="12dp"
+        android:background="#FFF8E1"
+        android:layout_marginTop="8dp"
+        android:visibility="gone"
+        app:layout_constraintTop_toBottomOf="@id/tvSmartboxStatus"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
+
     <!-- Info inferior — ancorado no fundo -->
     <TextView
         android:id="@+id/tvInfo"
