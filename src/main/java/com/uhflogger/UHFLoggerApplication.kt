@@ -23,6 +23,8 @@ class UHFLoggerApplication : Application(), Configuration.Provider {
         // Antes de qualquer Service: o UHFReaderService pode ser religado pelo
         // Android (START_STICKY) e já tentar conectar no onCreate dele.
         Analytics.init(this)
+        // Visibilidade de frota: sem isto, aparelho parado não aparece no Mixpanel.
+        Analytics.trackAppStarted(this)
     }
 
     override val workManagerConfiguration: Configuration

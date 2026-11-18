@@ -56,6 +56,29 @@ object Analytics {
         }
     }
 
+    /**
+     * "App Started" (ver [AppTelemetry]). Lê as preferências na thread do
+     * analytics, não na main: o Application.onCreate não pode atrasar.
+     */
+    fun trackAppStarted(context: Context) {
+        if (!enabled) return
+        val app = context.applicationContext
+        submit {
+            val props = AppTelemetry.appStarted(
+                smartboxKeyConfigured = com.uhflogger.smartbox.ble.FieldKey.isConfigured,
+                farmId = com.uhflogger.backend.BackendSettings.getFarmId(app),
+                backendEnabled = com.uhflogger.backend.BackendSettings.isEnabled(app),
+                smartboxAutoCollect = com.uhflogger.smartbox.SmartboxPrefs.isAutoEnabled(app),
+                btConnectGranted = com.uhflogger.smartbox.ble.SmartboxConnection.hasConnectPermission(app),
+                antennaType = com.uhflogger.SettingsManager.getAntennaType(app),
+                wasCapturing = com.uhflogger.SettingsManager.wasCapturing(app),
+            )
+            val json = JSONObject()
+            for ((key, value) in props) if (value != null) json.put(key, value)
+            mixpanel?.track(AppTelemetry.EVENT_APP_STARTED, json)
+        }
+    }
+
     fun track(event: String, properties: Map<String, Any?> = emptyMap()) {
         if (!enabled) return
         submit {
