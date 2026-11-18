@@ -28,6 +28,9 @@ import androidx.core.content.ContextCompat
 import com.hoho.android.usbserial.driver.UsbSerialProber
 import com.uhflogger.databinding.ActivityMainBinding
 import com.uhflogger.service.UHFReaderService
+import com.uhflogger.smartbox.ble.SmartboxConnection
+import com.uhflogger.smartbox.ble.SmartboxTelemetry
+import kotlinx.coroutines.launch
 import com.uhflogger.SettingsManager
 import com.uhflogger.SettingsActivity
 import com.uhflogger.drive.DriveHelper
@@ -160,7 +163,7 @@ class MainActivity : AppCompatActivity() {
                         if (device != null) {
                             if (usbManager.hasPermission(device)) {
                                 stoppedByError = false
-                                readerService?.startCapture(deviceName)
+                                startCaptureYieldingSmartbox(deviceName)
                                 toast("Antena reconectada — retomando leitura")
                             } else {
                                 requestUsbPermission(usbManager, device)
@@ -210,7 +213,7 @@ class MainActivity : AppCompatActivity() {
                         android.os.Handler(mainLooper).postDelayed({
                             if (readerService?.isPaused() == true) {
                                 stoppedByError = false
-                                readerService?.startCapture(connectedName)
+                                startCaptureYieldingSmartbox(connectedName)
                                 toast("$connectedName reconectado — retomando leitura")
                             }
                         }, 2000)
@@ -437,9 +440,39 @@ class MainActivity : AppCompatActivity() {
     private fun startReaderService(deviceName: String) {
         stoppedByError = false
         try {
-            readerService?.startCapture(deviceName)
+            startCaptureYieldingSmartbox(deviceName)
         } catch (e: Exception) {
             toast("Erro ao iniciar captura: ${e.message}")
+        }
+    }
+
+    /**
+     * A leitura de brincos SEMPRE tem prioridade sobre a smartbox (regra do
+     * Igor). Sem sessão de smartbox aberta, começa na hora, sem esperar nada.
+     * Com sessão, pede para ela ceder: termina o lote em mãos (commit + ACK)
+     * e desconecta, com teto de 5 s; aí a captura começa. Nada se perde: o que
+     * faltou baixar fica para a próxima vez.
+     */
+    private fun startCaptureYieldingSmartbox(deviceName: String) {
+        if (!SmartboxConnection.isBusy) {
+            readerService?.startCapture(deviceName)
+            return
+        }
+        // Escopo do processo, não da Activity: se a tela for destruída durante
+        // a espera, a captura começa mesmo assim.
+        val service = readerService
+        SmartboxConnection.appScope.launch {
+            try {
+                SmartboxConnection.yieldForCapture(SmartboxTelemetry.YieldTrigger.START_CAPTURE)
+            } catch (e: Exception) {
+                // Ceder nunca pode impedir a captura de começar.
+                android.util.Log.w("MainActivity", "smartbox não cedeu: ${e.message}")
+            }
+            try {
+                (readerService ?: service)?.startCapture(deviceName)
+            } catch (e: Exception) {
+                toast("Erro ao iniciar captura: ${e.message}")
+            }
         }
     }
 
