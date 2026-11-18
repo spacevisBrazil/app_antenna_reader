@@ -161,6 +161,11 @@ class SmartboxDiagnosticActivity : AppCompatActivity() {
             // Reiniciar só em caixa minha ou sem fazenda (o CHALLENGE é o que vale).
             val mineOrFree = c.farmId == 0L || c.farmId == myFarm
             val enabled = busyText == null
+            if (mineOrFree) {
+                root.addView(button("Configurar", enabled) {
+                    startActivity(SmartboxConfigureActivity.intent(this, target.address, target.moduleId))
+                })
+            }
             root.addView(button("Ler de novo", enabled) { read() })
             root.addView(button(if (raw) "Ver legível" else "Ver texto cru", enabled) { raw = !raw; render() })
             if (mineOrFree) root.addView(button("Reiniciar smartbox", enabled, danger = true) { confirmReboot() })

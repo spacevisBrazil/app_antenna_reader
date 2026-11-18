@@ -239,7 +239,12 @@ class SmartboxSearchActivity : AppCompatActivity() {
                 "É ${FarmLabel.of(adv.farmId, farms).of}. Só um gestor pode transferir, pelo SpaceVis Field.",
             ))
         }
-        // Diagnóstico: minha ou sem fazenda (seção 14.3), em botão próprio na largura toda.
+        // Configurar e Diagnóstico: minha ou sem fazenda (seção 14.3), cada um na largura toda.
+        if (actions.configure && busyHere == null) {
+            c.addView(fullButton("Configurar", enabled = busy == null) {
+                startActivity(SmartboxConfigureActivity.intent(this, box.address, adv.moduleId))
+            })
+        }
         if (actions.diagnose && busyHere == null) {
             c.addView(fullButton("Diagnóstico", enabled = busy == null) {
                 startActivity(SmartboxDiagnosticActivity.intent(this, box.address, adv.moduleId))

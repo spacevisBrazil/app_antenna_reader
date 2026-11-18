@@ -13,8 +13,8 @@ Entrega em PRs pequenos:
 | 1 | Protocolo, cripto, framing, sessão e descarga (JVM, contra simulador) + chave K pelo build | #19 |
 | 2 | Conexão GATT, busca, coordenação do rádio com o leitor, tela Buscar, telemetria | #20 |
 | 3 | Banco local, coleta automática, envio ao backend, tela de progresso | #21 |
-| 4 | Diagnóstico e Reiniciar | este |
-| 5 | Configurar | — |
+| 4 | Diagnóstico e Reiniciar | #22 |
+| 5 | Configurar | este |
 
 ## Chave K (confidencial)
 
@@ -143,3 +143,35 @@ fazenda. A tela faz uma conexão curta (conecta, `GET_DIAG`, desconecta) e mostr
 
 As ações manuais usam `waitIfBusy`: se a coleta automática estiver terminando um lote, a ação
 espera em vez de falhar.
+
+## Configurar (PR 5)
+
+O **Configurar** fica no cartão da tela Buscar e no topo do Diagnóstico, em caixa desta fazenda
+ou sem fazenda. Ele abre uma **sessão longa** (`ConfigSession`): conecta uma vez para ler,
+procurar redes e salvar, manda keep-alive `GET_DIAG` a cada 20 s parado e fecha sozinho depois
+de 10 min sem ação. Se a conexão cair, não reconecta sozinho: oferece **Reconectar**, que mantém
+o que foi digitado.
+
+Contrato com o firmware (`domain/ConfigForm.kt`, puro, porte do `configForm.ts` com os testes):
+
+- **Checkbox:** presente = marcado, ausente = desmarcado. O formulário vai sempre inteiro.
+- **`password` e `act_code`:** nunca voltam do `GET_CONFIG`; em branco, a smartbox mantém o
+  valor salvo. A senha só pode ficar em branco se a rede for a mesma (comparando os bytes) e a
+  original não for aberta.
+- **Chaves desconhecidas** (firmware mais novo) voltam iguais no `SET_CONFIG`.
+- **Modo Window** é validado e enviado mesmo desligado.
+- **Tamanhos** contam bytes UTF-8, não letras: SSID ≤ 31, senha de 8 a 63.
+- **Validação** usa os textos e a ordem do firmware, e para no primeiro erro.
+- **Resumo antes de salvar:** uma linha "• Grupo · Rótulo: antes → depois" por mudança.
+  Bluetooth → Wi-Fi mostra "**Passar para Wi-Fi?**" com o botão como ação destrutiva.
+- **Envio:** tudo em ASCII urlencoded, até 1023 bytes, com `farm_id` da fazenda do aparelho no
+  fim. Status 4/5 = a configuração **foi salva**, só a fazenda foi recusada.
+
+**Redes Wi-Fi** (`domain/WifiOptions.kt`):
+- **Pela smartbox** (só em modo configuração): guarda os bytes exatos do SSID.
+- **Pelo aparelho:** marca como incompatível, com o motivo, na ordem 5 GHz > Enterprise > WPA3.
+
+**Modelos** (`ConfigTemplates.kt`):
+- "Padrão de fábrica" mantém envio, rede, senha e chave.
+- Os modelos salvos não guardam a chave de ativação. A senha do Wi-Fi fica cifrada com uma
+  chave do **Android Keystore**.
