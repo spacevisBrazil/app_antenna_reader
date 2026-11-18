@@ -32,6 +32,38 @@ object SmartboxActions {
         data class Failed(val message: String) : AssignOutcome()
     }
 
+    class DiagResult(val challenge: com.uhflogger.smartbox.ble.Challenge, val text: String, val readAtMs: Long)
+
+    /** Diagnóstico (seção 13): conexão curta, GET_DIAG, desconecta. */
+    suspend fun readDiagnostic(context: Context, target: SmartboxTarget): DiagResult =
+        SmartboxConnection.withSession(
+            context = context,
+            target = target,
+            purpose = SmartboxTelemetry.Purpose.DIAGNOSE,
+            collectMode = CollectMode.MANUAL,
+            waitIfBusy = true,
+        ) { open ->
+            val data = open.session.callOk(Op.GET_DIAG)
+            DiagResult(open.challenge, com.uhflogger.smartbox.ble.Bytes.toAscii(data), System.currentTimeMillis())
+        }
+
+    /** REBOOT (seção 13.3): a smartbox só age quando o aparelho desconecta (o withSession desconecta no finally). */
+    suspend fun reboot(context: Context, target: SmartboxTarget) {
+        SmartboxConnection.withSession(
+            context = context,
+            target = target,
+            purpose = SmartboxTelemetry.Purpose.REBOOT,
+            collectMode = CollectMode.MANUAL,
+            waitIfBusy = true,
+        ) { open -> open.session.callOk(Op.REBOOT) }
+    }
+
+    /** Texto de erro de ação manual, para o card da tela. */
+    fun describe(e: Throwable): String = when (e) {
+        is SmartboxStatusException -> if (e.status == Status.ERROR_TEXT) "a smartbox recusou: ${e.text}" else (e.message ?: "erro")
+        else -> e.message ?: e.javaClass.simpleName
+    }
+
     /**
      * Baixar agora (seção 11.3), só em smartbox desta fazenda: a mesma descarga
      * da coleta automática, ignorando pausa. No fim, avisa o envio.
