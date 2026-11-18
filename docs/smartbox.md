@@ -10,11 +10,11 @@ Entrega em PRs pequenos:
 
 | PR | Conteúdo | Estado |
 |---|---|---|
-| 1 | Protocolo, cripto, framing, sessão e descarga (JVM, contra simulador) + chave K pelo build | este |
-| 2 | Conexão GATT, busca, coordenação do rádio com o leitor, tela Buscar, telemetria | — |
-| 3 | Banco local, coleta automática, envio ao backend, tela de progresso | — |
-| 4 | Diagnóstico e Reiniciar | — |
-| 5 | Configurar | — |
+| 1 | Protocolo, cripto, framing, sessão e descarga (JVM, contra simulador) + chave K pelo build | #19 |
+| 2 | Conexão GATT, busca, coordenação do rádio com o leitor, tela Buscar, telemetria | #20 |
+| 3 | Banco local, coleta automática, envio ao backend, tela de progresso | #21 |
+| 4 | Diagnóstico e Reiniciar | #22 |
+| 5 | Configurar | este |
 
 ## Chave K (confidencial)
 
@@ -54,3 +54,124 @@ nunca imprime o valor.
 
 Os testes ficam em `src/test/.../smartbox/ble/`. O `FakeSmartbox` simula o lado do
 firmware (handshake, sessão cifrada, LOTE/ACK) com a mesma cripto.
+
+## Conexão e busca (PR 2)
+
+| Arquivo | O quê |
+|---|---|
+| `ble/GattClient.kt` | `BluetoothGatt` nativo em coroutines: uma operação por vez, com timeout e status GATT |
+| `ble/SmartboxConnection.kt` | trava global (uma sessão por vez; ocupado = falha na hora), sequência da seção 4.3, 3 tentativas, telemetria, `yieldForCapture` |
+| `ble/SmartboxScanner.kt` | um scan só, com filtro de manufacturer data no hardware; `ScanScheduler` (puro) aplica 6 s entre inícios, vigia de 30 s e reabertura a cada 25 min |
+| `radio/RadioPolicy.kt` | convivência com o leitor (abaixo) |
+| `domain/FarmRules.kt` | ações por fazenda; `FarmLabel` cita a fazenda pelo nome |
+| `sync/SmartboxApi.kt` | cadastro do módulo no backend com a credencial do aparelho |
+| `ui/SmartboxSearchActivity.kt` | tela de técnico Buscar + Cadastrar (Configurações → Smartbox) |
+
+### Prioridade da leitura de brincos
+
+A leitura de brincos **sempre** tem prioridade. A regra fica em `RadioPolicy.decide`:
+
+| Leitor | Smartbox |
+|---|---|
+| Captura por Bluetooth (inclusive conectando ou no loop de reconexão) | não busca nem conecta |
+| Captura por USB | roda em segundo plano, sem tomar a tela |
+| Parado | roda e pode mostrar a tela de progresso (PR 3) |
+
+**Iniciar leitura com uma sessão de smartbox aberta:** `SmartboxConnection.yieldForCapture`
+pede a parada normal, em que a descarga termina o lote em mãos (commit + ACK) e desconecta.
+O teto é de 5 s. Se ele vencer, a sessão é cortada, mas **nunca entre o commit e o ACK**:
+nesse caso a descarga espera o commit terminar e sai sem mandar o ACK (`DownloadControl`). O
+lote volta na próxima conexão e o banco não duplica. Sem sessão aberta, a captura começa na
+hora.
+
+### Perfil e fazenda
+
+- **Minha fazenda** é a selecionada no seletor do servidor SpaceVis. As outras aparecem
+  pelo nome; uma fazenda desconhecida vira "outra fazenda (código N)".
+- **Sem gestor:** o UHF Logger entra com a conta do aparelho, então Transferir, Padrão de
+  fábrica e Tirar da fazenda ficam escondidos (`FarmRules.IS_MANAGER = false`). Essas
+  ações são feitas no SpaceVis Field, com login de gestor.
+
+## Coleta automática e envio (PR 3)
+
+**Zero passo para o operador.** A coleta já vem ligada sempre que o build tem a chave K, o
+aparelho tem fazenda selecionada e a permissão de Bluetooth foi dada. O ideal é a permissão
+vir concedida pelo MDM. Sem qualquer um desses três, não sobe nada (nem serviço nem scan) e a
+tela principal fica igual a antes (`AutoCollectRules.shouldRun`). Só o técnico desliga, em
+Configurações → Smartbox → Coleta automática.
+
+| Peça | O quê |
+|---|---|
+| `collect/SmartboxCollectService.kt` | serviço em primeiro plano `connectedDevice`, com canal, notificação (4201) e ID próprios; convive com o `UHFReaderService`. Sobe no `MainActivity.onStart` com o app na frente. Se o Android recusar, para quieto e não derruba nada |
+| `collect/SmartboxCollector.kt` | laço da seção 7: procura → conecta → baixa → desconecta → respiro de 2 s. Cada sessão roda num Job filho (o corte do yield não mata o laço) e cede o rádio às telas de técnico (`hold`) |
+| `collect/AutoCollectRules.kt` | candidatas e pausas (§7.2/7.3), regra de ligar e regra do aviso de 24 h. Puro e testado |
+| `data/SmartboxDatabase.kt` | Room próprio (`smartbox.db`), separado do banco que já está em campo. Chave única (módulo, epc, porta, instante) + INSERT OR IGNORE; lote numa transação; pendente nunca é apagada; enviada some depois de 7 dias |
+| `sync/SmartboxUploader.kt` | §9.3: lotes de 250 e a classificação do firmware. Só sobe leitura de smartbox que anunciava a fazenda do aparelho. Puro e testado |
+| `sync/SmartboxUploadWorker.kt` | WorkManager: só com rede, um por vez, retry com backoff. Disparado no fim de cada descarga e quando a coleta liga |
+| `ui/SmartboxCollectActivity.kt` | tela de progresso que trava a navegação (leitor parado) |
+
+### O que o operador vê
+
+| Leitor | Tela principal |
+|---|---|
+| Captura por Bluetooth | linha discreta "Smartbox: aguardando a leitura parar" |
+| Captura por USB | linha "Smartbox SPV-…: baixando N de M" + notificação com progresso |
+| Parado | tela de progresso: nome, barra, "N de M leituras", tempo estimado e um único botão, **Parar e ler brincos**. No fim, "Pronto: N leituras guardadas, enviando ao servidor" por ~3 s, e ela fecha sozinha |
+
+- **Parar e ler brincos** não tem lógica própria: faz o mesmo que **Iniciar leitura**
+  (`startCaptureYieldingSmartbox`), ou seja, a smartbox termina o lote em mãos, desconecta, e a
+  captura começa.
+- **Falhas** (fora de alcance, conexão caiu) são silenciosas: o app tenta de novo com as pausas
+  do §7 e registra só na telemetria.
+- **Aviso amarelo** quando uma smartbox da fazenda está por perto (vista na última hora) há
+  24 h com leituras sem conseguir baixar: "A smartbox X não está sendo baixada. Avise o
+  suporte."
+
+## Diagnóstico (PR 4)
+
+Na tela de técnico Buscar, toque em **Diagnóstico** numa smartbox desta fazenda ou sem
+fazenda. A tela faz uma conexão curta (conecta, `GET_DIAG`, desconecta) e mostra:
+
+- **Cabeçalho**, com dados do CHALLENGE: firmware, protocolo, MAC, modo (e o motivo, se em
+  configuração), pendentes e a fazenda pelo nome.
+- **Estado interno** legível, com as cores da seção 13.2 (`domain/DiagFormat.kt`, puro e
+  testado): relógio comparado com o aparelho no instante da leitura, antenas juntas e em ordem
+  (antena ausente nunca vira 0), temperatura numa linha só. Também dá para ver o **texto cru**.
+- **Reiniciar smartbox**, com confirmação e uma conexão nova. Só aparece em caixa minha ou sem
+  fazenda, segundo o CHALLENGE.
+- **Padrão de fábrica** não existe no UHF Logger: só o gestor faz, no SpaceVis Field.
+
+As ações manuais usam `waitIfBusy`: se a coleta automática estiver terminando um lote, a ação
+espera em vez de falhar.
+
+## Configurar (PR 5)
+
+O **Configurar** fica no cartão da tela Buscar e no topo do Diagnóstico, em caixa desta fazenda
+ou sem fazenda. Ele abre uma **sessão longa** (`ConfigSession`): conecta uma vez para ler,
+procurar redes e salvar, manda keep-alive `GET_DIAG` a cada 20 s parado e fecha sozinho depois
+de 10 min sem ação. Se a conexão cair, não reconecta sozinho: oferece **Reconectar**, que mantém
+o que foi digitado.
+
+Contrato com o firmware (`domain/ConfigForm.kt`, puro, porte do `configForm.ts` com os testes):
+
+- **Checkbox:** presente = marcado, ausente = desmarcado. O formulário vai sempre inteiro.
+- **`password` e `act_code`:** nunca voltam do `GET_CONFIG`; em branco, a smartbox mantém o
+  valor salvo. A senha só pode ficar em branco se a rede for a mesma (comparando os bytes) e a
+  original não for aberta.
+- **Chaves desconhecidas** (firmware mais novo) voltam iguais no `SET_CONFIG`.
+- **Modo Window** é validado e enviado mesmo desligado.
+- **Tamanhos** contam bytes UTF-8, não letras: SSID ≤ 31, senha de 8 a 63.
+- **Validação** usa os textos e a ordem do firmware, e para no primeiro erro.
+- **Resumo antes de salvar:** uma linha "• Grupo · Rótulo: antes → depois" por mudança.
+  Bluetooth → Wi-Fi mostra "**Passar para Wi-Fi?**" com o botão como ação destrutiva.
+- **Envio:** tudo em ASCII urlencoded, até 1023 bytes, com `farm_id` da fazenda do aparelho no
+  fim. Status 4/5 = a configuração **foi salva**, só a fazenda foi recusada.
+
+**Redes Wi-Fi** (`domain/WifiOptions.kt`):
+- **Pela smartbox** (só em modo configuração): guarda os bytes exatos do SSID.
+- **Pelo aparelho:** marca como incompatível, com o motivo, na ordem 5 GHz > Enterprise > WPA3.
+
+**Modelos** (`ConfigTemplates.kt`):
+- "Padrão de fábrica" mantém envio, rede, senha e chave.
+- Os modelos salvos não guardam a chave de ativação. A senha do Wi-Fi fica cifrada com uma
+  chave do **Android Keystore**.

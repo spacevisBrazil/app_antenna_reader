@@ -24,20 +24,68 @@ class DownloadDeps(
     val persistBatch: suspend (List<Reading>) -> Unit,
     val now: () -> Long,
     val onProgress: (DownloadProgress) -> Unit = {},
-    /**
-     * Consultado depois de cada ACK: true = parar ali (ex.: o leitor pediu o
-     * rádio). Nunca interrompe entre commit e ACK.
-     */
-    val shouldStop: () -> Boolean = { false },
+    /** Pedido de parada vindo de fora (o leitor quer o rádio). Ver [DownloadControl]. */
+    val control: DownloadControl = DownloadControl(),
 )
+
+/**
+ * Como parar uma descarga em andamento sem perder dado (regras do Igor:
+ * "Parar e ler brincos" e "Iniciar leitura" no meio da coleta).
+ *
+ * - [requestStop]: parada normal. A descarga termina o lote em mãos (commit +
+ *   ACK) e para antes de pedir o próximo.
+ * - [forceCut]: o teto de espera venceu. Fora da janela commit → ACK, corta
+ *   na hora (o lote em mãos volta na próxima conexão, o banco não duplica).
+ *   DENTRO da janela, não corta: espera o commit terminar, e a descarga sai
+ *   SEM mandar o ACK. Cortar no meio de uma transação do banco é seguro, mas
+ *   desperdiça o lote; mandar o ACK depois de "cortado" contradiz o pedido.
+ *
+ * Thread-safe: quem pede é a UI/yield; quem consulta é a coroutine da descarga.
+ */
+class DownloadControl {
+    private val lock = Any()
+    @Volatile var stopRequested = false
+        private set
+    private var forced = false
+    private var committing = false
+
+    /** Progresso visto pelo último ACK (para o evento Collect Yielded). */
+    @Volatile var received = 0
+        internal set
+    @Volatile var remaining: Long? = null
+        internal set
+
+    fun requestStop() {
+        stopRequested = true
+    }
+
+    /** @return true se cortou agora; false se adiou para o fim do commit (sem ACK). */
+    fun forceCut(cut: () -> Unit): Boolean {
+        val cutNow = synchronized(lock) {
+            stopRequested = true
+            forced = true
+            !committing
+        }
+        if (cutNow) cut()
+        return cutNow
+    }
+
+    val isForced: Boolean get() = synchronized(lock) { forced }
+
+    internal fun beginCommit() = synchronized(lock) { committing = true }
+
+    internal fun endCommit() = synchronized(lock) { committing = false }
+}
 
 data class DownloadResult(
     val batches: Int,
     val readings: Int,
     val remaining: Long,
     val durationMs: Long,
-    /** true = parou a pedido de [DownloadDeps.shouldStop], com lote(s) ainda na smartbox. */
+    /** true = parou a pedido do [DownloadControl], com lote(s) ainda na smartbox. */
     val stoppedEarly: Boolean,
+    /** true = o corte forçado caiu durante o commit: o lote foi gravado mas NÃO confirmado (volta na próxima). */
+    val ackSkipped: Boolean = false,
 )
 
 class DownloadException(message: String, val kind: Kind) : Exception(message) {
@@ -111,8 +159,20 @@ object SmartboxDownload {
             }
             if (counted != head.total) throw ProtocolException("LOTE: soma dos registros não bate")
 
-            // Commit primeiro. Só então o ACK.
-            deps.persistBatch(readings)
+            // Commit primeiro. Só então o ACK. O corte forçado não entra nesta janela.
+            val control = deps.control
+            control.beginCommit()
+            val mayAck = try {
+                deps.persistBatch(readings)
+            } finally {
+                // Também no erro do commit, para não deixar o corte forçado travado.
+                control.endCommit()
+            }.let { !control.isForced }
+            if (!mayAck) {
+                // Corte pedido durante o commit: sai sem ACK. O lote já está no
+                // banco e volta na próxima conexão; o INSERT OR IGNORE não duplica.
+                return DownloadResult(batches, received, remaining, deps.now() - startedAt, stoppedEarly = true, ackSkipped = true)
+            }
 
             remaining = parseAckResponse(ensureOk(session.call(Op.ACK, buildAckRequest(head.lastSeq))))
             lastAckedSeq = head.lastSeq
@@ -120,8 +180,10 @@ object SmartboxDownload {
             received += readings.size
             val elapsed = maxOf(1L, deps.now() - startedAt)
             deps.onProgress(DownloadProgress(received, remaining, (received * 1000L / elapsed).toInt()))
+            control.received = received
+            control.remaining = remaining
 
-            if (remaining > 0 && deps.shouldStop()) {
+            if (remaining > 0 && control.stopRequested) {
                 return DownloadResult(batches, received, remaining, deps.now() - startedAt, stoppedEarly = true)
             }
         }

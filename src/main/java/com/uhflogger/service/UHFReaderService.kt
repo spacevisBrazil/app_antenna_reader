@@ -1,5 +1,7 @@
 package com.uhflogger.service
 
+import com.uhflogger.smartbox.radio.RadioPolicy
+import com.uhflogger.smartbox.radio.ReaderRadio
 import com.uhflogger.analytics.Analytics
 import com.uhflogger.analytics.ConnectionTelemetry
 import com.uhflogger.analytics.ConnectionTelemetry.DropReason
@@ -511,7 +513,8 @@ class UHFReaderService : Service(), SensorEventListener {
 
     private var appContext: Context? = null
     private var activeAntennaType : String  = SettingsManager.ANTENNA_TYPE_JIETONG
-    private var activeIsBluetooth : Boolean = false  // true=BT session, false=USB session
+    // @Volatile: lido também pela smartbox (ReaderRadio), fora das threads do serviço.
+    @Volatile private var activeIsBluetooth : Boolean = false  // true=BT session, false=USB session
 
     // Telemetria de conexão (ver analytics/ConnectionTelemetry e docs/analytics.md).
     // Só OBSERVA o estado — nada aqui participa de decisão de conexão/reconexão.
@@ -566,6 +569,18 @@ class UHFReaderService : Service(), SensorEventListener {
         super.onCreate()
         appContext = applicationContext
         tagFilterEngine = TagFilterEngine(appContext!!)
+
+        // Smartbox: só LÊ o estado do leitor para ceder o rádio (ver
+        // smartbox/radio/RadioPolicy). Nada daqui muda a conexão do leitor.
+        ReaderRadio.provider = {
+            val started = connectStartedAt
+            RadioPolicy.deriveReaderState(
+                running = isRunning.get(),
+                paused = isPausedState.get() || btReconnectActive.get() || usbReconnectActive.get(),
+                bluetooth = activeIsBluetooth,
+                msSinceStartRequested = if (started > 0) System.currentTimeMillis() - started else Long.MAX_VALUE,
+            )
+        }
         createNotificationChannel()
         startForegroundWithSafeType()
 
@@ -665,6 +680,7 @@ class UHFReaderService : Service(), SensorEventListener {
                 } catch (_: Exception) {}
             }
         }
+        ReaderRadio.provider = null
         stopCapture(userInitiated = false)
         stopLocationAndSensors()
         releaseCaptureWakeLock()

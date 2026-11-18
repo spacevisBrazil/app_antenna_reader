@@ -3,6 +3,8 @@ package com.uhflogger.smartbox.ble
 import com.uhflogger.smartbox.ble.FakeSmartboxFixtures.MODULE_ID
 import com.uhflogger.smartbox.ble.FakeSmartboxFixtures.handshakeDeps
 import com.uhflogger.smartbox.ble.FakeSmartboxFixtures.reply
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -63,11 +65,11 @@ class DownloadTest {
     private fun deps(
         persisted: MutableList<List<Reading>>,
         log: MutableList<String> = mutableListOf(),
-        shouldStop: () -> Boolean = { false },
+        control: DownloadControl = DownloadControl(),
     ) = DownloadDeps(
         persistBatch = { r -> log += "COMMIT ${r.size}"; persisted += r },
         now = { System.currentTimeMillis() },
-        shouldStop = shouldStop,
+        control = control,
     )
 
     @Test
@@ -111,12 +113,78 @@ class DownloadTest {
         val persisted = mutableListOf<List<Reading>>()
         val s = session(FakeSmartbox(handler = loteHandler(listOf(10, 20, 30), log)))
 
-        val result = SmartboxDownload.downloadAll(s, deps(persisted, log, shouldStop = { true }))
+        val control = DownloadControl().also { it.requestStop() }
+        val result = SmartboxDownload.downloadAll(s, deps(persisted, log, control))
+        assertEquals(10, control.received)
+        assertEquals(50L, control.remaining)
 
         assertTrue(result.stoppedEarly)
         assertEquals(1, result.batches)
         assertEquals(50L, result.remaining)
         assertEquals(listOf("LOTE 0", "COMMIT 10", "ACK"), log)
+    }
+
+    @Test
+    fun `corte forcado durante o commit espera o commit e nao manda o ACK`() = runTest {
+        val log = mutableListOf<String>()
+        val control = DownloadControl()
+        val commitStarted = CompletableDeferred<Unit>()
+        val releaseCommit = CompletableDeferred<Unit>()
+        var cutCalled = false
+        val s = session(FakeSmartbox(handler = loteHandler(listOf(10, 20), log)))
+
+        val download = async {
+            SmartboxDownload.downloadAll(
+                s,
+                DownloadDeps(
+                    persistBatch = { r ->
+                        commitStarted.complete(Unit)
+                        releaseCommit.await()
+                        log += "COMMIT ${r.size}"
+                    },
+                    now = { 0L },
+                    control = control,
+                ),
+            )
+        }
+        commitStarted.await()
+        // Teto venceu no meio do commit: não corta agora.
+        assertFalse(control.forceCut { cutCalled = true })
+        assertFalse(cutCalled)
+        releaseCommit.complete(Unit)
+
+        val result = download.await()
+        assertFalse(cutCalled)
+        assertTrue(result.ackSkipped)
+        assertTrue(result.stoppedEarly)
+        assertEquals(0, result.batches)
+        assertEquals(listOf("LOTE 0", "COMMIT 10"), log)   // sem ACK
+    }
+
+    @Test
+    fun `corte forcado fora do commit corta na hora`() = runTest {
+        val control = DownloadControl()
+        var cutCalled = false
+        assertTrue(control.forceCut { cutCalled = true })
+        assertTrue(cutCalled)
+        assertTrue(control.stopRequested)
+    }
+
+    @Test
+    fun `commit que falha libera o corte forcado`() = runTest {
+        val control = DownloadControl()
+        val s = session(FakeSmartbox(handler = loteHandler(listOf(5), mutableListOf())))
+        try {
+            SmartboxDownload.downloadAll(
+                s,
+                DownloadDeps(persistBatch = { throw IllegalStateException("disco cheio") }, now = { 0L }, control = control),
+            )
+            fail("deveria lançar")
+        } catch (_: IllegalStateException) {
+        }
+        var cutCalled = false
+        assertTrue(control.forceCut { cutCalled = true })
+        assertTrue(cutCalled)
     }
 
     @Test
