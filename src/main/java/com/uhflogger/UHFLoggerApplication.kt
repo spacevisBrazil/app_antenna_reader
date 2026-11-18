@@ -3,6 +3,7 @@ package com.uhflogger
 import android.app.Application
 import androidx.work.Configuration
 import androidx.work.WorkManager
+import com.uhflogger.analytics.Analytics
 import java.util.concurrent.Executors
 
 /**
@@ -16,6 +17,13 @@ import java.util.concurrent.Executors
  * Combinado com os locks em DriveUploadWorker e DriveHelper, fornece defesa em profundidade.
  */
 class UHFLoggerApplication : Application(), Configuration.Provider {
+
+    override fun onCreate() {
+        super.onCreate()
+        // Antes de qualquer Service: o UHFReaderService pode ser religado pelo
+        // Android (START_STICKY) e já tentar conectar no onCreate dele.
+        Analytics.init(this)
+    }
 
     override val workManagerConfiguration: Configuration
         get() = Configuration.Builder()

@@ -125,12 +125,19 @@ android {
             resValue "string", "app_name", "UHF Logger HML"
             buildConfigField "String", "API_BASE_URL",
                 '"https://backend-cattlevis-q3zndqt2pq-uc.a.run.app"'
+            // Vazio = Analytics no-op: homologação não suja o projeto de produção.
+            buildConfigField "String", "MIXPANEL_TOKEN", '""'
         }
         prd {
             dimension "ambiente"
             resValue "string", "app_name", "UHF Logger"
             buildConfigField "String", "API_BASE_URL",
                 '"https://backend-cattlevis-3p6nhqmpoa-uc.a.run.app"'
+            // Token PÚBLICO de cliente do Mixpanel (vai em todo APK por
+            // natureza; não é segredo). Mesmo projeto do spacevis-mobile — ver
+            // docs/analytics.md.
+            buildConfigField "String", "MIXPANEL_TOKEN",
+                '"d05f0d7bd6ebdaf85ad1cd0372fbe372"'
         }
     }
 
@@ -177,6 +184,9 @@ dependencies {
 
     // WorkManager
     implementation 'androidx.work:work-runtime-ktx:2.9.0'
+
+    // Telemetria de conexão do leitor — ver docs/analytics.md
+    implementation 'com.mixpanel.android:mixpanel-android:8.11.1'
 
     // Room — KSP 2.3.9 + Room 2.7.1 + Kotlin 2.3.21 + AGP 9.2.1
     implementation libs.room.runtime

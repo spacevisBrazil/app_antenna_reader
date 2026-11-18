@@ -1,5 +1,9 @@
 package com.uhflogger.service
 
+import com.uhflogger.analytics.Analytics
+import com.uhflogger.analytics.ConnectionTelemetry
+import com.uhflogger.analytics.ConnectionTelemetry.DropReason
+import com.uhflogger.analytics.ConnectionTelemetry.Step
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -509,6 +513,19 @@ class UHFReaderService : Service(), SensorEventListener {
     private var activeAntennaType : String  = SettingsManager.ANTENNA_TYPE_JIETONG
     private var activeIsBluetooth : Boolean = false  // true=BT session, false=USB session
 
+    // Telemetria de conexão (ver analytics/ConnectionTelemetry e docs/analytics.md).
+    // Só OBSERVA o estado — nada aqui participa de decisão de conexão/reconexão.
+    @Volatile private var connectStartedAt   = 0L  // início da tentativa atual (startCapture)
+    @Volatile private var connectionOpenedAt = 0L  // quando a conexão atual ficou de pé
+    // Escrito pelos loops ANTES de chamar startCapture(); 0 = início manual/retomada.
+    @Volatile private var reconnectAttempt   = 0
+    // Foto de reconnectAttempt tirada no startCapture(): o loop zera o contador
+    // quando vê isRunning=true, possivelmente antes do evento de abertura sair.
+    @Volatile private var connectAttempt     = 0
+    // Quem fechou a porta de propósito (watchdog/config) avisa aqui, pra queda
+    // não ser contada como erro de leitura — o IOException ali é efeito, não causa.
+    private val dropReasonHint = java.util.concurrent.atomic.AtomicReference<String?>(null)
+
     // =========================================================================
     // Watchdog de silêncio — detecta "conexão zumbi": o socket continua de pé
     // (nenhum erro é lançado, então o mecanismo normal de reconexão nunca é
@@ -724,6 +741,9 @@ class UHFReaderService : Service(), SensorEventListener {
         activeIsBluetooth = isBtDeviceAllowed(deviceName)
         winnixRingClear()  // descarta bytes residuais da sessão anterior
 
+        connectStartedAt = System.currentTimeMillis()
+        connectAttempt   = reconnectAttempt
+
         if (isBtDeviceAllowed(deviceName)) {
             startBtConnection(deviceName, resuming)
         } else {
@@ -756,10 +776,18 @@ class UHFReaderService : Service(), SensorEventListener {
         val usbManager = getSystemService(Context.USB_SERVICE) as UsbManager
         val drivers    = UsbSerialProber.getDefaultProber().findAllDrivers(usbManager)
         val driver     = drivers.firstOrNull { it.device.deviceName == deviceName }
-            ?: run { Log.e(TAG, "Device not found: $deviceName"); if (!resuming) CsvExporter.cancelSession(); isPausedState.set(resuming); return }
+            ?: run {
+                Log.e(TAG, "Device not found: $deviceName")
+                trackConnectFailed(false, Step.DEVICE_LOOKUP, message = "not enumerated (${drivers.size} serial drivers found)")
+                if (!resuming) CsvExporter.cancelSession(); isPausedState.set(resuming); return
+            }
 
         val connection = usbManager.openDevice(driver.device)
-            ?: run { Log.e(TAG, "USB permission denied"); if (!resuming) CsvExporter.cancelSession(); isPausedState.set(resuming); return }
+            ?: run {
+                Log.e(TAG, "USB permission denied")
+                trackConnectFailed(false, Step.USB_PERMISSION, message = "openDevice returned null")
+                if (!resuming) CsvExporter.cancelSession(); isPausedState.set(resuming); return
+            }
 
         val port = driver.ports[0]
         try {
@@ -769,6 +797,7 @@ class UHFReaderService : Service(), SensorEventListener {
             port.rts = true
         } catch (e: Exception) {
             Log.e(TAG, "Error opening USB port", e)
+            trackConnectFailed(false, Step.USB_OPEN, e)
             port.close(); connection.close()
             if (!resuming) CsvExporter.cancelSession()
             isPausedState.set(resuming)
@@ -784,6 +813,7 @@ class UHFReaderService : Service(), SensorEventListener {
             val label = if (activeAntennaType == SettingsManager.ANTENNA_TYPE_WINNIX) "Winnix" else "Jietong"
             val msg   = "Antena $label não detectada. Verifique a conexão e o tipo configurado."
             Log.w(TAG, msg)
+            trackConnectFailed(false, Step.PROBE, message = "no valid probe response ($activeAntennaType)")
             isRunning.set(false)
             if (resuming) isPausedState.set(true)
             closePort()
@@ -792,6 +822,9 @@ class UHFReaderService : Service(), SensorEventListener {
         }
 
         isRunning.set(true)
+        // Antes de disparar a configuração assíncrona: se ela falhar, a queda
+        // (config_error) precisa encontrar connectionOpenedAt já preenchido.
+        trackConnectOpened(false, resuming, deviceName)
         lastDataReceivedAt = System.currentTimeMillis()
         lastProbeSentAt = 0L
         consecutiveFailedProbes = 0
@@ -817,6 +850,7 @@ class UHFReaderService : Service(), SensorEventListener {
                     if (ctx.checkSelfPermission(android.Manifest.permission.BLUETOOTH_CONNECT)
                         != android.content.pm.PackageManager.PERMISSION_GRANTED) {
                         Log.e(TAG, "BT_CONNECT: BLUETOOTH_CONNECT permission not granted")
+                        trackConnectFailed(true, Step.PERMISSION, message = "BLUETOOTH_CONNECT not granted")
                         if (!resuming) CsvExporter.cancelSession()
                         isPausedState.set(resuming)
                         onWrongAntennaType?.invoke("Permissão Bluetooth não concedida.")
@@ -826,7 +860,11 @@ class UHFReaderService : Service(), SensorEventListener {
 
                 val btManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
                 val adapter   = btManager.adapter
-                    ?: run { Log.e(TAG, "BT_CONNECT: Bluetooth not available"); if (!resuming) CsvExporter.cancelSession(); isPausedState.set(resuming); return@submit }
+                    ?: run {
+                        Log.e(TAG, "BT_CONNECT: Bluetooth not available")
+                        trackConnectFailed(true, Step.ADAPTER, message = "no bluetooth adapter")
+                        if (!resuming) CsvExporter.cancelSession(); isPausedState.set(resuming); return@submit
+                    }
 
                 Log.i(TAG, "BT_CONNECT: searching for paired device '$deviceName'")
                 @Suppress("DEPRECATION")
@@ -834,11 +872,13 @@ class UHFReaderService : Service(), SensorEventListener {
                     adapter.bondedDevices?.firstOrNull { it.name == deviceName }
                 } catch (se: SecurityException) {
                     Log.e(TAG, "BT_CONNECT: SecurityException on bondedDevices: ${se.message}")
+                    trackConnectFailed(true, Step.DEVICE_LOOKUP, se)
                     if (!resuming) CsvExporter.cancelSession()
                     isPausedState.set(resuming)
                     return@submit
                 } ?: run {
                     Log.e(TAG, "BT_CONNECT: device '$deviceName' not found in paired devices")
+                    trackConnectFailed(true, Step.DEVICE_LOOKUP, message = "not in paired devices")
                     if (!resuming) CsvExporter.cancelSession()
                     isPausedState.set(resuming)
                     return@submit
@@ -855,6 +895,7 @@ class UHFReaderService : Service(), SensorEventListener {
                     // a cada BT_RECONNECT_INTERVAL_MS indefinidamente. Falhar rápido aqui
                     // e deixar o loop externo tentar é mais eficaz.
                     Log.e(TAG, "BT_CONNECT: socket connect FAILED: ${e.message}")
+                    trackConnectFailed(true, Step.SOCKET_CONNECT, e)
                     btPort.close()
                     if (!resuming) CsvExporter.cancelSession()
                     isPausedState.set(resuming)
@@ -875,6 +916,8 @@ class UHFReaderService : Service(), SensorEventListener {
                         Thread.sleep(BT_RETRY_DELAY_MS)
                         startBtConnection(deviceName, resuming, retryCount + 1)
                     } else {
+                        // Só a falha final do probe vira evento; a 1ª é absorvida pelo retry local.
+                        trackConnectFailed(true, Step.PROBE, message = "no valid probe response after retry")
                         isRunning.set(false)
                         if (resuming) isPausedState.set(true)
                         onWrongAntennaType?.invoke("$deviceName: módulo não respondeu.")
@@ -884,6 +927,7 @@ class UHFReaderService : Service(), SensorEventListener {
 
                 Log.i(TAG, "BT_CONNECT: probe OK — starting Winnix capture")
                 isRunning.set(true)
+                trackConnectOpened(true, resuming, deviceName)  // antes da config assíncrona — ver USB
                 lastDataReceivedAt = System.currentTimeMillis()
                 lastProbeSentAt = 0L
                 consecutiveFailedProbes = 0
@@ -895,6 +939,7 @@ class UHFReaderService : Service(), SensorEventListener {
 
             } catch (e: Exception) {
                 Log.e(TAG, "BT_CONNECT: unexpected error: ${e.message}", e)
+                trackConnectFailed(true, Step.UNEXPECTED, e)
                 if (!resuming) CsvExporter.cancelSession()
                 isPausedState.set(resuming)
             }
@@ -1114,6 +1159,7 @@ class UHFReaderService : Service(), SensorEventListener {
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Winnix USB startup error", e)
+                dropReasonHint.set(DropReason.CONFIG_ERROR)
                 handleRunError(e)
             }
         }
@@ -1161,6 +1207,7 @@ class UHFReaderService : Service(), SensorEventListener {
 
             } catch (e: Exception) {
                 Log.e(TAG, "Winnix BT startup error", e)
+                dropReasonHint.set(DropReason.CONFIG_ERROR)
                 handleRunError(e)
             }
         }
@@ -1577,6 +1624,7 @@ class UHFReaderService : Service(), SensorEventListener {
      * — só destravar o que já existe.
      */
     private fun forceReconnectDueToSilence() {
+        dropReasonHint.set(DropReason.WATCHDOG_SILENCE)
         try {
             synchronized(this) { activePort?.close() }
         } catch (e: Exception) {
@@ -1587,6 +1635,9 @@ class UHFReaderService : Service(), SensorEventListener {
     private fun handleRunError(e: Exception) {
         Log.e(TAG, "Serial read error — device likely disconnected", e)
         if (!isRunning.compareAndSet(true, false)) return
+        // Daqui pra baixo é queda de verdade: stopCapture() já baixou isRunning
+        // antes de fechar a porta, então um Parar do usuário não chega aqui.
+        trackConnectionDropped(e)
         isPausedState.set(true)
         stopAutoSaveTimer()
         ioManager?.stop();   ioManager   = null
@@ -1627,6 +1678,7 @@ class UHFReaderService : Service(), SensorEventListener {
         usbReconnectActive.set(true)
         usbReconnectExecutor?.submit {
             Log.i(TAG, "USB_RECONNECT: loop started, will retry every ${USB_RECONNECT_INTERVAL_MS}ms")
+            val loopStartedAt = System.currentTimeMillis()
             var attempt = 0
             while (usbReconnectActive.get() && !isRunning.get()) {
                 attempt++
@@ -1643,6 +1695,7 @@ class UHFReaderService : Service(), SensorEventListener {
                 // aconteceu num teste real de 12h+ sem supervisão.
                 try {
                     Log.i(TAG, "USB_RECONNECT: attempt #$attempt — calling startCapture (same as Start button)")
+                    reconnectAttempt = attempt
                     startCapture(deviceName)
 
                     var waited = 0L
@@ -1655,6 +1708,8 @@ class UHFReaderService : Service(), SensorEventListener {
                 }
             }
             Log.i(TAG, "USB_RECONNECT: loop exiting — isRunning=${isRunning.get()}")
+            reconnectAttempt = 0
+            trackReconnectLoop(false, attempt, loopStartedAt)
         }
     }
 
@@ -1681,6 +1736,7 @@ class UHFReaderService : Service(), SensorEventListener {
         btReconnectActive.set(true)
         btReconnectExecutor?.submit {
             Log.i(TAG, "BT_RECONNECT: loop started, will retry every ${BT_RECONNECT_INTERVAL_MS}ms")
+            val loopStartedAt = System.currentTimeMillis()
             var attempt = 0
             while (btReconnectActive.get() && !isRunning.get()) {
                 attempt++
@@ -1706,6 +1762,7 @@ class UHFReaderService : Service(), SensorEventListener {
                 // parando de tentar reconectar. Foi exatamente isso que
                 // aconteceu num teste real de 12h+ sem supervisão.
                 try {
+                    reconnectAttempt = attempt
                     startCapture(activeDeviceName ?: BT_DEVICE_NAME)
 
                     // Polling em pequenos incrementos — sai assim que isRunning se tornar true,
@@ -1725,7 +1782,86 @@ class UHFReaderService : Service(), SensorEventListener {
                 }
             }
             Log.i(TAG, "BT_RECONNECT: loop ended after $attempt attempts (active=${btReconnectActive.get()} isRunning=${isRunning.get()})")
+            reconnectAttempt = 0
+            trackReconnectLoop(true, attempt, loopStartedAt)
         }
+    }
+
+    // =========================================================================
+    // Telemetria de conexão — runCatching em volta de tudo: montar o evento
+    // roda na thread do serial/loops e jamais pode lançar ali. O envio em si
+    // já é assíncrono (Analytics).
+    // =========================================================================
+    private fun trackConnectFailed(isBt: Boolean, step: String, error: Throwable? = null, message: String? = null) {
+        runCatching {
+            Analytics.track(
+                ConnectionTelemetry.EVENT_FAILED,
+                ConnectionTelemetry.failed(
+                    transport  = ConnectionTelemetry.transport(isBt),
+                    step       = step,
+                    error      = error,
+                    attempt    = connectAttempt,
+                    durationMs = System.currentTimeMillis() - connectStartedAt,
+                    btEnabled  = if (isBt) btEnabledOrNull() else null,
+                    message    = message,
+                ),
+            )
+        }
+    }
+
+    private fun trackConnectOpened(isBt: Boolean, resuming: Boolean, deviceName: String) {
+        runCatching {
+            val now = System.currentTimeMillis()
+            connectionOpenedAt = now
+            dropReasonHint.set(null)
+            Analytics.track(
+                ConnectionTelemetry.EVENT_OPENED,
+                ConnectionTelemetry.opened(
+                    transport  = ConnectionTelemetry.transport(isBt),
+                    durationMs = now - connectStartedAt,
+                    attempt    = connectAttempt,
+                    resuming   = resuming,
+                    deviceName = deviceName,
+                ),
+            )
+        }
+    }
+
+    private fun trackConnectionDropped(error: Throwable) {
+        runCatching {
+            val openedAt = connectionOpenedAt
+            connectionOpenedAt = 0L
+            Analytics.track(
+                ConnectionTelemetry.EVENT_DROPPED,
+                ConnectionTelemetry.dropped(
+                    transport = ConnectionTelemetry.transport(activeIsBluetooth),
+                    reason    = ConnectionTelemetry.dropReason(dropReasonHint.getAndSet(null)),
+                    error     = error,
+                    openMs    = if (openedAt > 0) System.currentTimeMillis() - openedAt else null,
+                ),
+            )
+        }
+    }
+
+    private fun trackReconnectLoop(isBt: Boolean, attempts: Int, loopStartedAt: Long) {
+        runCatching {
+            Analytics.track(
+                ConnectionTelemetry.EVENT_RECONNECT_LOOP,
+                ConnectionTelemetry.reconnectLoop(
+                    transport   = ConnectionTelemetry.transport(isBt),
+                    reconnected = isRunning.get(),
+                    attempts    = attempts,
+                    totalMs     = System.currentTimeMillis() - loopStartedAt,
+                ),
+            )
+        }
+    }
+
+    /** null quando não dá pra saber (sem adaptador, sem permissão). */
+    private fun btEnabledOrNull(): Boolean? = try {
+        (getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter?.isEnabled
+    } catch (_: Exception) {
+        null
     }
 
     // =========================================================================
