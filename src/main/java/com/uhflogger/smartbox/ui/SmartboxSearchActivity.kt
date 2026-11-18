@@ -23,6 +23,7 @@ import androidx.lifecycle.repeatOnLifecycle
 import com.uhflogger.backend.BackendSettings
 import com.uhflogger.smartbox.SmartboxActions
 import com.uhflogger.smartbox.ble.FieldKey
+import com.uhflogger.smartbox.collect.SmartboxCollector
 import com.uhflogger.smartbox.ble.NearbySmartbox
 import com.uhflogger.smartbox.ble.SmartboxConnection
 import com.uhflogger.smartbox.ble.SmartboxScanner
@@ -62,6 +63,7 @@ class SmartboxSearchActivity : AppCompatActivity() {
 
     private lateinit var root: LinearLayout
     private var releaseScan: (() -> Unit)? = null
+    private var releaseCollector: (() -> Unit)? = null
 
     /** Smartbox com ação em andamento e o texto de progresso. */
     private var busy: Pair<String, String>? = null
@@ -98,6 +100,8 @@ class SmartboxSearchActivity : AppCompatActivity() {
     override fun onStart() {
         super.onStart()
         if (!FieldKey.isConfigured) return
+        // A coleta automática cede o rádio enquanto esta tela está aberta.
+        releaseCollector = SmartboxCollector.hold()
         if (!SmartboxScanner.hasScanPermission(this)) requestBlePermissions()
         releaseScan = SmartboxScanner.request(this, "search")
     }
@@ -105,6 +109,8 @@ class SmartboxSearchActivity : AppCompatActivity() {
     override fun onStop() {
         releaseScan?.invoke()
         releaseScan = null
+        releaseCollector?.invoke()
+        releaseCollector = null
         super.onStop()
     }
 
@@ -188,7 +194,7 @@ class SmartboxSearchActivity : AppCompatActivity() {
                 root.addView(fullButton("Procurar de novo") { SmartboxScanner.retryNow() })
             }
             Status.PAUSED_FOR_CONNECTION ->
-                root.addView(statusText(activeId?.let { "Conectado em ${displayName(it)}…" } ?: "Esperando a conexão terminar…"))
+                root.addView(statusText(activeId?.let { "Esperando a conexão com ${displayName(it)} terminar…" } ?: "Esperando a conexão terminar…"))
             Status.BLOCKED_BY_READER ->
                 root.addView(noticeCard("O leitor está lendo pelo Bluetooth. Pare a captura para usar a smartbox.", error = false))
             Status.SCANNING, Status.IDLE ->
@@ -224,6 +230,7 @@ class SmartboxSearchActivity : AppCompatActivity() {
             actions.needsAppUpdate ->
                 c.addView(noticeCard("Smartbox no protocolo ${adv.proto}; este app fala o 2. Atualize o app.", error = true))
             busyHere != null -> c.addView(statusText(busyHere.second))
+            actions.download -> c.addView(fullButton("Baixar agora", enabled = busy == null) { download(box, myFarmId) })
             actions.register -> c.addView(fullButton("Cadastrar nesta fazenda", enabled = busy == null) { assign(box, myFarmId, farms) })
             actions.transferBlockedByWifi -> c.addView(mutedText(
                 "Está em Wi-Fi e é ${FarmLabel.of(adv.farmId, farms).of}. Para trazer para esta fazenda, configure com uma chave de ativação desta fazenda.",
@@ -255,6 +262,24 @@ class SmartboxSearchActivity : AppCompatActivity() {
                     "$name está em Wi-Fi e é ${FarmLabel.of(outcome.farmId, farms).of}. Para trazer para esta fazenda, configure com uma chave de ativação desta fazenda." to true
                 is SmartboxActions.AssignOutcome.Failed -> outcome.message to true
             }
+            rerender()
+        }
+    }
+
+    private fun download(box: NearbySmartbox, myFarmId: Int) {
+        val name = displayName(box.adv.moduleId)
+        busy = box.adv.moduleId to "Baixando $name…"
+        lastResult = null
+        rerender()
+        lifecycleScope.launch {
+            val (msg, isError) = SmartboxActions.downloadNow(applicationContext, box, myFarmId) { received, remaining ->
+                runOnUiThread {
+                    busy = box.adv.moduleId to ("Baixando $name: $received" + (remaining?.let { " de ${received + it}" } ?: ""))
+                    rerender()
+                }
+            }
+            busy = null
+            lastResult = msg to isError
             rerender()
         }
     }
