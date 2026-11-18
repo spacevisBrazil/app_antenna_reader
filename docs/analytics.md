@@ -29,6 +29,24 @@ e por que o envio ao backend para. Antes disso só existia `Log.e` no aparelho.
 retomada após restart do processo, e `n` na n-ésima tentativa do loop de reconexão.
 `error_message` vem em uma linha, cortada em 160 caracteres.
 
+### `App Started`
+Um evento por início do **processo** (`UHFLoggerApplication.onCreate`), com a tela aberta ou
+não (WorkManager, boot e serviço religado pelo Android também contam). Serve para ver a frota:
+quem já está na versão nova (`app_version`) e se o aparelho está pronto para a Smartbox.
+
+| Propriedade | |
+|---|---|
+| `smartbox_key_configured` | o build tem a chave K |
+| `farm_selected` / `farm_id` | fazenda selecionada no Servidor SpaceVis |
+| `backend_enabled` | envio do CSV ao servidor ligado |
+| `smartbox_auto_collect` | preferência da coleta automática (padrão: ligada) |
+| `bt_connect_granted` | permissão "Dispositivos próximos" concedida |
+| `antenna_type` | antena configurada |
+| `was_capturing` | o processo subiu com uma captura em andamento (restart/morte do processo) |
+
+A coleta automática só roda com chave + fazenda + permissão + preferência ligada. Um
+`App Started` com algum desses `false` explica uma smartbox que não está sendo baixada.
+
 ### `Reader Connection Opened`
 A conexão ficou de pé (probe OK e captura iniciada).
 Disparado em `startBtConnection` e `startUsbConnection`.
