@@ -55,6 +55,9 @@ jobs:
           UHFLOGGER_STORE_PASSWORD: ${{ secrets.UHFLOGGER_STORE_PASSWORD }}
           UHFLOGGER_KEY_ALIAS: uhflogger
           UHFLOGGER_KEY_PASSWORD: ${{ secrets.UHFLOGGER_KEY_PASSWORD }}
+          # Chave K da smartbox (BLE). Sem o secret, o APK sai com a Smartbox
+          # desligada e um aviso — não falha o build. Ver docs/smartbox.md.
+          SMARTBOX_BLE_KEY: ${{ secrets.SMARTBOX_BLE_KEY }}
         run: ./gradlew testPrdDebugUnitTest assemblePrdRelease
 
       - name: Verify signature and read version
