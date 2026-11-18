@@ -58,6 +58,35 @@ if (!canSignRelease) {
     )
 }
 
+// CHAVE K DA SMARTBOX (BLE) — ver smartbox/ble/FieldKey.kt e docs/smartbox.md
+//
+// Confidencial: nunca no Git, em log ou em chat. Vem de fora, igual às
+// credenciais de assinatura: `smartbox.bleKey` no local.properties (ignorado
+// pelo git) > -PSMARTBOX_BLE_KEY > variável de ambiente SMARTBOX_BLE_KEY (o
+// secret do GitHub Actions). Mesma chave em hml e prd: ela é do firmware, não
+// do backend.
+//
+// Sem chave (ou com valor fora do formato) o build NÃO falha: o app sai com a
+// Smartbox desligada e o aviso na tela. Só aceita 64 hex, o que também impede
+// que um valor estranho quebre o Java gerado do BuildConfig. O Gradle nunca
+// imprime o valor, só se ela está presente.
+def localProps = new Properties()
+def localPropsFile = file('local.properties')
+if (localPropsFile.exists()) {
+    localPropsFile.withInputStream { localProps.load(it) }
+}
+def smartboxKeyRaw = (localProps.getProperty('smartbox.bleKey')
+        ?: project.findProperty('SMARTBOX_BLE_KEY')
+        ?: System.getenv('SMARTBOX_BLE_KEY'))?.toString()?.trim()
+def smartboxKey = (smartboxKeyRaw != null && smartboxKeyRaw ==~ /[0-9a-fA-F]{64}/) ? smartboxKeyRaw.toLowerCase() : ''
+if (smartboxKey.isEmpty()) {
+    logger.warn(
+        "[uhflogger] Chave BLE da smartbox ausente ou invalida — o APK sai com a " +
+        "Smartbox desligada. Configure smartbox.bleKey no local.properties ou o " +
+        "secret SMARTBOX_BLE_KEY (veja docs/smartbox.md)."
+    )
+}
+
 android {
     namespace 'com.uhflogger'
     compileSdk 34
@@ -73,6 +102,8 @@ android {
         def ciBuildNumber = System.getenv('GITHUB_RUN_NUMBER')?.toInteger()
         versionCode ciBuildNumber ? 100 + ciBuildNumber : 14
         versionName "1.4.0" + (ciBuildNumber ? "-b${ciBuildNumber}" : "")
+
+        buildConfigField "String", "SMARTBOX_BLE_KEY", "\"${smartboxKey}\""
     }
 
     signingConfigs {
@@ -165,6 +196,9 @@ android {
 
 dependencies {
     testImplementation libs.junit
+    testImplementation 'org.jetbrains.kotlinx:kotlinx-coroutines-test:1.7.3'
+    // org.json real nos testes de JVM: o do android.jar é stub e lança "not mocked".
+    testImplementation 'org.json:json:20240303'
 
     implementation libs.androidx.core.ktx
     implementation libs.androidx.appcompat
