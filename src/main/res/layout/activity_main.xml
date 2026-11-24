@@ -49,10 +49,17 @@
             android:padding="12dp" />
     </LinearLayout>
 
-    <androidx.constraintlayout.widget.ConstraintLayout
+    <!-- Rola só se não couber (coletor 360x640 com o aviso da smartbox
+         ligado); com espaço sobrando, fillViewport mantém o rodapé no fundo. -->
+    <ScrollView
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1"
+        android:fillViewport="true">
+
+    <androidx.constraintlayout.widget.ConstraintLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
         android:padding="20dp">
 
         <!-- Título -->
@@ -272,7 +279,10 @@
             android:textColor="@color/sv_muted_foreground"
             android:textSize="11sp"
             android:gravity="center"
+            android:layout_marginTop="16dp"
             android:layout_marginBottom="4dp"
+            app:layout_constraintVertical_bias="1"
+            app:layout_constraintTop_toBottomOf="@id/tvSmartboxWarning"
             app:layout_constraintBottom_toBottomOf="parent"
             app:layout_constraintStart_toStartOf="parent"
             app:layout_constraintEnd_toEndOf="parent" />
@@ -289,4 +299,5 @@
             app:layout_constraintStart_toStartOf="parent" />
 
     </androidx.constraintlayout.widget.ConstraintLayout>
+    </ScrollView>
 </LinearLayout>

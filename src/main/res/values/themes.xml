@@ -2,7 +2,7 @@
 <resources>
     <!-- Tema claro fixo (a plataforma não tem modo escuro; DayNight deixava
          diálogos pretos em aparelho com tema escuro). -->
-    <style name="Theme.UHFLogger" parent="Theme.MaterialComponents.Light.NoActionBar">
+    <style name="Base.Theme.UHFLogger" parent="Theme.MaterialComponents.Light.NoActionBar">
         <item name="colorPrimary">@color/sv_primary</item>
         <item name="colorPrimaryVariant">@color/sv_sidebar</item>
         <item name="colorOnPrimary">@color/sv_primary_foreground</item>
@@ -18,7 +18,10 @@
         <item name="android:windowBackground">@color/sv_background</item>
         <item name="android:statusBarColor">@color/sv_sidebar</item>
         <item name="android:windowLightStatusBar">false</item>
-        <item name="android:navigationBarColor">@color/sv_background</item>
+        <!-- Barra de navegação escura no API 26: lá não existe
+             windowLightNavigationBar e os ícones brancos sumiriam no fundo
+             claro. A partir do 27 ela fica clara (values-v27/themes.xml). -->
+        <item name="android:navigationBarColor">@color/sv_sidebar</item>
         <!-- Inter em toda TextView/Button, inclusive as criadas em Kotlin. -->
         <item name="android:fontFamily">@font/inter</item>
         <item name="fontFamily">@font/inter</item>
@@ -49,6 +52,8 @@
         <item name="android:textAllCaps">false</item>
         <item name="android:fontFamily">@font/inter</item>
     </style>
+
+    <style name="Theme.UHFLogger" parent="Base.Theme.UHFLogger" />
 
     <style name="Widget.UHFLogger.Button" parent="Widget.MaterialComponents.Button">
         <item name="cornerRadius">@dimen/sv_radius_button</item>
