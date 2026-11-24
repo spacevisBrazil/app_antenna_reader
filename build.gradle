@@ -101,7 +101,7 @@ android {
         // Local continua 14: build de máquina não é para distribuir.
         def ciBuildNumber = System.getenv('GITHUB_RUN_NUMBER')?.toInteger()
         versionCode ciBuildNumber ? 100 + ciBuildNumber : 14
-        versionName "1.4.0" + (ciBuildNumber ? "-b${ciBuildNumber}" : "")
+        versionName "1.5.0" + (ciBuildNumber ? "-b${ciBuildNumber}" : "")
 
         buildConfigField "String", "SMARTBOX_BLE_KEY", "\"${smartboxKey}\""
     }

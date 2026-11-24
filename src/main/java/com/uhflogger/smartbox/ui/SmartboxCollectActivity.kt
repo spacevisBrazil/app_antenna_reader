@@ -1,7 +1,6 @@
 package com.uhflogger.smartbox.ui
 
 import android.app.Activity
-import android.graphics.Color
 import android.graphics.Typeface
 import android.os.Bundle
 import android.view.Gravity
@@ -14,7 +13,9 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
+import com.uhflogger.R
 import com.uhflogger.smartbox.ble.displayName
+import com.uhflogger.ui.Brand
 import com.uhflogger.smartbox.collect.AutoCollectRules
 import com.uhflogger.smartbox.collect.SmartboxCollector
 import com.uhflogger.smartbox.collect.SmartboxCollector.Phase
@@ -57,25 +58,25 @@ class SmartboxCollectActivity : AppCompatActivity() {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(pad, pad, pad, pad)
-            setBackgroundColor(Color.parseColor("#FAFAFA"))
+            setBackgroundColor(c(R.color.sv_background))
         }
         title = TextView(this).apply {
             textSize = 20f
             setTypeface(typeface, Typeface.BOLD)
-            setTextColor(Color.parseColor("#111111"))
+            setTextColor(c(R.color.sv_foreground))
         }
         bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
             max = 1000
             minimumHeight = dp(24)
+            progressTintList = android.content.res.ColorStateList.valueOf(c(R.color.sv_primary))
+            progressBackgroundTintList = android.content.res.ColorStateList.valueOf(c(R.color.sv_muted))
         }
-        count = TextView(this).apply { textSize = 18f; setTextColor(Color.parseColor("#111111")) }
-        eta = TextView(this).apply { textSize = 14f; setTextColor(Color.parseColor("#666666")) }
+        count = TextView(this).apply { textSize = 18f; setTextColor(c(R.color.sv_foreground)) }
+        eta = TextView(this).apply { textSize = 14f; setTextColor(c(R.color.sv_muted_foreground)) }
         stopButton = Button(this).apply {
             text = "Parar e ler brincos"
             textSize = 17f
-            isAllCaps = false
-            setTextColor(Color.WHITE)
-            backgroundTintList = android.content.res.ColorStateList.valueOf(Color.parseColor("#2E7D32"))
+            Brand.styleButton(this, Brand.ButtonKind.PRIMARY)
             setOnClickListener {
                 isEnabled = false
                 setResult(RESULT_READ_TAGS)
@@ -88,7 +89,7 @@ class SmartboxCollectActivity : AppCompatActivity() {
         root.addView(count, LinearLayout.LayoutParams(full).apply { topMargin = dp(12) })
         root.addView(eta, LinearLayout.LayoutParams(full).apply { topMargin = dp(4) })
         root.addView(stopButton, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(64)).apply { topMargin = dp(40) })
-        setContentView(root)
+        setContentView(Brand.withTopBar(this, root))
 
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
@@ -123,6 +124,8 @@ class SmartboxCollectActivity : AppCompatActivity() {
             else -> if (!isFinishing) finish()
         }
     }
+
+    private fun c(id: Int) = Brand.color(this, id)
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 

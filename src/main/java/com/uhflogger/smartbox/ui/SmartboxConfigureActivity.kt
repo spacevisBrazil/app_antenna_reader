@@ -1,9 +1,8 @@
 package com.uhflogger.smartbox.ui
 
-import android.app.AlertDialog
+import androidx.appcompat.app.AlertDialog
 import android.content.Context
 import android.content.Intent
-import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.net.wifi.WifiManager
@@ -24,6 +23,7 @@ import android.widget.ScrollView
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
+import com.uhflogger.R
 import com.uhflogger.backend.BackendSettings
 import com.uhflogger.smartbox.ConfigSession
 import com.uhflogger.smartbox.ConfigTemplates
@@ -45,6 +45,7 @@ import com.uhflogger.smartbox.domain.WifiOptions
 import com.uhflogger.smartbox.radio.RadioDecision
 import com.uhflogger.smartbox.radio.ReaderRadio
 import com.uhflogger.smartbox.sync.SmartboxApi
+import com.uhflogger.ui.Brand
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -60,10 +61,11 @@ import kotlinx.coroutines.withContext
  */
 class SmartboxConfigureActivity : AppCompatActivity() {
 
-    private val ink = Color.parseColor("#111111")
-    private val muted = Color.parseColor("#666666")
-    private val green = Color.parseColor("#2E7D32")
-    private val red = Color.parseColor("#C62828")
+    // Tokens SpaceVis (res/values/colors.xml); lazy porque o Context só
+    // existe depois do attach.
+    private val ink by lazy { Brand.color(this, R.color.sv_foreground) }
+    private val muted by lazy { Brand.color(this, R.color.sv_muted_foreground) }
+    private val red by lazy { Brand.color(this, R.color.sv_error) }
 
     private lateinit var target: SmartboxTarget
     private lateinit var top: LinearLayout       // cabeçalho + avisos (redesenhado à vontade)
@@ -107,7 +109,7 @@ class SmartboxConfigureActivity : AppCompatActivity() {
 
         supportActionBar?.setDisplayHomeAsUpEnabled(true)
         supportActionBar?.title = "Configurar ${displayName(moduleId)}"
-        val scroll = ScrollView(this).apply { setBackgroundColor(Color.parseColor("#FAFAFA")) }
+        val scroll = ScrollView(this).apply { setBackgroundColor(Brand.color(this@SmartboxConfigureActivity, R.color.sv_background)) }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             val pad = dp(16)
@@ -118,7 +120,7 @@ class SmartboxConfigureActivity : AppCompatActivity() {
         root.addView(top)
         root.addView(formBox)
         scroll.addView(root)
-        setContentView(scroll)
+        setContentView(Brand.withTopBar(this, scroll))
         connect(keepTyped = false)
     }
 
@@ -345,10 +347,7 @@ class SmartboxConfigureActivity : AppCompatActivity() {
         windowFields.addView(check("Window 2 · Aplicar ciclos ao ESP32 também", form.check("w2_esp32")) { form = form.withCheck("w2_esp32", it); refresh() })
         formBox.addView(windowFields)
 
-        saveButton = button("Salvar") { onSaveClicked() }.apply {
-            setTextColor(Color.WHITE)
-            backgroundTintList = android.content.res.ColorStateList.valueOf(green)
-        }
+        saveButton = button("Salvar", kind = Brand.ButtonKind.PRIMARY) { onSaveClicked() }
         formBox.addView(saveButton)
         suppress = false
         renderNetworks()
@@ -466,7 +465,7 @@ class SmartboxConfigureActivity : AppCompatActivity() {
     }
 
     private fun confirmRemoveTemplate(tpl: ConfigTemplates.Stored) {
-        AlertDialog.Builder(this, android.R.style.Theme_Material_Light_Dialog_Alert)
+        AlertDialog.Builder(this, Brand.DIALOG_THEME)
             .setTitle("Apagar o modelo ${tpl.name}?")
             .setMessage("As smartboxes já configuradas não mudam.")
             .setNegativeButton("Cancelar", null)
@@ -487,7 +486,7 @@ class SmartboxConfigureActivity : AppCompatActivity() {
         }
         val existing = ConfigTemplates.findByName(ConfigTemplates.list(this), name)
         if (existing == null) { doSave(); return }
-        AlertDialog.Builder(this, android.R.style.Theme_Material_Light_Dialog_Alert)
+        AlertDialog.Builder(this, Brand.DIALOG_THEME)
             .setTitle("Modelo já existe")
             .setMessage("Já existe o modelo ${existing.name}. Quer trocar ele por esta configuração?")
             .setNegativeButton("Cancelar", null)
@@ -511,7 +510,7 @@ class SmartboxConfigureActivity : AppCompatActivity() {
             return
         }
         val body = (if (changes.toWifi) listOf("ATENÇÃO: no modo Wi-Fi a smartbox para de falar com o aparelho depois de reiniciar.", "") else emptyList()) + changes.lines
-        val dialog = AlertDialog.Builder(this, android.R.style.Theme_Material_Light_Dialog_Alert)
+        val dialog = AlertDialog.Builder(this, Brand.DIALOG_THEME)
             .setTitle(if (changes.toWifi) "Passar para Wi-Fi?" else "Salvar na smartbox?")
             .setMessage(body.joinToString("\n"))
             .setNegativeButton("Cancelar", null)
@@ -582,7 +581,7 @@ class SmartboxConfigureActivity : AppCompatActivity() {
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
     private fun alert(title: String, msg: String) {
-        AlertDialog.Builder(this, android.R.style.Theme_Material_Light_Dialog_Alert)
+        AlertDialog.Builder(this, Brand.DIALOG_THEME)
             .setTitle(title).setMessage(msg).setPositiveButton("OK", null).show()
     }
 
@@ -596,7 +595,7 @@ class SmartboxConfigureActivity : AppCompatActivity() {
 
     private fun label(t: String) = text(t, 12f, muted).apply { setPadding(0, dp(8), 0, 0) }
 
-    private fun section(t: String) = text(t, 11f, green, bold = true).apply {
+    private fun section(t: String) = text(t, 11f, muted, bold = true).apply {
         letterSpacing = 0.08f
         setPadding(0, dp(20), 0, dp(4))
     }
@@ -608,18 +607,23 @@ class SmartboxConfigureActivity : AppCompatActivity() {
         val pad = dp(12)
         setPadding(pad, pad, pad, pad)
         background = GradientDrawable().apply {
-            setColor(Color.parseColor(if (error) "#FFEBEE" else "#FFF8E1"))
-            setStroke(dp(1), Color.parseColor(if (error) "#E53935" else "#FFB300"))
-            cornerRadius = dp(8).toFloat()
+            setColor(Brand.color(this@SmartboxConfigureActivity, if (error) R.color.sv_error_soft else R.color.sv_warning_soft))
+            setStroke(dp(1), Brand.color(this@SmartboxConfigureActivity, if (error) R.color.sv_error else R.color.sv_warning))
+            cornerRadius = dp(10).toFloat()
         }
         layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
             .apply { topMargin = dp(4); bottomMargin = dp(8) }
     }
 
-    private fun button(label: String, enabled: Boolean = true, onClick: () -> Unit) = Button(this).apply {
+    private fun button(
+        label: String,
+        enabled: Boolean = true,
+        kind: Brand.ButtonKind = Brand.ButtonKind.SECONDARY,
+        onClick: () -> Unit,
+    ) = Button(this).apply {
         text = label
-        isAllCaps = false
         isEnabled = enabled
+        Brand.styleButton(this, kind)
         setOnClickListener { onClick() }
         layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(52)).apply { topMargin = dp(6) }
     }

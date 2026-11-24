@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- API 27+: barra de navegação clara com ícones escuros. -->
+    <style name="Theme.UHFLogger" parent="Base.Theme.UHFLogger">
+        <item name="android:navigationBarColor">@color/sv_background</item>
+        <item name="android:windowLightNavigationBar">true</item>
+    </style>
+</resources>

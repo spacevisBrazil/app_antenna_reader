@@ -1,6 +1,7 @@
 package com.uhflogger.drive
 
 import android.content.Intent
+import com.uhflogger.ui.Brand
 import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
@@ -45,13 +46,14 @@ class GoogleSignInActivity : AppCompatActivity() {
             gravity     = Gravity.CENTER_HORIZONTAL
             val pad     = dp(24)
             setPadding(pad, pad, pad, pad)
-            setBackgroundColor(0xFFFAFAFA.toInt())
+            setBackgroundColor(c(R.color.sv_background))
         }
 
         val tvTitle = TextView(this).apply {
             text     = "Sincronização com Google Drive"
             textSize = 18f
-            setTextColor(0xFF111111.toInt())
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            setTextColor(c(R.color.sv_foreground))
             gravity  = Gravity.CENTER
             val lp   = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
@@ -64,7 +66,7 @@ class GoogleSignInActivity : AppCompatActivity() {
                     "My Drive → UHF Logger → ${DriveHelper.getDeviceName(this@GoogleSignInActivity)}\n\n" +
                     "O login é feito uma única vez."
             textSize = 13f
-            setTextColor(0xFF666666.toInt())
+            setTextColor(c(R.color.sv_muted_foreground))
             gravity  = Gravity.CENTER
             val lp   = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
@@ -83,9 +85,7 @@ class GoogleSignInActivity : AppCompatActivity() {
 
         btnSignIn = Button(this).apply {
             text = "Entrar com Google"
-            setTextColor(0xFFFFFFFF.toInt())
-            setBackgroundColor(0xFF1976D2.toInt())
-            stateListAnimator = null
+            Brand.styleButton(this, Brand.ButtonKind.PRIMARY)
             val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(52))
             lp.bottomMargin = dp(12)
             layoutParams = lp
@@ -94,18 +94,14 @@ class GoogleSignInActivity : AppCompatActivity() {
 
         btnSignOut = Button(this).apply {
             text = "Sair da conta Google"
-            setTextColor(0xFF555555.toInt())
-            setBackgroundColor(0xFFE0E0E0.toInt())
-            stateListAnimator = null
+            Brand.styleButton(this, Brand.ButtonKind.SECONDARY)
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(52))
             setOnClickListener { signOut() }
         }
 
         val btnBattery = Button(this).apply {
             text = "Desativar otimização de bateria"
-            setTextColor(0xFF555555.toInt())
-            setBackgroundColor(0xFFE0E0E0.toInt())
-            stateListAnimator = null
+            Brand.styleButton(this, Brand.ButtonKind.SECONDARY)
             val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(52))
             lp.topMargin = dp(24)
             layoutParams = lp
@@ -118,7 +114,7 @@ class GoogleSignInActivity : AppCompatActivity() {
         root.addView(btnSignIn)
         root.addView(btnSignOut)
         root.addView(btnBattery)
-        setContentView(root)
+        setContentView(Brand.withTopBar(this, root))
 
         updateUI()
     }
@@ -132,13 +128,13 @@ class GoogleSignInActivity : AppCompatActivity() {
         val account = DriveHelper.getSignedInAccount(this)
         if (account != null) {
             tvStatus.text      = "✓ Conectado: ${account.email}"
-            tvStatus.setTextColor(0xFF2E7D32.toInt())
+            tvStatus.setTextColor(c(R.color.sv_primary))
             btnSignIn.isEnabled  = false
             btnSignOut.isEnabled = true
             DriveMonitorService.start(this)
         } else {
             tvStatus.text      = "Não conectado"
-            tvStatus.setTextColor(0xFF888888.toInt())
+            tvStatus.setTextColor(c(R.color.sv_muted_foreground))
             btnSignIn.isEnabled  = true
             btnSignOut.isEnabled = false
         }
@@ -173,4 +169,6 @@ class GoogleSignInActivity : AppCompatActivity() {
         Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+    private fun c(id: Int) = Brand.color(this, id)
 }

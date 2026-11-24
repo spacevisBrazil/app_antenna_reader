@@ -3,7 +3,6 @@ package com.uhflogger.smartbox.ui
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
@@ -20,6 +19,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
+import com.uhflogger.R
 import com.uhflogger.backend.BackendSettings
 import com.uhflogger.smartbox.SmartboxActions
 import com.uhflogger.smartbox.ble.FieldKey
@@ -35,6 +35,7 @@ import com.uhflogger.smartbox.domain.FarmLabel
 import com.uhflogger.smartbox.domain.FarmRules
 import com.uhflogger.smartbox.radio.RadioDecision
 import com.uhflogger.smartbox.radio.ReaderRadio
+import com.uhflogger.ui.Brand
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.sample
@@ -50,16 +51,16 @@ import kotlinx.coroutines.launch
 @OptIn(FlowPreview::class)
 class SmartboxSearchActivity : AppCompatActivity() {
 
-    private val green = Color.parseColor("#2E7D32")
-    private val bg = Color.parseColor("#FAFAFA")
-    private val card = Color.parseColor("#FFFFFF")
-    private val border = Color.parseColor("#E0E0E0")
-    private val ink = Color.parseColor("#111111")
-    private val muted = Color.parseColor("#666666")
-    private val amberBg = Color.parseColor("#FFF8E1")
-    private val amberBorder = Color.parseColor("#FFB300")
-    private val redBg = Color.parseColor("#FFEBEE")
-    private val redBorder = Color.parseColor("#E53935")
+    // Tokens SpaceVis (res/values/colors.xml); lazy porque o Context só
+    // existe depois do attach.
+    private val label by lazy { Brand.color(this, R.color.sv_muted_foreground) }
+    private val bg by lazy { Brand.color(this, R.color.sv_background) }
+    private val ink by lazy { Brand.color(this, R.color.sv_foreground) }
+    private val muted by lazy { Brand.color(this, R.color.sv_muted_foreground) }
+    private val amberBg by lazy { Brand.color(this, R.color.sv_warning_soft) }
+    private val amberBorder by lazy { Brand.color(this, R.color.sv_warning) }
+    private val redBg by lazy { Brand.color(this, R.color.sv_error_soft) }
+    private val redBorder by lazy { Brand.color(this, R.color.sv_error) }
 
     private lateinit var root: LinearLayout
     private var releaseScan: (() -> Unit)? = null
@@ -81,7 +82,7 @@ class SmartboxSearchActivity : AppCompatActivity() {
             setPadding(pad, pad, pad, pad)
         }
         scroll.addView(root)
-        setContentView(scroll)
+        setContentView(Brand.withTopBar(this, scroll))
         rerender()  // primeiro desenho sem esperar o sample
 
         lifecycleScope.launch {
@@ -230,8 +231,8 @@ class SmartboxSearchActivity : AppCompatActivity() {
             actions.needsAppUpdate ->
                 c.addView(noticeCard("Smartbox no protocolo ${adv.proto}; este app fala o 2. Atualize o app.", error = true))
             busyHere != null -> c.addView(statusText(busyHere.second))
-            actions.download -> c.addView(fullButton("Baixar agora", enabled = busy == null) { download(box, myFarmId) })
-            actions.register -> c.addView(fullButton("Cadastrar nesta fazenda", enabled = busy == null) { assign(box, myFarmId, farms) })
+            actions.download -> c.addView(fullButton("Baixar agora", enabled = busy == null, kind = Brand.ButtonKind.PRIMARY) { download(box, myFarmId) })
+            actions.register -> c.addView(fullButton("Cadastrar nesta fazenda", enabled = busy == null, kind = Brand.ButtonKind.PRIMARY) { assign(box, myFarmId, farms) })
             actions.transferBlockedByWifi -> c.addView(mutedText(
                 "Está em Wi-Fi e é ${FarmLabel.of(adv.farmId, farms).of}. Para trazer para esta fazenda, configure com uma chave de ativação desta fazenda.",
             ))
@@ -305,7 +306,7 @@ class SmartboxSearchActivity : AppCompatActivity() {
         root.addView(TextView(this).apply {
             this.text = title.uppercase()
             textSize = 11f
-            setTextColor(green)
+            setTextColor(label)
             setTypeface(typeface, Typeface.BOLD)
             letterSpacing = 0.08f
             setPadding(0, dp(16), 0, dp(8))
@@ -328,13 +329,9 @@ class SmartboxSearchActivity : AppCompatActivity() {
 
     private fun cardLayout() = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
-        val pad = dp(12)
+        val pad = dp(16)
         setPadding(pad, pad, pad, pad)
-        background = GradientDrawable().apply {
-            setColor(card)
-            setStroke(dp(1), border)
-            cornerRadius = dp(8).toFloat()
-        }
+        background = Brand.card(this@SmartboxSearchActivity)
         layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
             .apply { bottomMargin = dp(8) }
     }
@@ -349,16 +346,21 @@ class SmartboxSearchActivity : AppCompatActivity() {
         background = GradientDrawable().apply {
             setColor(if (error) redBg else amberBg)
             setStroke(dp(1), if (error) redBorder else amberBorder)
-            cornerRadius = dp(8).toFloat()
+            cornerRadius = dp(10).toFloat()
         }
         layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
             .apply { topMargin = dp(4); bottomMargin = dp(8) }
     }
 
-    private fun fullButton(label: String, enabled: Boolean = true, onClick: () -> Unit) = Button(this).apply {
+    private fun fullButton(
+        label: String,
+        enabled: Boolean = true,
+        kind: Brand.ButtonKind = Brand.ButtonKind.SECONDARY,
+        onClick: () -> Unit,
+    ) = Button(this).apply {
         this.text = label
         isEnabled = enabled
-        isAllCaps = false
+        Brand.styleButton(this, kind)
         setOnClickListener { onClick() }
         layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(52))
             .apply { topMargin = dp(4) }

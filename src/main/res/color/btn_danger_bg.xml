@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- "Parar e salvar": error durante a leitura; parado vira botão contornado. -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_enabled="false" android:color="@color/sv_card" />
+    <item android:color="@color/sv_error" />
+</selector>

@@ -27,6 +27,7 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.hoho.android.usbserial.driver.UsbSerialProber
 import com.uhflogger.databinding.ActivityMainBinding
+import com.uhflogger.ui.Brand
 import com.uhflogger.service.UHFReaderService
 import com.uhflogger.smartbox.ble.SmartboxConnection
 import com.uhflogger.smartbox.collect.SmartboxCollectService
@@ -114,7 +115,6 @@ class MainActivity : AppCompatActivity() {
                 isSessionActive = false
                 binding.btnSettings.isEnabled = true
             }
-            updateButtonColors()
         }
     }
     private val tagCountUpdater = object : Runnable {
@@ -152,7 +152,6 @@ class MainActivity : AppCompatActivity() {
                     setCapturingState(false)
                     binding.btnStart.isEnabled = false
                     binding.btnStop.isEnabled  = true
-                    updateButtonColors()
                     toast("Sinal da antena perdido — clique em STOP para salvar os dados")
                 }
             }
@@ -612,14 +611,14 @@ class MainActivity : AppCompatActivity() {
             android.R.layout.simple_spinner_item, labels) {
             override fun getView(pos: Int, v: android.view.View?, parent: android.view.ViewGroup): android.view.View {
                 val view = super.getView(pos, v, parent)
-                (view as? android.widget.TextView)?.setTextColor(android.graphics.Color.parseColor("#111111"))
+                (view as? android.widget.TextView)?.setTextColor(Brand.color(context, R.color.sv_foreground))
                 return view
             }
             override fun getDropDownView(pos: Int, v: android.view.View?, parent: android.view.ViewGroup): android.view.View {
                 val view = super.getDropDownView(pos, v, parent)
                 (view as? android.widget.TextView)?.apply {
-                    setTextColor(android.graphics.Color.parseColor("#111111"))
-                    setBackgroundColor(android.graphics.Color.WHITE)
+                    setTextColor(Brand.color(context, R.color.sv_foreground))
+                    setBackgroundColor(Brand.color(context, R.color.sv_card))
                 }
                 return view
             }
@@ -673,20 +672,14 @@ class MainActivity : AppCompatActivity() {
         binding.btnSettings.isEnabled    = !isSessionActive
         binding.spinnerDevices.isEnabled = !capturing
 
-        binding.tvStatus.text = if (capturing) "Lendo" else "Parado"
+        binding.tvStatus.text = if (capturing) "● Lendo" else "Parado"
         binding.tvStatus.setBackgroundResource(
             if (capturing) R.drawable.bg_badge_green else R.drawable.bg_badge_gray
         )
-        updateButtonColors()
-    }
-
-    private fun updateButtonColors() {
-        binding.btnStart.backgroundTintList = android.content.res.ColorStateList.valueOf(
-            if (binding.btnStart.isEnabled) 0xFF2E7D32.toInt() else 0xFFA5D6A7.toInt()
-        )
-        binding.btnStop.backgroundTintList = android.content.res.ColorStateList.valueOf(
-            if (binding.btnStop.isEnabled) 0xFFC62828.toInt() else 0xFFEF9A9A.toInt()
-        )
+        binding.tvStatus.setTextColor(Brand.color(this,
+            if (capturing) R.color.sv_primary_foreground else R.color.sv_foreground))
+        // Cores dos botões por estado (habilitado/apagado) vêm dos color
+        // state lists do layout (res/color/btn_*) — basta mudar isEnabled.
     }
 
     private fun toast(msg: String) {

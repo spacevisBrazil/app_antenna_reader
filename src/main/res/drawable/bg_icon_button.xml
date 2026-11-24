@@ -1,7 +1,25 @@
 <?xml version="1.0" encoding="utf-8"?>
-<shape xmlns:android="http://schemas.android.com/apk/res/android"
-    android:shape="rectangle">
-    <solid android:color="#FFFFFF" />
-    <stroke android:width="1dp" android:color="#CCCCCC" />
-    <corners android:radius="8dp" />
-</shape>
+<!-- Botão na barra do topo (sidebar-accent); desabilitado durante a leitura. -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_enabled="false">
+        <shape android:shape="rectangle">
+            <solid android:color="@color/sv_sidebar" />
+            <stroke android:width="1dp" android:color="@color/sv_sidebar_border" />
+            <corners android:radius="12dp" />
+        </shape>
+    </item>
+    <item android:state_pressed="true">
+        <shape android:shape="rectangle">
+            <solid android:color="@color/sv_sidebar_border" />
+            <stroke android:width="1dp" android:color="@color/sv_sidebar_border" />
+            <corners android:radius="12dp" />
+        </shape>
+    </item>
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="@color/sv_sidebar_accent" />
+            <stroke android:width="1dp" android:color="@color/sv_sidebar_border" />
+            <corners android:radius="12dp" />
+        </shape>
+    </item>
+</selector>
