@@ -14,7 +14,9 @@ import android.widget.ScrollView
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
+import com.uhflogger.R
 import com.uhflogger.backend.BackendSettings
+import com.uhflogger.ui.Brand
 import com.uhflogger.smartbox.SmartboxActions
 import com.uhflogger.smartbox.ble.SmartboxMode
 import com.uhflogger.smartbox.ble.SmartboxTarget
@@ -37,14 +39,18 @@ import kotlinx.coroutines.launch
  */
 class SmartboxDiagnosticActivity : AppCompatActivity() {
 
-    private val ink = Color.parseColor("#111111")
-    private val muted = Color.parseColor("#666666")
-    private val toneColor = mapOf(
-        DiagFormat.Tone.OK to Color.parseColor("#2E7D32"),
-        DiagFormat.Tone.WARN to Color.parseColor("#E65100"),
-        DiagFormat.Tone.BAD to Color.parseColor("#C62828"),
-        DiagFormat.Tone.NEUTRAL to ink,
-    )
+    // Tokens SpaceVis (res/values/colors.xml); lazy porque o Context só
+    // existe depois do attach.
+    private val ink by lazy { Brand.color(this, R.color.sv_foreground) }
+    private val muted by lazy { Brand.color(this, R.color.sv_muted_foreground) }
+    private val toneColor by lazy {
+        mapOf(
+            DiagFormat.Tone.OK to Brand.color(this, R.color.sv_primary),
+            DiagFormat.Tone.WARN to Brand.color(this, R.color.sv_warning_text),
+            DiagFormat.Tone.BAD to Brand.color(this, R.color.sv_error),
+            DiagFormat.Tone.NEUTRAL to ink,
+        )
+    }
 
     private lateinit var root: LinearLayout
     private lateinit var target: SmartboxTarget
@@ -64,14 +70,14 @@ class SmartboxDiagnosticActivity : AppCompatActivity() {
 
         supportActionBar?.setDisplayHomeAsUpEnabled(true)
         supportActionBar?.title = "Diagnóstico ${displayName(moduleId)}"
-        val scroll = ScrollView(this).apply { setBackgroundColor(Color.parseColor("#FAFAFA")) }
+        val scroll = ScrollView(this).apply { setBackgroundColor(Brand.color(this@SmartboxDiagnosticActivity, R.color.sv_background)) }
         root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             val pad = dp(16)
             setPadding(pad, pad, pad, pad)
         }
         scroll.addView(root)
-        setContentView(scroll)
+        setContentView(Brand.withTopBar(this, scroll))
         read()
     }
 
@@ -111,7 +117,7 @@ class SmartboxDiagnosticActivity : AppCompatActivity() {
     }
 
     private fun confirmReboot() {
-        AlertDialog.Builder(this, android.R.style.Theme_Material_Light_Dialog_Alert)
+        AlertDialog.Builder(this, Brand.DIALOG_THEME)
             .setTitle("Reiniciar a smartbox?")
             .setMessage("Ela desliga e liga de novo (leva uns segundos). Não muda a configuração e não apaga as leituras.")
             .setNegativeButton("Cancelar", null)
@@ -197,7 +203,7 @@ class SmartboxDiagnosticActivity : AppCompatActivity() {
         setPadding(0, dp(2), 0, dp(2))
     }
 
-    private fun section(t: String) = root.addView(text(t, 11f, Color.parseColor("#2E7D32"), bold = true).apply {
+    private fun section(t: String) = root.addView(text(t, 11f, muted, bold = true).apply {
         letterSpacing = 0.08f
         setPadding(0, dp(20), 0, dp(4))
     })
@@ -209,9 +215,9 @@ class SmartboxDiagnosticActivity : AppCompatActivity() {
         val pad = dp(12)
         setPadding(pad, pad, pad, pad)
         background = GradientDrawable().apply {
-            setColor(Color.parseColor(if (error) "#FFEBEE" else "#FFF8E1"))
-            setStroke(dp(1), Color.parseColor(if (error) "#E53935" else "#FFB300"))
-            cornerRadius = dp(8).toFloat()
+            setColor(Brand.color(this@SmartboxDiagnosticActivity, if (error) R.color.sv_error_soft else R.color.sv_warning_soft))
+            setStroke(dp(1), Brand.color(this@SmartboxDiagnosticActivity, if (error) R.color.sv_error else R.color.sv_warning))
+            cornerRadius = dp(10).toFloat()
         }
         layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
             .apply { topMargin = dp(4); bottomMargin = dp(8) }
@@ -219,9 +225,8 @@ class SmartboxDiagnosticActivity : AppCompatActivity() {
 
     private fun button(label: String, enabled: Boolean, danger: Boolean = false, onClick: () -> Unit) = Button(this).apply {
         text = label
-        isAllCaps = false
         isEnabled = enabled
-        if (danger) setTextColor(Color.parseColor("#C62828"))
+        Brand.styleButton(this, if (danger) Brand.ButtonKind.DANGER else Brand.ButtonKind.SECONDARY)
         setOnClickListener { onClick() }
         layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(52)).apply { topMargin = dp(6) }
     }

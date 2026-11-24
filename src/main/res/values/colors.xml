@@ -1,5 +1,38 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- Identidade visual SpaceVis: mesmos tokens do CSS de app.spacevis.com.br
+     (primary, background...). Toda cor de tela sai daqui — layout XML e
+     telas montadas em Kotlin (via ContextCompat.getColor). Não usar hex solto. -->
 <resources>
+    <color name="sv_primary">#31814F</color>
+    <color name="sv_primary_foreground">#FFFFFF</color>
+    <color name="sv_background">#FAFAFA</color>
+    <color name="sv_card">#FFFFFF</color>
+    <color name="sv_foreground">#193423</color>
+    <color name="sv_muted">#F0F4F2</color>
+    <color name="sv_muted_foreground">#527A61</color>
+    <color name="sv_border">#E2E9E4</color>
+    <color name="sv_input">#E8EEEA</color>
+    <!-- Borda de campo editável/seletor. Não é token da plataforma: o input
+         (#E8EEEA) some num campo branco sobre o fundo claro, que já foi
+         reclamação de campo ("caixa sem borda"). É o muted-foreground clareado. -->
+    <color name="sv_field_border">#A9BCB0</color>
+
+    <color name="sv_sidebar">#265939</color>
+    <color name="sv_sidebar_accent">#326745</color>
+    <color name="sv_sidebar_border">#396047</color>
+    <color name="sv_sidebar_foreground">#FAFAFA</color>
+
+    <color name="sv_warning">#EE9D2B</color>
+    <color name="sv_warning_foreground">#372315</color>
+    <color name="sv_error">#DF3020</color>
+    <color name="sv_error_foreground">#FFFFFF</color>
+    <!-- Fundos suaves dos avisos inline (≈10% do token sobre o card). -->
+    <color name="sv_warning_soft">#FDF5EA</color>
+    <!-- Warning como COR DE TEXTO sobre branco: o warning puro (#EE9D2B) tem
+         contraste 2,2:1, ilegível ao sol. Mesmo matiz escurecido (≈4,6:1). -->
+    <color name="sv_warning_text">#A8620F</color>
+    <color name="sv_error_soft">#FCEAE9</color>
+
     <color name="black">#FF000000</color>
     <color name="white">#FFFFFFFF</color>
 </resources>

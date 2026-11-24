@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <dimen name="sv_radius_card">16dp</dimen>
+    <dimen name="sv_radius_button">10dp</dimen>
+    <dimen name="sv_radius_field">10dp</dimen>
+    <dimen name="sv_topbar_height">72dp</dimen>
+</resources>

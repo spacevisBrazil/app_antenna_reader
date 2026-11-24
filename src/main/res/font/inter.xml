@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Inter (SIL OFL 1.1, ver docs/licenses/Inter-OFL.txt). Embutida em vez de
+     fonte baixável: os aparelhos de campo vêm do MDM e nem sempre têm Play
+     Services. 400/600/700 cobrem o que a plataforma usa; textStyle=bold → 700. -->
+<font-family xmlns:android="http://schemas.android.com/apk/res/android">
+    <font android:fontStyle="normal" android:fontWeight="400" android:font="@font/inter_regular" />
+    <font android:fontStyle="normal" android:fontWeight="600" android:font="@font/inter_semibold" />
+    <font android:fontStyle="normal" android:fontWeight="700" android:font="@font/inter_bold" />
+</font-family>

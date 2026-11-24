@@ -1,6 +1,5 @@
 package com.uhflogger
 
-import android.graphics.Color
 import android.graphics.Typeface
 import android.os.Bundle
 import android.text.InputType
@@ -10,16 +9,17 @@ import android.view.View
 import android.widget.*
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import com.uhflogger.ui.Brand
 
 class SettingsActivity : AppCompatActivity() {
 
-    private val GREEN  = Color.parseColor("#2E7D32")
-    private val BG     = Color.parseColor("#FAFAFA")
-    private val CARD   = Color.parseColor("#FFFFFF")
-    private val BORDER = Color.parseColor("#E0E0E0")
-    private val TEXT   = Color.parseColor("#111111")
-    private val MUTED  = Color.parseColor("#888888")
-    private val LABEL  = Color.parseColor("#2E7D32")
+    // Tokens SpaceVis (res/values/colors.xml). Lazy: o Context só existe
+    // depois do attach, não na construção da Activity.
+    private val BG     by lazy { Brand.color(this, R.color.sv_background) }
+    private val CARD   by lazy { Brand.color(this, R.color.sv_card) }
+    private val TEXT   by lazy { Brand.color(this, R.color.sv_foreground) }
+    private val MUTED  by lazy { Brand.color(this, R.color.sv_muted_foreground) }
+    private val LABEL  by lazy { Brand.color(this, R.color.sv_muted_foreground) }
 
     private lateinit var root: LinearLayout
     private lateinit var winnixSection: LinearLayout
@@ -38,7 +38,7 @@ class SettingsActivity : AppCompatActivity() {
             setBackgroundColor(BG)
         }
         scroll.addView(root)
-        setContentView(scroll)
+        setContentView(Brand.withTopBar(this, scroll))
 
         // --- AUTO-SAVE --------------------------------------------------
         buildSectionLabel(root, "AUTO-SAVE")
@@ -315,7 +315,7 @@ class SettingsActivity : AppCompatActivity() {
 
         val wrapper = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.WHITE)
+            setBackgroundColor(CARD)
             val p = dp(20)
             setPadding(p, dp(8), p, dp(8))
         }
@@ -339,7 +339,7 @@ class SettingsActivity : AppCompatActivity() {
         radioGroup.addView(rbWinnix)
         wrapper.addView(radioGroup)
 
-        AlertDialog.Builder(this, android.R.style.Theme_Material_Light_Dialog_Alert)
+        AlertDialog.Builder(this, Brand.DIALOG_THEME)
             .setTitle("Tipo de antena")
             .setView(wrapper)
             .setPositiveButton("Salvar") { _, _ ->
@@ -361,7 +361,7 @@ class SettingsActivity : AppCompatActivity() {
 
         val wrapper = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.WHITE)
+            setBackgroundColor(CARD)
             val p = dp(20)
             setPadding(p, dp(8), p, dp(8))
         }
@@ -389,7 +389,7 @@ class SettingsActivity : AppCompatActivity() {
         }
         wrapper.addView(radioGroup)
 
-        AlertDialog.Builder(this, android.R.style.Theme_Material_Light_Dialog_Alert)
+        AlertDialog.Builder(this, Brand.DIALOG_THEME)
             .setTitle("Modo de inventário (Winnix)")
             .setView(wrapper)
             .setPositiveButton("Salvar") { _, _ ->
@@ -408,7 +408,7 @@ class SettingsActivity : AppCompatActivity() {
 
         val wrapper = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.WHITE)
+            setBackgroundColor(CARD)
             val p = dp(20)
             setPadding(p, dp(8), p, dp(8))
         }
@@ -426,7 +426,7 @@ class SettingsActivity : AppCompatActivity() {
         }
         wrapper.addView(radioGroup)
 
-        AlertDialog.Builder(this, android.R.style.Theme_Material_Light_Dialog_Alert)
+        AlertDialog.Builder(this, Brand.DIALOG_THEME)
             .setTitle("Número de antenas (Winnix)")
             .setView(wrapper)
             .setPositiveButton("Salvar") { _, _ ->
@@ -445,7 +445,7 @@ class SettingsActivity : AppCompatActivity() {
                                  min: Int, max: Int, onSave: (Int) -> Unit) {
         val wrapper = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.WHITE)
+            setBackgroundColor(CARD)
             val p = dp(20)
             setPadding(p, dp(8), p, 0)
         }
@@ -464,13 +464,13 @@ class SettingsActivity : AppCompatActivity() {
             textSize = 18f
             gravity  = Gravity.CENTER
             setTextColor(TEXT)
-            setBackgroundColor(Color.WHITE)
+            setBackgroundColor(CARD)
             selectAll()
         }
         wrapper.addView(tvHint)
         wrapper.addView(input)
 
-        AlertDialog.Builder(this, android.R.style.Theme_Material_Light_Dialog_Alert)
+        AlertDialog.Builder(this, Brand.DIALOG_THEME)
             .setTitle(title)
             .setView(wrapper)
             .setPositiveButton("Salvar") { _, _ ->
@@ -491,7 +491,7 @@ class SettingsActivity : AppCompatActivity() {
 
         val wrapper = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.WHITE)
+            setBackgroundColor(CARD)
             val p = dp(20)
             setPadding(p, dp(8), p, dp(8))
         }
@@ -515,7 +515,7 @@ class SettingsActivity : AppCompatActivity() {
         radioGroup.addView(rbGnss)
         wrapper.addView(radioGroup)
 
-        AlertDialog.Builder(this, android.R.style.Theme_Material_Light_Dialog_Alert)
+        AlertDialog.Builder(this, Brand.DIALOG_THEME)
             .setTitle("Modo de localização")
             .setView(wrapper)
             .setPositiveButton("Salvar") { _, _ ->
@@ -537,12 +537,10 @@ class SettingsActivity : AppCompatActivity() {
         val btn = Button(this).apply {
             text              = "Restaurar padrões"
             textSize          = 14f
-            setTextColor(MUTED)
-            background        = borderDrawable()
-            stateListAnimator = null
+            Brand.styleButton(this, Brand.ButtonKind.SECONDARY)
             setOnClickListener {
                 AlertDialog.Builder(this@SettingsActivity,
-                    android.R.style.Theme_Material_Light_Dialog_Alert)
+                    Brand.DIALOG_THEME)
                     .setTitle("Restaurar padrões")
                     .setMessage("Deseja restaurar todas as configurações?")
                     .setPositiveButton("Restaurar") { _, _ ->
@@ -680,33 +678,22 @@ class SettingsActivity : AppCompatActivity() {
         val arrow = TextView(this).apply {
             text     = "›"
             textSize = 18f
-            setTextColor(BORDER)
+            setTextColor(MUTED)
         }
         card.addView(textCol)
         card.addView(arrow)
         parent.addView(card)
     }
 
-    private fun borderDrawable(): android.graphics.drawable.GradientDrawable {
-        return android.graphics.drawable.GradientDrawable().apply {
-            setColor(CARD)
-            setStroke(dp(1), BORDER)
-            cornerRadius = dp(12).toFloat()
-        }
-    }
+    private fun borderDrawable(): android.graphics.drawable.GradientDrawable = Brand.card(this)
 
     // Borda de input mais visível que borderDrawable() — usada nos campos
-    // inline do filtro. borderDrawable() usa um cinza claro (#E0E0E0) pensado
-    // pra separar cards num fundo #FAFAFA; num EditText branco sobre fundo
+    // inline do filtro. borderDrawable() usa a borda clara de card (border)
+    // pensada pra separar cards no fundo da tela; num EditText branco sobre fundo
     // branco isso ficava praticamente invisível (o problema relatado: "a
     // caixa de texto esta da mesma cor que todo o resto, sem borda").
-    private fun fieldBorderDrawable(focused: Boolean = false): android.graphics.drawable.GradientDrawable {
-        return android.graphics.drawable.GradientDrawable().apply {
-            setColor(Color.WHITE)
-            setStroke(dp(if (focused) 2 else 1), if (focused) GREEN else Color.parseColor("#BDBDBD"))
-            cornerRadius = dp(8).toFloat()
-        }
-    }
+    private fun fieldBorderDrawable(focused: Boolean = false): android.graphics.drawable.GradientDrawable =
+        Brand.field(this, focused)
 
     // Linha com checkbox: toda a linha é clicável (idioma padrão do Android —
     // o toque no checkbox consome o evento antes de chegar no listener do

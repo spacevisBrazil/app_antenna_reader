@@ -8,7 +8,9 @@ import android.view.MenuItem
 import android.view.View
 import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
+import com.uhflogger.R
 import com.uhflogger.drive.DriveMonitorService
+import com.uhflogger.ui.Brand
 import java.util.concurrent.Executors
 
 /**
@@ -38,14 +40,14 @@ class BackendSettingsActivity : AppCompatActivity() {
         supportActionBar?.setDisplayHomeAsUpEnabled(true)
         supportActionBar?.title = "Servidor SpaceVis"
 
-        val scroll = ScrollView(this).apply { setBackgroundColor(0xFFFAFAFA.toInt()) }
+        val scroll = ScrollView(this).apply { setBackgroundColor(c(R.color.sv_background)) }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             val pad = dp(24)
             setPadding(pad, pad, pad, pad)
         }
         scroll.addView(root)
-        setContentView(scroll)
+        setContentView(Brand.withTopBar(this, scroll))
 
         // O servidor NÃO é mais um campo: ele é do build (flavor hml/prd), como
         // no app de campo. Fica só a informação de para onde este aparelho manda
@@ -63,9 +65,9 @@ class BackendSettingsActivity : AppCompatActivity() {
         root.addView(label("Fazenda"))
         tvFarm = TextView(this).apply {
             textSize = 16f
-            setTextColor(0xFF111111.toInt())
+            setTextColor(c(R.color.sv_foreground))
             setPadding(dp(14), dp(14), dp(14), dp(14))
-            setBackgroundColor(0xFFFFFFFF.toInt())
+            background = Brand.card(this@BackendSettingsActivity)
             setOnClickListener { abrirSeletorDeFazenda() }
         }
         root.addView(tvFarm)
@@ -93,9 +95,7 @@ class BackendSettingsActivity : AppCompatActivity() {
 
         btnActivate = Button(this).apply {
             text = "Ativar aparelho"
-            setTextColor(0xFFFFFFFF.toInt())
-            setBackgroundColor(0xFF2E7D32.toInt())
-            stateListAnimator = null
+            Brand.styleButton(this, Brand.ButtonKind.PRIMARY)
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(52))
             setOnClickListener { onActivateClicked() }
         }
@@ -103,7 +103,7 @@ class BackendSettingsActivity : AppCompatActivity() {
 
         swEnabled = Switch(this).apply {
             text = "Enviar leituras para o servidor"
-            setTextColor(0xFF111111.toInt())
+            setTextColor(c(R.color.sv_foreground))
             isChecked = BackendSettings.isEnabled(this@BackendSettingsActivity)
             setPadding(0, dp(24), 0, 0)
             setOnCheckedChangeListener { _, checked -> onEnabledChanged(checked) }
@@ -158,7 +158,7 @@ class BackendSettingsActivity : AppCompatActivity() {
             nome.isNotEmpty()  -> if (podeTrocar) "$nome  ›" else nome
             else               -> "Fazenda $id"
         }
-        tvFarm.setTextColor(if (id > 0) 0xFF111111.toInt() else 0xFF888888.toInt())
+        tvFarm.setTextColor(c(if (id > 0) R.color.sv_foreground else R.color.sv_muted_foreground))
         // Só é clicável quando há escolha de verdade a fazer.
         tvFarm.isClickable = podeTrocar
         tvFarm.isEnabled   = podeTrocar
@@ -361,16 +361,16 @@ class BackendSettingsActivity : AppCompatActivity() {
         when {
             !active -> {
                 tvStatus.text = "Aparelho não ativado"
-                tvStatus.setTextColor(0xFF888888.toInt())
+                tintStatus(Tone.NEUTRAL)
             }
             BackendSettings.isEnabled(this) -> {
                 val email = BackendSettings.getDeviceEmail(this)
                 tvStatus.text = "✓ Ativado e enviando" + if (email.isNotEmpty()) "\n$email" else ""
-                tvStatus.setTextColor(0xFF2E7D32.toInt())
+                tintStatus(Tone.OK)
             }
             else -> {
                 tvStatus.text = "Ativado, envio desligado"
-                tvStatus.setTextColor(0xFFEF6C00.toInt())
+                tintStatus(Tone.WARN)
             }
         }
 
@@ -397,7 +397,7 @@ class BackendSettingsActivity : AppCompatActivity() {
                     }
                     if (!erro.isNullOrEmpty()) {
                         tvStatus.append("\nÚltima falha: $erro")
-                        tvStatus.setTextColor(0xFFEF6C00.toInt())
+                        tintStatus(Tone.WARN)
                     }
                 }
             }
@@ -406,26 +406,49 @@ class BackendSettingsActivity : AppCompatActivity() {
 
     // ── helpers de UI ─────────────────────────────────────────────────────────
 
+    private enum class Tone { NEUTRAL, OK, WARN }
+
+    private fun c(id: Int) = Brand.color(this, id)
+
+    // Aviso vira caixa --warning suave: o laranja da plataforma (#EE9D2B) como
+    // cor de texto sobre branco não tem contraste para leitura em campo.
+    private fun tintStatus(tone: Tone) {
+        when (tone) {
+            Tone.NEUTRAL -> tvStatus.setTextColor(c(R.color.sv_muted_foreground))
+            Tone.OK      -> tvStatus.setTextColor(c(R.color.sv_primary))
+            Tone.WARN    -> tvStatus.setTextColor(c(R.color.sv_warning_foreground))
+        }
+        if (tone == Tone.WARN) {
+            tvStatus.background = Brand.rounded(this, c(R.color.sv_warning_soft), 10, c(R.color.sv_warning))
+            tvStatus.setPadding(dp(12), dp(12), dp(12), dp(12))
+        } else {
+            tvStatus.background = null
+            tvStatus.setPadding(0, dp(16), 0, dp(16))
+        }
+    }
+
     private fun label(text: String) = TextView(this).apply {
         this.text = text
         textSize  = 13f
-        setTextColor(0xFF2E7D32.toInt())
+        setTextColor(c(R.color.sv_muted_foreground))
+        setTypeface(typeface, android.graphics.Typeface.BOLD)
         setPadding(0, dp(16), 0, dp(4))
     }
 
     private fun hint(text: String) = TextView(this).apply {
         this.text = text
         textSize  = 12f
-        setTextColor(0xFF888888.toInt())
+        setTextColor(c(R.color.sv_muted_foreground))
         setPadding(0, dp(4), 0, dp(4))
     }
 
     private fun field(hint: String, inputType: Int) = EditText(this).apply {
         this.hint = hint
         this.inputType = inputType
-        setTextColor(0xFF111111.toInt())
-        setHintTextColor(0xFFAAAAAA.toInt())
-        setBackgroundColor(0xFFFFFFFF.toInt())
+        setTextColor(c(R.color.sv_foreground))
+        setHintTextColor(c(R.color.sv_muted_foreground))
+        background = Brand.field(this@BackendSettingsActivity)
+        setOnFocusChangeListener { v, has -> v.background = Brand.field(this@BackendSettingsActivity, has) }
         setPadding(dp(12), dp(12), dp(12), dp(12))
         layoutParams = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT

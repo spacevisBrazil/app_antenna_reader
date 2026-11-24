@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- "Iniciar leitura": primary; apagado (durante a leitura) em muted. -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_enabled="false" android:color="@color/sv_muted" />
+    <item android:color="@color/sv_primary" />
+</selector>
