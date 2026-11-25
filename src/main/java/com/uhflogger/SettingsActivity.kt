@@ -23,6 +23,7 @@ class SettingsActivity : AppCompatActivity() {
 
     private lateinit var root: LinearLayout
     private lateinit var winnixSection: LinearLayout
+    private lateinit var royalraySection: LinearLayout
     private lateinit var filterContainer: LinearLayout
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -81,7 +82,7 @@ class SettingsActivity : AppCompatActivity() {
         buildSectionLabel(root, "ANTENA")
 
         val currentType  = SettingsManager.getAntennaType(this)
-        val antennaLabel = if (currentType == SettingsManager.ANTENNA_TYPE_WINNIX) "Winnix HYM750E" else "Jietong"
+        val antennaLabel = SettingsManager.antennaTypeLabel(currentType)
         buildRow(root, "Tipo de antena", antennaLabel, ROW_ANTENNA_TYPE) {
             showAntennaTypeDialog(root)
         }
@@ -89,8 +90,10 @@ class SettingsActivity : AppCompatActivity() {
         // Seção Winnix — visível apenas quando Winnix estiver selecionado
         winnixSection = buildWinnixSection()
         root.addView(winnixSection)
-        winnixSection.visibility = if (currentType == SettingsManager.ANTENNA_TYPE_WINNIX)
-            View.VISIBLE else View.GONE
+        // Seção RoyalRay — idem
+        royalraySection = buildRoyalraySection()
+        root.addView(royalraySection)
+        updateAntennaSections(currentType)
 
         // --- FILTRO -------------------------------------------------------
         // Reduz o volume salvo/enviado antes mesmo dos dados chegarem no CSV
@@ -225,6 +228,122 @@ class SettingsActivity : AppCompatActivity() {
         return section
     }
 
+    private fun updateAntennaSections(type: String) {
+        winnixSection.visibility = if (type == SettingsManager.ANTENNA_TYPE_WINNIX) View.VISIBLE else View.GONE
+        royalraySection.visibility = if (type == SettingsManager.ANTENNA_TYPE_ROYALRAY) View.VISIBLE else View.GONE
+    }
+
+    // ─── Seção RoyalRay ───
+    // Três parâmetros, mandados inteiros ao leitor a cada conexão (o ESP32 não
+    // grava config de forma permanente). Mudança vale na próxima conexão.
+
+    private fun buildRoyalraySection(): LinearLayout {
+        val section = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        section.addView(spacer(8))
+        buildSectionLabel(section, "CONFIGURAÇÃO ROYALRAY")
+
+        buildRow(section, "Portas de antena",
+            royalrayPortsLabel(SettingsManager.getRoyalrayAntMask(this)),
+            ROW_ROYALRAY_PORTS) {
+            showRoyalrayPortsDialog(section)
+        }
+
+        buildRow(section, "Potência",
+            "${SettingsManager.getRoyalrayPowerDbm(this)} dBm",
+            ROW_ROYALRAY_POWER) {
+            showNumberDialog("Potência RoyalRay",
+                "Entre ${SettingsManager.ROYALRAY_POWER_MIN_DBM} e ${SettingsManager.ROYALRAY_POWER_MAX_DBM} dBm " +
+                    "(padrão: ${SettingsManager.DEFAULT_ROYALRAY_POWER_DBM} dBm)",
+                SettingsManager.getRoyalrayPowerDbm(this).toString(),
+                SettingsManager.ROYALRAY_POWER_MIN_DBM, SettingsManager.ROYALRAY_POWER_MAX_DBM) { v ->
+                SettingsManager.setRoyalrayPowerDbm(this, v)
+                updateRowValue(section, ROW_ROYALRAY_POWER, "$v dBm")
+                toast("Salvo")
+            }
+        }
+
+        buildRow(section, "Modo de leitura",
+            SettingsManager.royalrayModeLabel(SettingsManager.getRoyalrayMode(this)),
+            ROW_ROYALRAY_MODE) {
+            showRoyalrayModeDialog(section)
+        }
+        return section
+    }
+
+    private fun royalrayPortsLabel(mask: Int): String =
+        com.uhflogger.spacevis.SpacevisProtocol.portsLabel(mask)
+
+    private fun dialogWrapper(): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setBackgroundColor(CARD)
+        val p = dp(20)
+        setPadding(p, dp(8), p, dp(8))
+    }
+
+    private fun showRoyalrayPortsDialog(parent: LinearLayout) {
+        val current = SettingsManager.getRoyalrayAntMask(this)
+        // Escolha por porta, não por quantidade: a antena pode estar só na porta 2.
+        val wrapper = dialogWrapper()
+        val boxes = (1..4).map { port ->
+            CheckBox(this).apply {
+                text      = "Porta $port"
+                setTextColor(TEXT)
+                textSize  = 14f
+                isChecked = current and (1 shl (port - 1)) != 0
+            }.also { wrapper.addView(it) }
+        }
+        AlertDialog.Builder(this, Brand.DIALOG_THEME)
+            .setTitle("Portas de antena (RoyalRay)")
+            .setView(wrapper)
+            .setPositiveButton("Salvar") { _, _ ->
+                val mask = boxes.withIndex().filter { it.value.isChecked }.fold(0) { acc, b -> acc or (1 shl b.index) }
+                if (mask == 0) {
+                    toast("Escolha pelo menos uma porta — nada foi alterado")
+                    return@setPositiveButton
+                }
+                SettingsManager.setRoyalrayAntMask(this, mask)
+                updateRowValue(parent, ROW_ROYALRAY_PORTS, royalrayPortsLabel(mask))
+                toast("Salvo: ${royalrayPortsLabel(mask)}")
+            }
+            .setNegativeButton("Cancelar", null)
+            .show()
+    }
+
+    private fun showRoyalrayModeDialog(parent: LinearLayout) {
+        val current = SettingsManager.getRoyalrayMode(this)
+        val wrapper = dialogWrapper()
+        val radioGroup = RadioGroup(this)
+        val rbAdaptive = RadioButton(this).apply {
+            id        = 50
+            text      = "Adaptativo — recomendado: vigia + rajada com tag nova, com proteção térmica"
+            setTextColor(TEXT)
+            textSize  = 13f
+            isChecked = current == SettingsManager.ROYALRAY_MODE_ADAPTIVE
+        }
+        val rbContinuous = RadioButton(this).apply {
+            id        = 51
+            text      = "Contínuo — lê sem parar; esquenta bem mais o módulo"
+            setTextColor(TEXT)
+            textSize  = 13f
+            isChecked = current == SettingsManager.ROYALRAY_MODE_CONTINUOUS
+        }
+        radioGroup.addView(rbAdaptive)
+        radioGroup.addView(rbContinuous)
+        wrapper.addView(radioGroup)
+        AlertDialog.Builder(this, Brand.DIALOG_THEME)
+            .setTitle("Modo de leitura (RoyalRay)")
+            .setView(wrapper)
+            .setPositiveButton("Salvar") { _, _ ->
+                val mode = if (radioGroup.checkedRadioButtonId == 51)
+                    SettingsManager.ROYALRAY_MODE_CONTINUOUS else SettingsManager.ROYALRAY_MODE_ADAPTIVE
+                SettingsManager.setRoyalrayMode(this, mode)
+                updateRowValue(parent, ROW_ROYALRAY_MODE, SettingsManager.royalrayModeLabel(mode))
+                toast("Salvo: ${SettingsManager.royalrayModeLabel(mode)}")
+            }
+            .setNegativeButton("Cancelar", null)
+            .show()
+    }
+
     // ─── Seção Filtro ───
     // Camadas 1 e 2 usam checkbox inline: marcar já revela o campo de
     // configuração no lugar, sem diálogo — o usuário pediu explicitamente
@@ -335,21 +454,31 @@ class SettingsActivity : AppCompatActivity() {
             textSize  = 14f
             isChecked = current == SettingsManager.ANTENNA_TYPE_WINNIX
         }
+        val rbRoyalray = RadioButton(this).apply {
+            text      = SettingsManager.antennaTypeLabel(SettingsManager.ANTENNA_TYPE_ROYALRAY)
+            id        = 22
+            setTextColor(TEXT)
+            textSize  = 14f
+            isChecked = current == SettingsManager.ANTENNA_TYPE_ROYALRAY
+        }
         radioGroup.addView(rbJietong)
         radioGroup.addView(rbWinnix)
+        radioGroup.addView(rbRoyalray)
         wrapper.addView(radioGroup)
 
         AlertDialog.Builder(this, Brand.DIALOG_THEME)
             .setTitle("Tipo de antena")
             .setView(wrapper)
             .setPositiveButton("Salvar") { _, _ ->
-                val type = if (radioGroup.checkedRadioButtonId == 21)
-                    SettingsManager.ANTENNA_TYPE_WINNIX else SettingsManager.ANTENNA_TYPE_JIETONG
+                val type = when (radioGroup.checkedRadioButtonId) {
+                    21   -> SettingsManager.ANTENNA_TYPE_WINNIX
+                    22   -> SettingsManager.ANTENNA_TYPE_ROYALRAY
+                    else -> SettingsManager.ANTENNA_TYPE_JIETONG
+                }
                 SettingsManager.setAntennaType(this, type)
-                val label = if (type == SettingsManager.ANTENNA_TYPE_WINNIX) "Winnix HYM750E" else "Jietong"
+                val label = SettingsManager.antennaTypeLabel(type)
                 updateRowValue(parent, ROW_ANTENNA_TYPE, label)
-                winnixSection.visibility = if (type == SettingsManager.ANTENNA_TYPE_WINNIX)
-                    View.VISIBLE else View.GONE
+                updateAntennaSections(type)
                 toast("Salvo: $label")
             }
             .setNegativeButton("Cancelar", null)
@@ -560,6 +689,12 @@ class SettingsActivity : AppCompatActivity() {
                             SettingsManager.DEFAULT_WINNIX_WORKING_MS)
                         SettingsManager.setWinnixInventoryMode(this@SettingsActivity,
                             SettingsManager.DEFAULT_WINNIX_INVENTORY_MODE)
+                        SettingsManager.setRoyalrayAntMask(this@SettingsActivity,
+                            SettingsManager.DEFAULT_ROYALRAY_ANT_MASK)
+                        SettingsManager.setRoyalrayPowerDbm(this@SettingsActivity,
+                            SettingsManager.DEFAULT_ROYALRAY_POWER_DBM)
+                        SettingsManager.setRoyalrayMode(this@SettingsActivity,
+                            SettingsManager.DEFAULT_ROYALRAY_MODE)
                         SettingsManager.setFilterEnabled(this@SettingsActivity,
                             SettingsManager.DEFAULT_FILTER_ENABLED)
                         SettingsManager.setFilterL1Enabled(this@SettingsActivity,
@@ -578,8 +713,7 @@ class SettingsActivity : AppCompatActivity() {
                         updateRowValue(parent, ROW_MINUTES,
                             "A cada ${SettingsManager.DEFAULT_AUTO_SAVE_MINUTES} min")
                         updateRowValue(parent, ROW_LOCATION, "GNSS + Rede")
-                        val defaultAntennaLabel = if (SettingsManager.DEFAULT_ANTENNA_TYPE == SettingsManager.ANTENNA_TYPE_WINNIX)
-                            "Winnix HYM750E" else "Jietong"
+                        val defaultAntennaLabel = SettingsManager.antennaTypeLabel(SettingsManager.DEFAULT_ANTENNA_TYPE)
                         updateRowValue(parent, ROW_ANTENNA_TYPE, defaultAntennaLabel)
                         val defaultCount = SettingsManager.DEFAULT_WINNIX_ANT_COUNT
                         updateRowValue(winnixSection, ROW_WINNIX_ANT_COUNT,
@@ -590,9 +724,13 @@ class SettingsActivity : AppCompatActivity() {
                             "${SettingsManager.DEFAULT_WINNIX_WORKING_MS}ms")
                         updateRowValue(winnixSection, ROW_WINNIX_INV_MODE,
                             SettingsManager.winnixInventoryModeLabel(SettingsManager.DEFAULT_WINNIX_INVENTORY_MODE))
-                        winnixSection.visibility =
-                            if (SettingsManager.DEFAULT_ANTENNA_TYPE == SettingsManager.ANTENNA_TYPE_WINNIX)
-                                View.VISIBLE else View.GONE
+                        updateRowValue(royalraySection, ROW_ROYALRAY_PORTS,
+                            royalrayPortsLabel(SettingsManager.DEFAULT_ROYALRAY_ANT_MASK))
+                        updateRowValue(royalraySection, ROW_ROYALRAY_POWER,
+                            "${SettingsManager.DEFAULT_ROYALRAY_POWER_DBM} dBm")
+                        updateRowValue(royalraySection, ROW_ROYALRAY_MODE,
+                            SettingsManager.royalrayModeLabel(SettingsManager.DEFAULT_ROYALRAY_MODE))
+                        updateAntennaSections(SettingsManager.DEFAULT_ANTENNA_TYPE)
 
                         // Sem IDs para patchar (checkboxes + campos inline não
                         // têm um "valor" único como as linhas de diálogo) —
@@ -902,5 +1040,8 @@ class SettingsActivity : AppCompatActivity() {
         private const val ROW_BACKEND         = 2011
         private const val ROW_SMARTBOX        = 2012
         private const val ROW_SMARTBOX_AUTO   = 2013
+        private const val ROW_ROYALRAY_PORTS  = 2014
+        private const val ROW_ROYALRAY_POWER  = 2015
+        private const val ROW_ROYALRAY_MODE   = 2016
     }
 }

@@ -16,6 +16,12 @@ object SettingsManager {
     const val KEY_WINNIX_POWER_DBM        = "winnix_power_dbm"
     const val KEY_WINNIX_WORKING_MS       = "winnix_working_ms"
     const val KEY_WINNIX_INVENTORY_MODE   = "winnix_inventory_mode"
+    const val KEY_ROYALRAY_ANT_MASK       = "royalray_ant_mask"
+    const val KEY_ROYALRAY_POWER_DBM      = "royalray_power_dbm"
+    const val KEY_ROYALRAY_MODE           = "royalray_mode"
+    // Último aviso de "leitor tem N porta(s)" mostrado, por leitor — o aviso só
+    // volta quando o usuário muda as portas ou o leitor responde diferente.
+    private const val KEY_ROYALRAY_PORT_WARN_PREFIX = "royalray_port_warn_"
     // Estado de captura persistido — usado para retomar (ou não) a leitura
     // sozinho depois que o processo é morto (SIGKILL de backup, OOM-kill, etc.)
     // e o Android recria o Service. Sem isso, o app não tem como saber se
@@ -41,6 +47,14 @@ object SettingsManager {
     // Antenna type values
     const val ANTENNA_TYPE_JIETONG        = "jietong"
     const val ANTENNA_TYPE_WINNIX         = "winnix"
+    // Leitor com ESP32 falando SPACEVIS_PROTOCOL (módulo RoyalRay). Só Bluetooth.
+    const val ANTENNA_TYPE_ROYALRAY       = "royalray"
+
+    // RoyalRay — modo de leitura (valores do SPACEVIS_PROTOCOL, SET_MODO)
+    const val ROYALRAY_MODE_CONTINUOUS    = 0
+    const val ROYALRAY_MODE_ADAPTIVE      = 1
+    const val ROYALRAY_POWER_MIN_DBM      = 5
+    const val ROYALRAY_POWER_MAX_DBM      = 33
 
     // Winnix inventory mode values
     const val WINNIX_INV_MODE_MULTITAG    = 1   // Multi-tag — S1, high accuracy
@@ -60,6 +74,11 @@ object SettingsManager {
     const val DEFAULT_WINNIX_POWER_DBM       = 30
     const val DEFAULT_WINNIX_WORKING_MS      = 100
     const val DEFAULT_WINNIX_INVENTORY_MODE  = WINNIX_INV_MODE_ADAPTIVE
+    // Padrões obrigatórios do guia RoyalRay: portas 1 e 2, 33 dBm, adaptativo
+    // (o adaptativo tem proteção térmica; o contínuo esquenta bem mais).
+    const val DEFAULT_ROYALRAY_ANT_MASK      = 0x03
+    const val DEFAULT_ROYALRAY_POWER_DBM     = 33
+    const val DEFAULT_ROYALRAY_MODE          = ROYALRAY_MODE_ADAPTIVE
 
     // Filtro — ligado por padrão, com as camadas 1 e 2 ativas e a camada 1 já
     // com os padrões de EPC conhecidos das antenas em uso.
@@ -126,6 +145,57 @@ object SettingsManager {
         WINNIX_INV_MODE_FAST     -> "Fast read"
         WINNIX_INV_MODE_ADAPTIVE -> "Adaptive"
         else                     -> "Desconhecido"
+    }
+
+    fun antennaTypeLabel(type: String): String = when (type) {
+        ANTENNA_TYPE_WINNIX   -> "Winnix HYM750E"
+        ANTENNA_TYPE_ROYALRAY -> "RoyalRay (SPACEVIS_PROTOCOL)"
+        else                  -> "Jietong"
+    }
+
+    // -------------------------------------------------------------------
+    // RoyalRay. Máscara de 4 bits (bit 0 = porta 1). Valor inválido gravado
+    // (0 ou fora de 4 bits) volta ao padrão em vez de mandar lixo ao leitor.
+    // -------------------------------------------------------------------
+    fun getRoyalrayAntMask(context: Context): Int {
+        val v = prefs(context).getInt(KEY_ROYALRAY_ANT_MASK, DEFAULT_ROYALRAY_ANT_MASK) and 0x0F
+        return if (v == 0) DEFAULT_ROYALRAY_ANT_MASK else v
+    }
+
+    fun setRoyalrayAntMask(context: Context, value: Int) {
+        require(value and 0x0F != 0) { "pelo menos uma porta" }
+        prefs(context).edit().putInt(KEY_ROYALRAY_ANT_MASK, value and 0x0F).apply()
+    }
+
+    fun getRoyalrayPowerDbm(context: Context): Int =
+        prefs(context).getInt(KEY_ROYALRAY_POWER_DBM, DEFAULT_ROYALRAY_POWER_DBM)
+            .coerceIn(ROYALRAY_POWER_MIN_DBM, ROYALRAY_POWER_MAX_DBM)
+
+    fun setRoyalrayPowerDbm(context: Context, value: Int) =
+        prefs(context).edit().putInt(KEY_ROYALRAY_POWER_DBM,
+            value.coerceIn(ROYALRAY_POWER_MIN_DBM, ROYALRAY_POWER_MAX_DBM)).apply()
+
+    fun getRoyalrayMode(context: Context): Int {
+        val v = prefs(context).getInt(KEY_ROYALRAY_MODE, DEFAULT_ROYALRAY_MODE)
+        return if (v == ROYALRAY_MODE_CONTINUOUS) v else ROYALRAY_MODE_ADAPTIVE
+    }
+
+    fun setRoyalrayMode(context: Context, value: Int) =
+        prefs(context).edit().putInt(KEY_ROYALRAY_MODE, value).apply()
+
+    fun royalrayModeLabel(mode: Int): String =
+        if (mode == ROYALRAY_MODE_CONTINUOUS) "Contínuo" else "Adaptativo"
+
+    /**
+     * true se o aviso de portas reduzidas ainda não foi mostrado para este
+     * leitor com esta combinação (pedida → efetiva). Já grava como mostrado.
+     */
+    fun shouldShowRoyalrayPortWarning(context: Context, deviceName: String, signature: String): Boolean {
+        val key = KEY_ROYALRAY_PORT_WARN_PREFIX + deviceName
+        val p = prefs(context)
+        if (p.getString(key, null) == signature) return false
+        p.edit().putString(key, signature).apply()
+        return true
     }
 
     // -------------------------------------------------------------------
