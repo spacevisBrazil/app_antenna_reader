@@ -135,3 +135,5 @@ lugar a olhar antes de ir atrás de log de servidor.
 
 - [`docs/build-e-ambientes.md`](docs/build-e-ambientes.md) — detalhes de build,
   assinatura e ativação
+- [`docs/royalray.md`](docs/royalray.md) — leitor RoyalRay (SPACEVIS_PROTOCOL):
+  configuração, fluxo de sessão, watchdog e mensagens

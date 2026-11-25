@@ -46,6 +46,11 @@ import com.uhflogger.serial.BluetoothInputOutputManager
 import com.uhflogger.serial.BluetoothSerialPort
 import com.uhflogger.serial.ISerialPort
 import com.uhflogger.serial.UsbSerialPortWrapper
+import com.uhflogger.spacevis.SpacevisCommandChannel
+import com.uhflogger.spacevis.SpacevisFrameParser
+import com.uhflogger.spacevis.SpacevisMessages
+import com.uhflogger.spacevis.SpacevisProtocol
+import com.uhflogger.spacevis.SpacevisSession
 import java.util.concurrent.Executors
 import com.uhflogger.drive.DriveHelper
 import java.util.concurrent.ScheduledExecutorService
@@ -554,12 +559,24 @@ class UHFReaderService : Service(), SensorEventListener {
     // Sinalizado por onNewData quando a confirmação de parada 0x8D é recebida
     private val winnixStopConfirmed = java.util.concurrent.atomic.AtomicBoolean(false)
 
+    // RoyalRay (SPACEVIS_PROTOCOL) — um canal/sessão por conexão BT. Criados em
+    // startRoyalrayBt() e derrubados em closePort().
+    @Volatile private var royalrayChannel: SpacevisCommandChannel? = null
+    @Volatile private var royalraySession: SpacevisSession? = null
+    // Eventos de tag só valem com a captura ativa: os que chegam na validação,
+    // na configuração ou depois de pedir STOP são descartados (guia, 10.3).
+    @Volatile private var royalrayAcceptTags = false
+    // Temperatura inicial (GET_STATUS) — vai no primeiro registro da sessão.
+    @Volatile private var royalrayStartTemp: String = ""
+
     // Callbacks
     var onStatusChanged    : ((Boolean) -> Unit)? = null
     var onCaptureError     : (() -> Unit)?        = null
     var onAutoSaved        : ((Int) -> Unit)?     = null
     var onWrongAntennaType : ((String) -> Unit)?  = null
-    var onStopComplete     : ((String?, Int) -> Unit)? = null
+    // Avisos que NÃO interrompem a captura (ex.: RoyalRay com porta sem antena).
+    var onReaderWarning    : ((String) -> Unit)?  = null
+    var onStopComplete    : ((String?, Int) -> Unit)? = null
     var mainActivity       : MainActivity?        = null
 
     // =========================================================================
@@ -671,11 +688,18 @@ class UHFReaderService : Service(), SensorEventListener {
     }
 
     override fun onDestroy() {
-        // Se Winnix estava ativo e app fecha sem Stop, envia 0x8C para parar o módulo
+        // Se Winnix estava ativo e app fecha sem Stop, envia 0x8C para parar o módulo.
+        // RoyalRay: mesmo princípio — desconectar NÃO para a leitura do ESP32, só
+        // o STOP para. Escrito direto, sem esperar resposta.
         synchronized(this) {
-            if (activeAntennaType == SettingsManager.ANTENNA_TYPE_WINNIX && activePort != null) {
+            val stopFrame = when (activeAntennaType) {
+                SettingsManager.ANTENNA_TYPE_WINNIX   -> winnixBuildStopInventory()
+                SettingsManager.ANTENNA_TYPE_ROYALRAY -> SpacevisProtocol.stop()
+                else -> null
+            }
+            if (stopFrame != null && activePort != null) {
                 try {
-                    activePort?.write(winnixBuildStopInventory(), 1000)
+                    activePort?.write(stopFrame, 1000)
                     Thread.sleep(200)
                 } catch (_: Exception) {}
             }
@@ -789,6 +813,15 @@ class UHFReaderService : Service(), SensorEventListener {
 
     private fun startUsbConnection(deviceName: String, resuming: Boolean) {
         val ctx = appContext ?: return
+        if (activeAntennaType == SettingsManager.ANTENNA_TYPE_ROYALRAY) {
+            // O USB do ESP32 é só gravação/diagnóstico.
+            Log.w(TAG, "RoyalRay configurado com dispositivo USB — recusado")
+            trackConnectFailed(false, Step.PROBE, message = "royalray is bluetooth-only")
+            if (!resuming) CsvExporter.cancelSession()
+            isPausedState.set(resuming)
+            onWrongAntennaType?.invoke(SpacevisMessages.usbNotSupported())
+            return
+        }
         val usbManager = getSystemService(Context.USB_SERVICE) as UsbManager
         val drivers    = UsbSerialProber.getDefaultProber().findAllDrivers(usbManager)
         val driver     = drivers.firstOrNull { it.device.deviceName == deviceName }
@@ -920,6 +953,11 @@ class UHFReaderService : Service(), SensorEventListener {
                 }
 
                 activePort = btPort
+                if (activeAntennaType == SettingsManager.ANTENNA_TYPE_ROYALRAY) {
+                    // Protocolo próprio: nada do probe/config Winnix vale aqui.
+                    startRoyalrayBt(btPort, deviceName, resuming)
+                    return@submit
+                }
                 Log.i(TAG, "BT_CONNECT: running probe...")
                 if (!probeAntennaType(btPort, SettingsManager.ANTENNA_TYPE_WINNIX)) {
                     Log.w(TAG, "BT_CONNECT: probe FAILED")
@@ -997,7 +1035,14 @@ class UHFReaderService : Service(), SensorEventListener {
         }
 
         stopExecutor.submit {
-            sendWinnixStop()
+            // RoyalRay: STOP + temperatura final pelo canal de comandos (antes de
+            // fechar a porta — a resposta chega pelo mesmo parser das tags).
+            val royalrayStopTemp = if (activeAntennaType == SettingsManager.ANTENNA_TYPE_ROYALRAY) {
+                royalrayStop()
+            } else {
+                sendWinnixStop()
+                ""
+            }
 
             val localBtIo = btIoManager
             val localIo   = ioManager
@@ -1010,10 +1055,14 @@ class UHFReaderService : Service(), SensorEventListener {
             // que preenche o latch quando 0x35 é detectado no winnixResponseBuffer.
             // Leitura direta (winnixReadTemperature) não funciona pois o IOManager
             // consome os bytes antes — mesmo problema no USB e no BT.
-            val winnixStopTemp = if (activeAntennaType == SettingsManager.ANTENNA_TYPE_WINNIX) {
-                val port = activePort
-                if (port != null) winnixReadTemperatureBt(port) else ""
-            } else ""
+            val winnixStopTemp = when (activeAntennaType) {
+                SettingsManager.ANTENNA_TYPE_WINNIX -> {
+                    val port = activePort
+                    if (port != null) winnixReadTemperatureBt(port) else ""
+                }
+                SettingsManager.ANTENNA_TYPE_ROYALRAY -> royalrayStopTemp
+                else -> ""
+            }
 
             if (localBtIo != null) {
                 closePort()        // interrompe stream.read() bloqueante → btIoManager sai via IOException
@@ -1230,6 +1279,163 @@ class UHFReaderService : Service(), SensorEventListener {
     }
 
     // =========================================================================
+    // RoyalRay capture — Bluetooth only (SPACEVIS_PROTOCOL, ver pacote spacevis
+    // e docs/royalray.md). Roda no configExecutor: as esperas de resposta NUNCA
+    // podem acontecer na thread de leitura BT (quem libera a espera é ela).
+    // =========================================================================
+    private fun startRoyalrayBt(btPort: BluetoothSerialPort, deviceName: String, resuming: Boolean) {
+        val ctx = appContext ?: return
+        val channel = SpacevisCommandChannel(write = { frame ->
+            synchronized(this) { btPort.write(frame, 2000) }
+        })
+        val session = SpacevisSession(channel)
+        val parser = SpacevisFrameParser(
+            onTag = ::royalrayOnTag,
+            onResponse = channel::onResponse,
+            onError = { msg, e -> Log.e(TAG, "RoyalRay $msg", e) },
+        )
+        royalrayAcceptTags = false
+        royalrayStartTemp  = ""
+        royalrayChannel    = channel
+        royalraySession    = session
+
+        // 1. Recepção ligada ANTES do primeiro comando — as respostas chegam
+        //    pelo mesmo stream das tags. Toda resposta passa pelo parser.
+        btIoManager = BluetoothInputOutputManager(btPort, object : BluetoothInputOutputManager.Listener {
+            override fun onNewData(data: ByteArray) {
+                lastDataReceivedAt = System.currentTimeMillis()
+                parser.feed(data)
+            }
+            override fun onRunError(e: Exception) = handleRunError(e)
+        })
+        Executors.newSingleThreadExecutor().submit(btIoManager)
+
+        // 2. Validação: GET_INFO (3 tentativas de 2,5 s já fazem o retry).
+        val validation = session.validate()
+        if (validation !is SpacevisSession.Validation.Valid) {
+            val msg = SpacevisMessages.validation(deviceName, validation) ?: "$deviceName: falha na validação"
+            Log.w(TAG, "ROYALRAY: validação falhou ($validation)")
+            trackConnectFailed(true, Step.PROBE, message = "royalray get_info: ${validation.javaClass.simpleName}")
+            btIoManager?.stop(); btIoManager = null
+            closePort()
+            if (!resuming) CsvExporter.cancelSession()
+            isPausedState.set(resuming)
+            onWrongAntennaType?.invoke(msg)
+            return
+        }
+        val info = validation.info
+        Log.i(TAG, "ROYALRAY: GET_INFO ok — proto=${info.protoVersion} módulo=${info.moduleType} portas=${info.ports} fw=${info.firmware}")
+
+        isRunning.set(true)
+        trackConnectOpened(true, resuming, deviceName)
+        lastDataReceivedAt = System.currentTimeMillis()
+        lastProbeSentAt = 0L
+        consecutiveFailedProbes = 0
+        startAutoSaveTimer()
+        updateNotification("Capturando via BT…")
+        onStatusChanged?.invoke(true)
+
+        // 3. Config inteira a cada conexão (o ESP32 perde tudo numa falta de
+        //    energia) e START. Lida das settings aqui: mudança vale na próxima conexão.
+        val config = SpacevisSession.ReaderConfig(
+            antennaMask = SettingsManager.getRoyalrayAntMask(ctx),
+            powerDbm    = SettingsManager.getRoyalrayPowerDbm(ctx),
+            mode        = SettingsManager.getRoyalrayMode(ctx),
+        )
+        // Daqui em diante a sessão já está aberta: um erro inesperado vira queda
+        // (reconexão), nunca o catch genérico de startBtConnection, que cancelaria
+        // o CSV em andamento.
+        val outcome = try {
+            session.configureAndStart(info, config) { startTempC ->
+                // Ainda com a trava de comandos: um STOP pedido agora espera.
+                royalrayStartTemp = formatRoyalrayTemp(startTempC)
+                royalrayAcceptTags = isRunning.get()
+                royalrayAcceptTags
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "ROYALRAY: erro na configuração: ${e.message}", e)
+            dropReasonHint.set(DropReason.CONFIG_ERROR)
+            handleRunError(e)
+            return
+        }
+        outcome.anomalies.forEach { Log.w(TAG, "ROYALRAY: $it") }
+        Log.i(TAG, "ROYALRAY: config enviada mask=0x%02X→0x%02X pot=%d modo=%d temp=%s lost=%s".format(
+            config.antennaMask, outcome.effectiveMask, config.powerDbm, config.mode,
+            royalrayStartTemp.ifEmpty { "?" }, outcome.connectionLost))
+
+        royalrayReportWarnings(ctx, deviceName, outcome.warnings)
+
+        if (outcome.connectionLost) {
+            // Comando sem resposta = ESP32 não responde: trata como queda e reconecta.
+            dropReasonHint.set(DropReason.CONFIG_ERROR)
+            handleRunError(java.io.IOException("RoyalRay: comando sem resposta na configuração"))
+        }
+    }
+
+    private fun royalrayReportWarnings(ctx: Context, deviceName: String, warnings: List<SpacevisSession.Warning>) {
+        val texts = warnings.mapNotNull { w ->
+            // "Leitor tem N porta(s)" aparece a cada conexão num módulo de 1 porta
+            // com o padrão 1+2: só mostra de novo se a combinação mudar.
+            if (w is SpacevisSession.Warning.PortsReduced &&
+                !SettingsManager.shouldShowRoyalrayPortWarning(ctx, deviceName, "${w.requestedMask}>${w.effectiveMask}")) {
+                Log.i(TAG, "ROYALRAY: ${SpacevisMessages.warning(w)} (já avisado)")
+                return@mapNotNull null
+            }
+            SpacevisMessages.warning(w).also { Log.w(TAG, "ROYALRAY: $it") }
+        }
+        if (texts.isNotEmpty()) onReaderWarning?.invoke(texts.joinToString("\n"))
+    }
+
+    /** Thread de leitura BT — não bloqueia; o filtro e a escrita seguem o caminho normal. */
+    private fun royalrayOnTag(evt: SpacevisProtocol.TagEvent) {
+        if (!royalrayAcceptTags) return
+        val temp = royalrayStartTemp
+        if (temp.isNotEmpty()) royalrayStartTemp = ""
+        val record = TagRecord(
+            epc       = evt.epcHex,
+            rssi      = evt.rssi,
+            antenna   = evt.antenna,
+            androidTs = System.currentTimeMillis(),
+            latitude  = getCurrentLatitude(),
+            longitude = getCurrentLongitude(),
+            bearing   = getCurrentBearing(),
+            temperature       = temp,
+            gnssSpeed         = getCurrentGnssSpeed(),
+            locationTimestamp = getCurrentLocationTimestamp(),
+            locationProvider  = getCurrentLocationProvider(),
+        )
+        val raw = listOf(record)
+        val tags = tagFilterEngine?.process(raw) ?: raw
+        if (tags.isNotEmpty()) writeTagsNow(tags)
+    }
+
+    /**
+     * STOP (espera resposta, regras da seção 8) e GET_STATUS para a temperatura
+     * final. Sem resposta (BT caído): loga e segue — o leitor continua lendo até
+     * alguém mandar STOP ou faltar energia (limitação conhecida; no adaptativo o
+     * teto térmico protege o módulo).
+     */
+    private fun royalrayStop(): String {
+        royalrayAcceptTags = false
+        val session = royalraySession ?: run {
+            Log.w(TAG, "ROYALRAY: stop sem conexão ativa — leitor pode continuar lendo")
+            return ""
+        }
+        return try {
+            val out = session.stop()
+            if (!out.stopAcknowledged) Log.w(TAG, "ROYALRAY: STOP sem resposta — finalizando assim mesmo")
+            else Log.i(TAG, "ROYALRAY: STOP confirmado, temp final=${out.endTemperatureC}")
+            formatRoyalrayTemp(out.endTemperatureC)
+        } catch (e: Exception) {
+            Log.e(TAG, "ROYALRAY: erro no STOP: ${e.message}", e)
+            ""
+        }
+    }
+
+    private fun formatRoyalrayTemp(c: Int?): String =
+        if (c == null) "" else "%.1f".format(java.util.Locale.US, c.toFloat())
+
+    // =========================================================================
     // Shared Winnix helpers
     // =========================================================================
 
@@ -1366,6 +1572,12 @@ class UHFReaderService : Service(), SensorEventListener {
     }
 
     private fun closePort() {
+        // Fora do lock do serviço: libera quem estiver esperando resposta de
+        // comando RoyalRay (o canal tem trava própria; nunca aninhar ao contrário).
+        royalrayAcceptTags = false
+        royalrayChannel?.close()
+        royalrayChannel = null
+        royalraySession = null
         synchronized(this) {
             try { activePort?.close() } catch (_: Exception) {}
             activePort    = null
@@ -1618,9 +1830,15 @@ class UHFReaderService : Service(), SensorEventListener {
 
         lastProbeSentAt = now
         consecutiveFailedProbes++
-        Log.w(TAG, "WATCHDOG: ${silence / 1000}s sem nenhum dado — mandando sonda (start_inventory), tentativa #$consecutiveFailedProbes")
+        // RoyalRay no vigia sem tag fica legitimamente em silêncio: a sonda é um
+        // GET_STATUS escrito direto (sem esperar com timeout); qualquer byte de
+        // volta zera o silêncio em onNewData. START aqui seria errado — religaria
+        // a leitura depois de um STOP.
+        val royalray = activeAntennaType == SettingsManager.ANTENNA_TYPE_ROYALRAY
+        val probe = if (royalray) SpacevisProtocol.getStatus() else winnixBuildStartInventory()
+        Log.w(TAG, "WATCHDOG: ${silence / 1000}s sem nenhum dado — mandando sonda (${if (royalray) "get_status" else "start_inventory"}), tentativa #$consecutiveFailedProbes")
         try {
-            synchronized(this) { port.write(winnixBuildStartInventory(), 1000) }
+            synchronized(this) { port.write(probe, 1000) }
         } catch (e: Exception) {
             Log.e(TAG, "WATCHDOG: falha ao mandar sonda: ${e.message}")
         }
@@ -1666,8 +1884,9 @@ class UHFReaderService : Service(), SensorEventListener {
         // 100% do usbReceiver da MainActivity (ACTION_USB_DEVICE_ATTACHED), que
         // não existe se a Activity foi destruída com a tela apagada por muito
         // tempo. Com os dois loops, a retomada não depende mais da Activity.
-        if (activeIsBluetooth && activeAntennaType == SettingsManager.ANTENNA_TYPE_WINNIX &&
-            btIoManager == null && activePort == null) {
+        val btLoopType = activeAntennaType == SettingsManager.ANTENNA_TYPE_WINNIX ||
+            activeAntennaType == SettingsManager.ANTENNA_TYPE_ROYALRAY
+        if (activeIsBluetooth && btLoopType && btIoManager == null && activePort == null) {
             Log.i(TAG, "BT_RECONNECT: BT session lost — starting reconnect loop")
             startBtReconnectLoop()
         } else if (!activeIsBluetooth && activePort == null && activeDeviceName != null) {

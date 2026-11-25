@@ -69,7 +69,7 @@ A tentativa de abrir não chegou ao fim.
 | `usb_permission` | `openDevice()` devolveu null | USB |
 | `socket_connect` | `BluetoothSocket.connect()` falhou | BT |
 | `usb_open` | `open()`/`setParameters()` da porta falhou | USB |
-| `probe` | a porta abriu mas o módulo não respondeu (no BT, só depois do retry local) | BT/USB |
+| `probe` | a porta abriu mas o módulo não respondeu (no BT, só depois do retry local). RoyalRay: `GET_INFO` inválido ou sem resposta (`error_message` = `royalray get_info: <motivo>`), ou RoyalRay com USB | BT/USB |
 | `unexpected` | exceção fora dos passos acima | BT |
 
 Outras propriedades: `transport`, `error_name`, `error_message`, `attempt`,
@@ -84,7 +84,7 @@ então não conta como queda.
 |---|---|
 | `read_error` | a leitura do socket/USB lançou (BT caiu, cabo desplugado) |
 | `watchdog_silence` | o watchdog fechou a porta depois de sondas sem resposta (conexão zumbi) |
-| `config_error` | falhou a configuração do Winnix logo depois de abrir |
+| `config_error` | falhou a configuração do Winnix logo depois de abrir; RoyalRay: comando sem resposta na sequência SET/START |
 
 Outras propriedades: `transport`, `error_name`, `error_message` e `open_ms` (quanto
 tempo ficou aberta).

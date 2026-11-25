@@ -166,6 +166,10 @@ class MainActivity : AppCompatActivity() {
                     toast(msg)
                 }
             }
+            readerService?.onReaderWarning = { msg ->
+                // Aviso de configuração (RoyalRay): a captura continua.
+                runOnUiThread { toast(msg) }
+            }
             readerService?.onAutoSaved = { total ->
                 runOnUiThread {
                     toast("Auto-save: $total tags gravadas")

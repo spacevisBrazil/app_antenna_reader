@@ -53,6 +53,16 @@ object DeviceIdentity {
             put("working_ms", SettingsManager.getWinnixWorkingMs(context))
             put("inventory_mode", SettingsManager.getWinnixInventoryMode(context))
         }
+        // RoyalRay: campos do guia de integração (ant_mask, power_dbm,
+        // royalray_mode). ant_count = portas pedidas, para o backend atual, que
+        // ainda só guarda ant_count/power_dbm (os outros são descartados lá).
+        if (antennaType == SettingsManager.ANTENNA_TYPE_ROYALRAY) {
+            val mask = SettingsManager.getRoyalrayAntMask(context)
+            put("ant_mask", mask)
+            put("ant_count", Integer.bitCount(mask))
+            put("power_dbm", SettingsManager.getRoyalrayPowerDbm(context))
+            put("royalray_mode", SettingsManager.getRoyalrayMode(context))
+        }
         put("app_version", appVersion(context))
     }
 
