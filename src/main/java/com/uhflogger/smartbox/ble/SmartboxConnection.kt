@@ -268,6 +268,9 @@ object SmartboxConnection {
                 if (!adapter.isEnabled) throw SmartboxConnectException("Ligue o Bluetooth.", e)
                 if (!hasConnectPermission(context)) throw SmartboxConnectException("Sem permissão de Bluetooth.", e)
                 if (attempt < Timeouts.CONNECT_ATTEMPTS) delay(Timeouts.CONNECT_RETRY_DELAY_MS)
+            } catch (e: Throwable) {
+                client.close()
+                throw e
             }
         }
         throw SmartboxConnectException("Não conectou na smartbox. Chegue mais perto e tente de novo.", last)
