@@ -39,6 +39,7 @@ object SmartboxTelemetry {
     object YieldTrigger {
         const val STOP_BUTTON = "stop_button"
         const val START_CAPTURE = "start_capture"
+        const val READER_RECONNECT = "reader_reconnect"
     }
 
     private val STATUS_IN_TEXT = Regex("status[\\s:=]*(\\d+)", RegexOption.IGNORE_CASE)

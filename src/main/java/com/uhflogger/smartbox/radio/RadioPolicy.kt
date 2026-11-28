@@ -14,6 +14,7 @@ enum class ReaderState(val telemetry: String) {
     IDLE("idle"),
     /** Captura por Bluetooth Classic ativa ou conectando. */
     BT_CAPTURING("bt_capturing"),
+    BT_CONNECTING("bt_connecting"),
     /** Sessão BT pausada, com o loop de reconexão tentando voltar. */
     BT_RECONNECTING("bt_reconnecting"),
     USB_CAPTURING("usb_capturing"),
@@ -48,8 +49,8 @@ object RadioPolicy {
     const val BT_CONNECT_GRACE_MS = 20_000L
 
     fun decide(state: ReaderState): RadioDecision = when (state) {
-        ReaderState.BT_CAPTURING, ReaderState.BT_RECONNECTING -> RadioDecision.BLOCK
-        ReaderState.USB_CAPTURING, ReaderState.USB_RECONNECTING -> RadioDecision.BACKGROUND
+        ReaderState.BT_CONNECTING, ReaderState.BT_RECONNECTING -> RadioDecision.BLOCK
+        ReaderState.BT_CAPTURING, ReaderState.USB_CAPTURING, ReaderState.USB_RECONNECTING -> RadioDecision.BACKGROUND
         ReaderState.IDLE -> RadioDecision.FOREGROUND
     }
 
@@ -68,7 +69,7 @@ object RadioPolicy {
         when {
             running -> ReaderState.BT_CAPTURING
             paused -> ReaderState.BT_RECONNECTING
-            msSinceStartRequested in 0 until BT_CONNECT_GRACE_MS -> ReaderState.BT_CAPTURING
+            msSinceStartRequested in 0 until BT_CONNECT_GRACE_MS -> ReaderState.BT_CONNECTING
             else -> ReaderState.IDLE
         }
     } else {
