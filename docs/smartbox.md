@@ -73,8 +73,8 @@ A leitura de brincos **sempre** tem prioridade. A regra fica em `RadioPolicy.dec
 
 | Leitor | Smartbox |
 |---|---|
-| Captura por Bluetooth (inclusive conectando ou no loop de reconexão) | não busca nem conecta |
-| Captura por USB | roda em segundo plano, sem tomar a tela |
+| Bluetooth conectando ou no loop de reconexão | não busca nem conecta |
+| Captura por Bluetooth ou por USB | roda em segundo plano, sem tomar a tela |
 | Parado | roda e pode mostrar a tela de progresso (PR 3) |
 
 **Iniciar leitura com uma sessão de smartbox aberta:** `SmartboxConnection.yieldForCapture`
@@ -83,6 +83,14 @@ O teto é de 5 s. Se ele vencer, a sessão é cortada, mas **nunca entre o commi
 nesse caso a descarga espera o commit terminar e sai sem mandar o ACK (`DownloadControl`). O
 lote volta na próxima conexão e o banco não duplica. Sem sessão aberta, a captura começa na
 hora.
+
+**Leitor Bluetooth caiu no meio de uma descarga:** quando o loop de reconexão começa, a coleta
+chama o mesmo `yieldForCapture` (gatilho `reader_reconnect`) e só volta depois que o leitor
+reconectou. A reconexão nunca disputa o rádio com a smartbox.
+
+No caminhão de trato o leitor Bluetooth fica capturando a viagem inteira. Com a regra antiga
+(Bluetooth capturando = bloqueio), o caminhão passava pelos bebedouros sem coletar e só
+liberava parado, longe deles.
 
 ### Perfil e fazenda
 
@@ -114,8 +122,8 @@ Configurações → Smartbox → Coleta automática.
 
 | Leitor | Tela principal |
 |---|---|
-| Captura por Bluetooth | linha discreta "Smartbox: aguardando a leitura parar" |
-| Captura por USB | linha "Smartbox SPV-…: baixando N de M" + notificação com progresso |
+| Bluetooth conectando ou reconectando | linha discreta "Smartbox: aguardando a leitura parar" |
+| Captura por Bluetooth ou por USB | linha "Smartbox SPV-…: baixando N de M" + notificação com progresso |
 | Parado | tela de progresso: nome, barra, "N de M leituras", tempo estimado e um único botão, **Parar e ler brincos**. No fim, "Pronto: N leituras guardadas, enviando ao servidor" por ~3 s, e ela fecha sozinha |
 
 - **Parar e ler brincos** não tem lógica própria: faz o mesmo que **Iniciar leitura**

@@ -59,6 +59,7 @@ object SmartboxCollector {
     private const val DONE_SHOW_MS = 3_000L
     private const val SEEN_WRITE_INTERVAL_MS = 60_000L
     private const val STALE_CHECK_INTERVAL_MS = 60_000L
+    private const val READER_WATCH_INTERVAL_MS = 500L
 
     enum class Phase { OFF, WAITING_READER, PAUSED_FOR_TECHNICIAN, SEARCHING, CONNECTING, DOWNLOADING, DONE }
 
@@ -199,8 +200,9 @@ object SmartboxCollector {
         var attempt: Attempt? = null
         var error: Throwable? = null
         coroutineScope {
+            val yieldWatcher = launch { yieldWhenReaderClaimsRadio() }
             // Job filho: o corte do yieldForCapture cancela só este.
-            launch {
+            val session = launch {
                 try {
                     attempt = SmartboxConnection.withSession(
                         context, SmartboxTarget(box.address, moduleId), SmartboxTelemetry.Purpose.AUTO_COLLECT,
@@ -233,6 +235,8 @@ object SmartboxCollector {
                     error = e
                 }
             }
+            session.join()
+            yieldWatcher.cancel()
         }
 
         val got = attempt
@@ -260,6 +264,14 @@ object SmartboxCollector {
             delay(DONE_SHOW_MS)
         }
         _state.update { it.copy(phase = Phase.SEARCHING, moduleId = null, received = 0, total = null) }
+    }
+
+    private suspend fun yieldWhenReaderClaimsRadio() {
+        while (true) {
+            delay(READER_WATCH_INTERVAL_MS)
+            val readerClaimsRadio = ReaderRadio.decision() == RadioDecision.BLOCK
+            if (readerClaimsRadio && SmartboxConnection.yieldForCapture(SmartboxTelemetry.YieldTrigger.READER_RECONNECT)) return
+        }
     }
 
     private suspend fun recordSeen(repo: SmartboxRepository, nearby: Collection<NearbySmartbox>, farmId: Long, now: Long) {

@@ -114,7 +114,7 @@ então com o aparelho offline cada retry gera um evento com `status = 0`.
 ### Smartbox (bebedouro)
 
 Os eventos e as propriedades seguem os do spacevis-mobile, com dois acréscimos em todo
-evento de sessão: `reader_state` (`idle` | `bt_capturing` | `bt_reconnecting` |
+evento de sessão: `reader_state` (`idle` | `bt_capturing` | `bt_connecting` | `bt_reconnecting` |
 `usb_capturing` | `usb_reconnecting`) e `collect_mode` (`blocking` | `background` |
 `manual`). Código: `smartbox/ble/SmartboxTelemetry.kt`.
 
@@ -124,7 +124,7 @@ evento de sessão: `reader_state` (`idle` | `bt_capturing` | `bt_reconnecting` |
 | `Smartbox Session Failed` | abertura ou ação falhou | `step` (`precheck`, `connect`, `mtu`, `discover`, `notify`, `handshake`, `action`), `android_error_code` (status GATT do callback, ou lido do texto do erro), `attempt_errors`, `error_name`, `error_message` |
 | `Smartbox Session Dropped` | caiu depois de aberta, sem o app pedir | `reason`, `open_ms` |
 | `Smartbox Scan Failed` | `onScanFailed` do Android (o app tenta de novo em 5 s) | `ble_error_code`, `error_message`, `scan_open_ms` |
-| `Smartbox Collect Yielded` | a smartbox cedeu o rádio para a captura | `trigger` (`start_capture` \| `stop_button`), `downloaded`, `remaining`, `waited_ms`, `forced_disconnect` |
+| `Smartbox Collect Yielded` | a smartbox cedeu o rádio para a captura | `trigger` (`start_capture` \| `stop_button` \| `reader_reconnect`), `downloaded`, `remaining`, `waited_ms`, `forced_disconnect` |
 
 ## Consultas úteis
 

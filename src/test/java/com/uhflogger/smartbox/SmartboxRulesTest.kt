@@ -18,18 +18,19 @@ import org.junit.Test
 class RadioPolicyTest {
 
     @Test
-    fun `captura BT bloqueia, USB roda em segundo plano, parado roda na frente`() {
-        assertEquals(RadioDecision.BLOCK, RadioPolicy.decide(ReaderState.BT_CAPTURING))
+    fun `BT conectando ou reconectando bloqueia, captura BT ou USB roda em segundo plano, parado roda na frente`() {
+        assertEquals(RadioDecision.BLOCK, RadioPolicy.decide(ReaderState.BT_CONNECTING))
         assertEquals(RadioDecision.BLOCK, RadioPolicy.decide(ReaderState.BT_RECONNECTING))
+        assertEquals(RadioDecision.BACKGROUND, RadioPolicy.decide(ReaderState.BT_CAPTURING))
         assertEquals(RadioDecision.BACKGROUND, RadioPolicy.decide(ReaderState.USB_CAPTURING))
         assertEquals(RadioDecision.BACKGROUND, RadioPolicy.decide(ReaderState.USB_RECONNECTING))
         assertEquals(RadioDecision.FOREGROUND, RadioPolicy.decide(ReaderState.IDLE))
     }
 
     @Test
-    fun `BT conectando conta como captura durante a janela do connect`() {
+    fun `BT conectando durante a janela do connect`() {
         // startCapture() acabou de ser chamado: isRunning e isPaused ainda false.
-        assertEquals(ReaderState.BT_CAPTURING, RadioPolicy.deriveReaderState(false, false, true, 1_000))
+        assertEquals(ReaderState.BT_CONNECTING, RadioPolicy.deriveReaderState(false, false, true, 1_000))
         assertEquals(ReaderState.IDLE, RadioPolicy.deriveReaderState(false, false, true, RadioPolicy.BT_CONNECT_GRACE_MS))
         assertEquals(ReaderState.IDLE, RadioPolicy.deriveReaderState(false, false, true, Long.MAX_VALUE))
     }
